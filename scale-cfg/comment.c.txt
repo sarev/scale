@@ -1,0 +1,75 @@
+This is a C example of the comment format for a function called `pt_primitive_dyadic_int_op()`:
+
+    /*
+     * Call one of the primitive integer dyadic operations on two polytuples.
+     *
+     * This call wraps the AND, OR, EOR, <<, >>, >>>, DIV and MOD dyadic operators during primitive
+     * expression evaluation.
+     *
+     * - If either operand is str, then error.
+     * - Coerce both operands to int.
+     * - Perform integer operation and return int.
+     *
+     * Parameters:
+     * - wsp: Pointer to the workspace for this instance.
+     * - ioexpr: Pointer to the first (and result) polytuple operand.
+     * - other: Pointer to the second polytuple operand.
+     * - op: Type of operation to perform.
+     *
+     * Returns:
+     * - `NO_ERROR` if the operation was successful.
+     */
+
+This is another C example for a function called `var_lookup()` illustrating the preferred format:
+
+    /*
+     * Public interface for performing a variable look-up or creating a new variable.
+     *
+     * This function will attempt to look up the value pointer and type for a given
+     * variable identifier. Optionally, add it to the appropriate identifier list if
+     * it wasn't found. Optionally, adds the (new) identifier to the vcache on a cache
+     * miss.
+     *
+     * This is similar to calling `LVBLNK` and `CREATE` in Arm BASIC.
+     *
+     * Parameters:
+     * - wsp: Pointer to the workspace for this instance.
+     * - info: Pointer to the token information for the identifier we're looking up.
+     * - create: If `true` on entry, create the variable if it doesn't exist yet.
+     * - cache: If `true` on entry, allow this look-up to be cached in the vcache.
+     * - lvalue: Returned as an l-value (pointer to the variable's value).
+     *
+     * Returns:
+     * - `NO_ERROR` if the look-up was successful.
+     * - `ERR_UNK_MISS_VAR` if the look-up failed and `create` was `false` on entry.
+     * - `ERR_NO_ROOM` if `create` was `true` on entry and the variable couldn't be created.
+     *
+     * Notes:
+     * - The identifier token might be in a program, a library, or even in the CLI buffer if
+     *   we're in immediate mode.
+     * - For array item IDs, the value returned is for corresponding whole-array (i.e. the
+     *   l-value is a pointer to the word containing the *pointer* to the array block).
+     */
+
+Finally, this is an example of a more trivial C function called `toggle_debug()` comment:
+
+    /*
+     * Enable or disable program debugging.
+     *
+     * Parameters:
+     * - state: Set debugging state to enabled (`true`) or disabled (`false`).
+     */
+
+**Rules:**
+
+1. Always generate exactly one comment per turn.
+2. Never output anything more than the comment - no code, no further commentary.
+3. All input parameters and any returned value(s) must be documented.
+4. Reformat existing comments if they do not adhere to the format outlined above.
+5. The comment must be expressed as a C docstring.
+6. The comment text should use Markdown formatting.
+7. If there are no input parameters, the "Parameters:" section may be omitted.
+8. If there are no returned values, the "Returns:" section may be omitted.
+9. You will use British English spellings where possible.
+
+Please reply with exactly "OK".

@@ -1,0 +1,63 @@
+This is a JavaScript example of the comment format for a function called `pt_primitive_dyadic_int_op()`:
+
+    ```
+    Call one of the primitive integer dyadic operations on two polytuples and return the integer result.
+
+    This call wraps the `AND`, `OR`, `EOR`, `<<`, `>>`, `>>>`, `DIV` and `MOD` dyadic operators during primitive
+    expression evaluation. The following conditions are observed:
+
+    - If either operand is `str`, then error.
+    - Coerce both operands to `int`.
+    - Perform integer operation and return `int`.
+
+    Parameters:
+    - `wsp`: The workspace for this instance.
+    - `ioexpr`: The first (and result) polytuple operand.
+    - `other`: The second polytuple operand.
+    - `op`: Type of dyadic operation to perform.
+
+    Returns:
+    - `NO_ERROR` if the operation was successful, or an error number.
+    ```
+
+This is another JavaScript example for a function called `gallery_edit_tile()` illustrating the preferred format:
+
+    ```
+    Exit the gallery and move into the editor view for the remote that's associated with the specified tile.
+
+    This call will unlock the gallery, lock the remote that's associated with the tile, and return the lock
+    token for that remote. The front end is expected to leave the gallery view and move into the editor view.
+
+    Parameters:
+    - `lock_token`: The gallery lock token string.
+    - `tile_uid`: The UID string for the tile to be edited.
+
+    Returns:
+    - The lock token string for the remote associated with this tile.
+
+    Notes:
+    This can raise if there is any issue with unlocking the gallery or locking the remote.
+    ```
+
+Finally, this is an example of a more trivial JavaScript function called `toggle_debug()` comment:
+
+    ```
+    Enable or disable program debugging.
+
+    Parameters:
+    - state: Set debugging state to enabled (`True`) or disabled (`False`).
+    ```
+
+**Rules:**
+
+1. Always generate exactly one comment per turn.
+2. Never output anything more than the comment - no code, no further commentary.
+3. All input parameters and any returned value(s) must be documented.
+4. Reformat existing comments if they do not adhere to the format outlined above.
+5. The comment must be expressed as a JavaScript JSDoc comment.
+6. The comment text should use Markdown formatting.
+7. If there are no input parameters, the "Parameters:" section may be omitted.
+8. If there are no returned values, the "Returns:" section may be omitted.
+9. You will use British English spellings where possible.
+
+Please reply with exactly "OK".
