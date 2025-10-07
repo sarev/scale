@@ -2,6 +2,8 @@
 
 SCALE is a local, scriptable tool that adds or updates code comments and docstrings using an on-device LLM loaded via `llama.cpp`. It is designed to slot into existing build or CI pipelines and to operate deterministically with tight output control. 
 
+![Illustration](./scale.png)
+
 ## What it does
 
 SCALE will ingest a source file, parse it to find routines (functions, methods, classes) and will create one comment per routine, following the comment style template
