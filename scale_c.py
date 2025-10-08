@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-# scale_c.py
+"""
+This Python program, `scale_c.py`, is a tool for generating and inserting documentation comments into C source code files.
 
-# pip install tree-sitter-c
+It uses the Tree-sitter C parser to analyse the code, identify function definitions, and then asks a language model (LLM)
+to provide documentation comments for each function. The comments are then inserted or replaced above the corresponding
+function declarations in the source code.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +21,19 @@ import textwrap
 # ---------------- Tree-sitter bootstrap (handles capsule vs Language object, and both Parser APIs)
 
 def _load_c_language_and_parser() -> Tuple[Language, Parser]:
+    """
+    Load the C language and parser.
+
+    This function loads the C language and creates a parser instance. If the `c_language()` call returns a `Language` object, it
+    is used directly. Otherwise, it is assumed to be a label and a new `Language` instance is created with the label "C".
+
+    Parameters:
+    - None
+
+    Returns:
+    - A tuple containing the loaded `Language` object and the created `Parser` instance.
+    """
+
     ptr_or_lang: Any = c_language()
 
     # Wrap capsule -> Language, or accept Language directly.
@@ -42,11 +59,32 @@ C_LANGUAGE, C_PARSER = _load_c_language_and_parser()
 # ---------------- Utilities
 
 def _to_1based(row0: int) -> int:
+    """
+    Convert a 0-based row index to a 1-based index.
+
+    Parameters:
+    - `row0`: The 0-based row index to convert.
+
+    Returns:
+    - The corresponding 1-based row index.
+    """
+
     return row0 + 1
 
 
 def _row_of(point) -> int:
-    """Row from a tree-sitter point; supports tuple or object forms."""
+    """
+    Return the row number of a tree-sitter point.
+
+    This function supports both tuple and object forms of points. If the input is an object with a `.row` attribute, it is used directly.
+    If the input is a tuple, its first element (the row number) is returned.
+
+    Parameters:
+    - `point`: The tree-sitter point to extract the row from.
+
+    Returns:
+    - The row number of the point as an integer.
+    """
     try:
         return point.row  # object with .row
     except AttributeError:
@@ -54,11 +92,31 @@ def _row_of(point) -> int:
 
 
 def _line_span_from_node(n) -> Tuple[int, int]:
-    """Inclusive 1-based start/end line span for node."""
+    """
+    Return the inclusive 1-based start and end line span for a given node.
+
+    Parameters:
+    - `n`: The node for which to compute the line span.
+
+    Returns:
+    - A tuple of two integers representing the 1-based start and end line numbers.
+    """
     return _to_1based(_row_of(n.start_point)), _to_1based(_row_of(n.end_point))
 
 
 def _get_text_for_lines(source_lines: Chunk, a: int, b: int) -> str:
+    """
+    Extract a range of lines from the source code.
+
+    Parameters:
+    - `source_lines`: The list of source code lines.
+    - `a`: The starting line number (inclusive).
+    - `b`: The ending line number (exclusive).
+
+    Returns:
+    - A string containing the extracted lines, joined by newline characters. If `a` is greater than `b`, an empty string is returned.
+    """
+
     a = max(1, a)
     b = min(len(source_lines), b)
     if a > b:
@@ -67,15 +125,33 @@ def _get_text_for_lines(source_lines: Chunk, a: int, b: int) -> str:
 
 
 def _leading_spaces_count(line: str) -> int:
+    """
+    Count the number of leading spaces in a line.
+
+    Parameters:
+    - `line`: The input string to count leading spaces from.
+
+    Returns:
+    - The number of leading spaces in the input string.
+    """
+
     return len(line) - len(line.lstrip(" "))
 
 
 def _scan_existing_comment_block_above(source_lines: Chunk, header_start_line_1b: int) -> Optional[Tuple[int, int]]:
     """
-    Detect an existing comment block immediately above header_start_line:
-      - a block '/* ... */' whose last line ends just above the header, or
-      - a contiguous run of '//' lines immediately above the header (no blank line).
-    Returns (start_line_1b, end_line_1b), or None.
+    Detect an existing comment block immediately above the header start line.
+
+    This function scans the source lines for a contiguous block of comments that ends just above the header.
+    It supports both C-style block comments '/* ... */' and C-style line comments '//'.
+
+    Parameters:
+    - `source_lines`: The source code lines to scan.
+    - `header_start_line_1b`: The line number of the header start (1-based).
+
+    Returns:
+    - A tuple `(start_line_1b, end_line_1b)` representing the start and end line numbers of the comment block,
+      or `None` if no comment block is found.
     """
     i = header_start_line_1b - 2  # zero-based line just above header
     if i < 0:
@@ -113,6 +189,22 @@ def _scan_existing_comment_block_above(source_lines: Chunk, header_start_line_1b
 
 @dataclass(frozen=True)
 class DefInfoC:
+    """
+    Represents information about a C function definition.
+
+    Attributes:
+        qualname (str): The name of the function.
+        node (object): The tree-sitter Node object representing the function definition.
+        kind (str): The type of node, always "function".
+        start (int): The line number where the function definition starts (1-based).
+        end (int): The line number where the function definition ends (inclusive).
+        header_start (int): The line number where the function header starts.
+        header_end (int): The line number where the function header ends (line before body starts '{').
+        depth (int): The nesting depth of the function, always 0 for C (no nested functions).
+        parent_id (Optional[int]): The ID of the parent node, always None.
+        children_ids (Tuple[int, ...]): A tuple of IDs of child nodes, always empty.
+    """
+
     qualname: str            # function name
     node: object             # tree_sitter.Node (function_definition)
     kind: str                # "function"
@@ -129,9 +221,16 @@ class DefInfoC:
 
 def iter_defs_with_info_c(source_blob: str) -> List[DefInfoC]:
     """
-    Parse C file and collect real function definitions:
-      - Node type: function_definition
-      - Forward declarations are not included (they are 'declaration' with function declarator but no body).
+    Collect real function definitions from a C file.
+
+    This function parses the input C source code, identifies function definitions, and collects metadata.
+    Forward declarations are excluded from the results.
+
+    Parameters:
+    - `source_blob`: The input C source code as a string.
+
+    Returns:
+    - A sorted list of `DefInfoC` objects, each containing information about a real function definition.
     """
     source_bytes = source_blob.encode("utf-8", errors="replace")
     tree = C_PARSER.parse(source_bytes)
@@ -141,7 +240,10 @@ def iter_defs_with_info_c(source_blob: str) -> List[DefInfoC]:
 
     def header_span_for_function(fn_node) -> Tuple[int, int]:
         """
-        Header ends on line before the compound_statement (body) begins.
+        Return the line span of the header for a function.
+
+        The header ends on the line before the compound statement (body) begins, unless there is no body,
+        in which case it spans the entire function definition.
         """
         # In C grammar, function_definition has field 'declarator' and 'body'
         body = fn_node.child_by_field_name("body")
@@ -156,6 +258,12 @@ def iter_defs_with_info_c(source_blob: str) -> List[DefInfoC]:
     def function_name(fn_node) -> str:
         """
         Extract function identifier text from the declarator subtree.
+
+        Parameters:
+        - `fn_node`: The declarator subtree node to extract the function identifier from.
+
+        Returns:
+        - The extracted function identifier as a string, or "<anonymous>" if not found.
         """
         # function_definition -> declarator (function_declarator) -> declarator (pointer? direct_declarator)
         decl = fn_node.child_by_field_name("declarator")
@@ -175,6 +283,19 @@ def iter_defs_with_info_c(source_blob: str) -> List[DefInfoC]:
 
     # DFS over named nodes
     def walk(n) -> None:
+        """
+        Walk the abstract syntax tree (AST) and collect function definitions.
+
+        This function recursively traverses the AST, identifying function definitions and collecting metadata.
+        For each function definition, it extracts the qualified name, line span, header span, and other relevant information.
+
+        Parameters:
+        - `n`: The current node in the AST to process.
+
+        Returns:
+        - None
+        """
+
         if n.type == "function_definition":
             qual = function_name(n) or "<anonymous>"
             s, e = _line_span_from_node(n)
@@ -204,8 +325,16 @@ def iter_defs_with_info_c(source_blob: str) -> List[DefInfoC]:
 
 def assemble_snippet_for_c(source_lines: Chunk, info: DefInfoC) -> str:
     """
-    Snippet for LLM: header (possibly multi-line) plus body.
-    We do not attempt to suppress inner functions (C does not support nested functions).
+    Assemble a snippet of C code for the function, including its header and body.
+
+    This method does not attempt to suppress inner functions, as C does not support nested functions.
+
+    Parameters:
+    - `source_lines`: The input source code lines.
+    - `info`: A DefInfoC object containing metadata about the function definition.
+
+    Returns:
+    - A string representing the assembled snippet of C code.
     """
     header_text = _get_text_for_lines(source_lines, info.header_start, info.header_end)
     body_text = _get_text_for_lines(source_lines, info.header_end + 1, info.end)
@@ -221,7 +350,14 @@ def assemble_snippet_for_c(source_lines: Chunk, info: DefInfoC) -> str:
 
 def _render_c_block_comment(text: str, base_indent: str) -> List[str]:
     """
-    Render as a C-style block comment. We keep it neutral (no JSDoc tags unless the text has them).
+    Render a C-style block comment from the provided text.
+
+    Parameters:
+    - `text`: The text to be rendered as a block comment.
+    - `base_indent`: The base indentation for the comment lines.
+
+    Returns:
+    - A list of strings representing the rendered C-style block comment.
     """
     lines = text.splitlines()
     out = [f"{base_indent}/*"]
@@ -237,8 +373,15 @@ def _render_c_block_comment(text: str, base_indent: str) -> List[str]:
 def _extract_first_c_comment_block(reply: str) -> str:
     """
     Extract the first C block comment body from the LLM reply.
+
     Supports either explicit '/* ... */' fences or plain text (then we take all, dedented).
     Returns the inner text only (without '/*' and '*/').
+
+    Parameters:
+    - `reply`: The LLM reply string to extract the comment from.
+
+    Returns:
+    - The extracted C block comment body as a string.
     """
     txt = textwrap.dedent(reply)
     # Prefer fenced block
@@ -271,7 +414,22 @@ def generate_comments_c(
 ) -> Dict[Tuple[int, int], str]:
     """
     Generate doc comments for each function definition.
-    Key doc_map by the (header_start, header_end) span so duplicates under different #ifs can co-exist.
+
+    This function generates documentation comments for a list of C function definitions.
+    It assembles a snippet of code for each function, prompts the language model to generate a comment,
+    extracts the first C block comment from the response, and stores the result in a dictionary keyed by the
+    function's header span.
+
+    Parameters:
+    - `llm`: The language model instance used for generating comments.
+    - `cfg`: The generation configuration.
+    - `messages`: A list of messages exchanged with the language model.
+    - `defs`: A list of function definition information.
+    - `source_blob`: The original source code as a string.
+    - `source_lines`: The source code broken down into chunks.
+
+    Returns:
+    - A dictionary mapping each function's header span to its corresponding documentation comment.
     """
     doc_map: Dict[Tuple[int, int], str] = {}
 
@@ -305,10 +463,22 @@ def generate_comments_c(
 
 def patch_comments_textually_c(source_lines: Chunk, defs: List[DefInfoC], doc_map: Dict[Tuple[int, int], str]) -> Chunk:
     """
-    Insert or replace documentation blocks for each C function:
-      - If there is a '/* ... */' or contiguous '//' block ending immediately above the header, replace it.
-      - Otherwise insert a new block immediately above the header.
-    Keys in doc_map are (header_start, header_end) to distinguish multiple definitions of the same name.
+    Insert or replace documentation blocks for each C function.
+
+    This function updates the source code by inserting or replacing documentation blocks above each C function definition.
+    It checks if a '/* ... */' or contiguous '//' block already exists immediately above the header, and replaces it if so.
+    Otherwise, it inserts a new block immediately above the header.
+
+    The `doc_map` dictionary is used to store the documentation comments for each function definition, with keys being
+    tuples of (header_start, header_end) to distinguish multiple definitions of the same name.
+
+    Parameters:
+    - `source_lines`: The original source code as a list of lines.
+    - `defs`: A list of `DefInfoC` objects containing information about each C function definition.
+    - `doc_map`: A dictionary mapping function definition keys to their corresponding documentation comments.
+
+    Returns:
+    - The updated source code with inserted or replaced documentation blocks.
     """
     out_lines = source_lines[:]
 
@@ -345,12 +515,25 @@ def generate_language_comments(
     source_lines: Chunk
 ) -> Chunk:
     """
-    End-to-end for C:
-      - parse with Tree-sitter C,
-      - collect function definitions (ignoring forward declarations),
-      - ask LLM for block comment text per definition,
-      - patch textually by inserting/replacing blocks above headers,
-      - return updated source lines.
+    Generate language comments for a given C source code.
+
+    This function performs the following steps:
+
+    - Parses the C source code using Tree-sitter C.
+    - Collects function definitions, ignoring forward declarations.
+    - Asks the LLM to generate block comment text for each definition.
+    - Patches the original source code by inserting or replacing blocks above function headers.
+    - Returns the updated source lines.
+
+    Parameters:
+    - `llm`: The LocalChatModel instance used for generating comments.
+    - `cfg`: The GenerationConfig instance containing configuration settings.
+    - `messages`: The Messages object containing any relevant messages.
+    - `source_blob`: The raw C source code as a string.
+    - `source_lines`: The original source code split into lines.
+
+    Returns:
+    - The updated source lines with generated comments.
     """
     echo("Parsing C source with Tree-sitter...")
     defs = iter_defs_with_info_c(source_blob)

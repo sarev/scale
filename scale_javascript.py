@@ -1,6 +1,28 @@
 #!/usr/bin/env python3
-# scale_js_tsitter.py
-# pip install tree-sitter-languages
+"""
+This Python program is a tool for generating JSDoc comments for JavaScript code using a large language model (LLM)
+as a content generator. It leverages the Tree-sitter library to parse and analyse the JavaScript source code,
+identifying definition-like constructs such as functions, classes, methods, and variables. The LLM is then used to
+generate documentation comments for these definitions in a deepest-first order, ensuring that parents see child stubs.
+Finally, the program applies textual patches to insert or replace existing comment blocks above headers, resulting in
+an updated source code with generated JSDoc comments.
+
+# Highlights of Internal Workings
+
+1. **Tree-sitter Setup**: The program initialises Tree-sitter by loading the JavaScript language and parser using the
+   `tree_sitter_javascript` library.
+2. **DefInfo Collection**: It defines a data class `DefInfoJS` to represent information about each definition-like construct,
+   including its name, node, kind, start and end lines, header start and end lines, depth, parent ID, and children IDs. The
+   program then uses Tree-sitter to parse the JavaScript source code and collect DefInfo instances for each definition.
+3. **LLM-driven JSDoc Generation**: The program generates JSDoc comments for each definition using the LLM. It prompts the
+   LLM with a snippet of the code, asking it to produce exactly the documentation comment for that specific JavaScript
+   program chunk. The LLM output is then processed to extract the first comment block.
+4. **Textual Patching**: The program applies textual patches to insert or replace existing comment blocks above headers.
+   It scans for existing comment blocks immediately above each header and replaces them with the generated JSDoc comments
+   if found. Otherwise, it inserts a new JSDoc block above the header.
+5. **Orchestrator**: The `generate_language_comments` function orchestrates the entire process, from parsing and DefInfo
+   collection to LLM-driven JSDoc generation and textual patching.
+"""
 
 from __future__ import annotations
 
@@ -26,6 +48,18 @@ ParserT = object
 
 def _load_js_language_and_parser() -> Tuple[Language, Parser]:
     # Get the export (capsule or Language)
+    """
+    Load the JavaScript language and parser.
+
+    This function initializes the JavaScript language and parser, handling different API versions.
+
+    Parameters:
+    - None
+
+    Returns:
+    - A tuple containing the loaded `Language` instance and the initialised `Parser` instance.
+    """
+
     ptr_or_lang: Any = js_language()
 
     # Wrap capsule -> Language, or accept Language directly.
@@ -54,6 +88,25 @@ JS_LANGUAGE, JS_PARSER = _load_js_language_and_parser()
 
 @dataclass(frozen=True)
 class DefInfoJS:
+    """
+    Represents information about a JavaScript definition-like construct.
+
+    Attributes:
+        qualname (str): The qualified name of the definition, e.g. "foo", "ClassName.method", "obj.method".
+        node (object): The Tree-sitter node representing the definition.
+        kind (str): The type of definition, e.g. "function", "class", "method", "var_func", "var_arrow", "obj_method".
+        start (int): The 1-based line number where the definition starts.
+        end (int): The 1-based line number where the definition ends (inclusive).
+        header_start (int): The 1-based line number where the definition's header starts (same as `start`).
+        header_end (int): The 1-based line number where the definition's header ends (line before body block begins).
+        depth (int): The nesting depth of the definition, with 0 indicating a module-level definition.
+        parent_id (Optional[int]): The ID of the parent node, or `None` if this is a top-level definition.
+        children_ids (Tuple[int, ...]): A tuple of IDs of child nodes.
+
+    Note:
+        This class is an abstraction over various types of JavaScript definitions, including functions, classes, methods, and variables.
+    """
+
     qualname: str                  # e.g. "foo", "ClassName.method", "obj.method"
     node: object                   # tree_sitter.Node
     kind: str                      # "function" | "class" | "method" | "var_func" | "var_arrow" | "obj_method"
@@ -70,23 +123,81 @@ class DefInfoJS:
 
 
 def _to_1based(row0: int) -> int:
+    """
+    Convert a 0-based row index to a 1-based index.
+
+    Parameters:
+    - `row0`: The 0-based row index to convert.
+
+    Returns:
+    - The corresponding 1-based row index.
+    """
+
     return row0 + 1
 
 
 def _line_span_from_node(n) -> Tuple[int, int]:
     # convert 0-based rows to 1-based line numbers
+    """
+    Convert a Tree-sitter node to its corresponding line span.
+
+    Returns:
+        A tuple of two integers representing the 1-based line numbers for the start and end points of the node.
+    """
+
     return _to_1based(_row_of(n.start_point)), _to_1based(_row_of(n.end_point))
 
 
 def _node_field(n, field: str):
+    """
+    Get the child node of a Tree-sitter node by its field name.
+
+    Parameters:
+    - `n`: The parent Tree-sitter node.
+    - `field`: The name of the field to retrieve.
+
+    Returns:
+    - The child node with the specified field name, or `None` if not found.
+    """
+
     return n.child_by_field_name(field)
 
 
 def _node_text(source_bytes: bytes, n) -> str:
+    """
+    Extract the text content of a Tree-sitter node from the source code bytes.
+
+    This function returns a string representation of the text within the specified node, replacing any invalid UTF-8
+    sequences with a replacement character.
+
+    Parameters:
+    - `source_bytes`: The raw bytes of the source code.
+    - `n`: The Tree-sitter node to extract the text from.
+
+    Returns:
+    - A string containing the text content of the node, or an error message if decoding fails.
+    """
+
     return source_bytes[n.start_byte:n.end_byte].decode("utf-8", errors="replace")
 
 
 def _get_text_for_lines(source_lines: Chunk, a: int, b: int) -> str:
+    """
+    Return a string representation of the specified lines in the source code.
+
+    This function extracts a contiguous range of lines from the input `source_lines` chunk, starting
+    from line `a` (inclusive) and ending at line `b` (inclusive). The range is clipped to ensure that
+    `a` is not less than 1 and `b` does not exceed the total number of lines in the chunk.
+
+    Parameters:
+    - `source_lines`: The input chunk containing the source code.
+    - `a`: The starting line index (inclusive).
+    - `b`: The ending line index (inclusive).
+
+    Returns:
+    - A string representation of the specified lines, or an empty string if the range is invalid.
+    """
+
     a = max(1, a)
     b = min(len(source_lines), b)
     if a > b:
@@ -95,11 +206,33 @@ def _get_text_for_lines(source_lines: Chunk, a: int, b: int) -> str:
 
 
 def _leading_spaces_count(line: str) -> int:
+    """
+    Count the number of leading spaces in a line.
+
+    Parameters:
+    - `line`: The input string to count leading spaces from.
+
+    Returns:
+    - An integer representing the number of leading spaces.
+    """
+
     return len(line) - len(line.lstrip(" "))
 
 
 def _row_of(point) -> int:
-    """Return 0-based row from a tree-sitter point (supports tuple or object)."""
+    """
+    Return the 0-based row from a tree-sitter point.
+
+    This function supports both object and tuple representations of points.
+    For objects with a `.row` attribute, it directly returns the row value.
+    For tuples, it extracts the first element (the row) and returns it.
+
+    Parameters:
+    - `point`: The tree-sitter point from which to extract the row.
+
+    Returns:
+    - The 0-based row of the point as an integer.
+    """
     try:
         return point.row            # object with .row
     except AttributeError:
@@ -110,6 +243,17 @@ def _row_of(point) -> int:
 
 
 def _ident_text(source_bytes: bytes, n) -> Optional[str]:
+    """
+    Extract the text of an identifier or string node from the source code.
+
+    Parameters:
+    - `source_bytes`: The bytes representation of the source code.
+    - `n`: The node to extract the text from.
+
+    Returns:
+    - The extracted text as a string, or `None` if the node is not an identifier or string.
+    """
+
     if n is None:
         return None
     if n.type in ("identifier", "property_identifier"):
@@ -126,29 +270,102 @@ def _ident_text(source_bytes: bytes, n) -> Optional[str]:
 
 
 def _qual_for_function_decl(source_bytes: bytes, n, scope: List[str]) -> str:
+    """
+    Construct a qualified name for a function declaration.
+
+    This function generates a string representing the fully qualified name of a function declaration.
+    It takes into account the scope and name of the function, handling anonymous functions by default.
+
+    Parameters:
+    - `source_bytes`: The source code bytes containing the function declaration.
+    - `n`: The node object representing the function declaration.
+    - `scope`: A list of strings representing the scope of the function.
+
+    Returns:
+    - A string representing the fully qualified name of the function declaration.
+    """
+
     name = _ident_text(source_bytes, _node_field(n, "name")) or "<anonymous>"
     return ".".join(scope + [name]) if scope else name
 
 
 def _qual_for_class_decl(source_bytes: bytes, n, scope: List[str]) -> str:
+    """
+    Construct the qualified name for a class declaration.
+
+    Parameters:
+    - `source_bytes`: The bytes of the source code.
+    - `n`: The Tree-sitter node representing the class declaration.
+    - `scope`: A list of strings representing the current scope.
+
+    Returns:
+    - The qualified name of the class as a string, or "<anonymous>" if the name is unknown.
+    """
+
     name = _ident_text(source_bytes, _node_field(n, "name")) or "<anonymous>"
     return ".".join(scope + [name]) if scope else name
 
 
 def _qual_for_method(source_bytes: bytes, n, scope: List[str]) -> str:
     # method_definition: field 'name'
+    """
+    Construct the qualified name for a method.
+
+    This function generates the fully qualified name of a method by combining the scope and method name.
+    If the scope is empty, only the method name is returned.
+
+    Parameters:
+    - `source_bytes`: The bytes representing the source code.
+    - `n`: The node containing the method definition.
+    - `scope`: A list of strings representing the scope of the method.
+
+    Returns:
+    - The fully qualified name of the method as a string.
+    """
+
     name = _ident_text(source_bytes, _node_field(n, "name")) or "<anonymous>"
     return ".".join(scope + [name]) if scope else name
 
 
 def _qual_for_var_declarator(source_bytes: bytes, declarator, scope: List[str]) -> str:
     # variable_declarator: field 'name' (identifier / pattern)
+    """
+    Construct a qualified name for a variable declarator.
+
+    This function generates the fully qualified name of a variable declarator by joining its scope and name components.
+
+    Parameters:
+    - `source_bytes`: The source code bytes containing the variable declarator.
+    - `declarator`: The Tree-sitter node representing the variable declarator.
+    - `scope`: A list of strings representing the scope of the variable declarator.
+
+    Returns:
+    - A string representing the fully qualified name of the variable declarator, or an anonymous name if it has no scope.
+    """
+
     name = _ident_text(source_bytes, _node_field(declarator, "name")) or "<anonymous>"
     return ".".join(scope + [name]) if scope else name
 
 
 def _qual_for_obj_method(source_bytes: bytes, pair_or_method, scope: List[str], enclosing_obj: Optional[str]) -> str:
     # object literal method or pair with function value
+    """
+    Construct a qualified name for an object method.
+
+    This function generates a string representing the fully qualified name of an object method.
+    It takes into account whether the method is enclosed within another object and constructs
+    the name accordingly.
+
+    Parameters:
+    - `source_bytes`: The source code bytes containing the method definition.
+    - `pair_or_method`: The object literal method or pair with a function value.
+    - `scope`: A list of strings representing the current scope.
+    - `enclosing_obj`: The name of the enclosing object, if any.
+
+    Returns:
+    - A string representing the fully qualified name of the object method.
+    """
+
     key_node = _node_field(pair_or_method, "name") or _node_field(pair_or_method, "key")
     method = _ident_text(source_bytes, key_node) or "<anonymous>"
     if enclosing_obj:
@@ -163,8 +380,12 @@ def _qual_for_obj_method(source_bytes: bytes, pair_or_method, scope: List[str], 
 
 def _header_end_for_function_like(n) -> int:
     """
-    If body is a statement_block, header ends on the line before the block's start.
-    For arrow functions with expression body, header is on the function line.
+    Determine the line number of the end of a function-like header.
+
+    For statement blocks, the header ends on the line before the block's start.
+    For arrow functions with expression body, the header is on the function line.
+    For method definitions, if the value has a statement block, the header ends on the line before the block's start.
+    Otherwise, the header ends on the line of the method definition.
     """
     body = _node_field(n, "body") if n.type != "method_definition" else _node_field(n, "body")
     if body and body.type in ("statement_block", "class_body"):
@@ -181,18 +402,36 @@ def _header_end_for_function_like(n) -> int:
 
 
 def _iter_children(n) -> Iterable:
+    """
+    Yield the named children of a node.
+
+    This generator iterates over the named child nodes of the given node, yielding each child in turn.
+    The number of named child nodes is determined by the `named_child_count` attribute of the node.
+
+    Parameters:
+    - `n`: The node to iterate over its named children.
+
+    Yields:
+    - Each named child node of the given node.
+    """
+
     for i in range(n.named_child_count):
         yield n.named_child(i)
 
 
 def iter_defs_with_info_js(source_blob: str) -> List[DefInfoJS]:
     """
-    Parse the JS module and collect definition-like constructs:
-      - function_declaration
-      - class_declaration
-      - method_definition in class_body
-      - variable_declarator with init function_expression or arrow_function
-      - object method in object (method_definition) and pair with function/arrow value
+    Collect definition-like constructs from the given JavaScript source code.
+
+    This function parses the JS module and identifies functions, classes, methods, variables, and object methods.
+    It creates DefInfoJS instances for each definition, which contain information such as the qualified name, type,
+    start and end lines, header start and end lines, depth, parent ID, and children IDs.
+
+    Parameters:
+    - `source_blob`: The JavaScript source code to parse.
+
+    Returns:
+    - A sorted list of DefInfoJS instances representing the definition-like constructs in the source code.
     """
     source_bytes = source_blob.encode("utf-8", errors="replace")
     tree = JS_PARSER.parse(source_bytes)
@@ -204,14 +443,52 @@ def iter_defs_with_info_js(source_blob: str) -> List[DefInfoJS]:
     scope_nodes: List[object] = []
 
     def add_child(parent_node: Optional[object], child_node: object) -> None:
+        """
+        Add a child node to the parent's children map.
+
+        Parameters:
+        - `parent_node`: The parent node to add the child to. If `None`, do nothing.
+        - `child_node`: The child node to be added.
+
+        Notes:
+        This method updates the internal children map, which is used to keep track of node relationships.
+        The `children_map` dictionary is keyed by parent node IDs and contains lists of child node IDs.
+        """
+
         if parent_node is None:
             return
         children_map.setdefault(id(parent_node), []).append(id(child_node))
 
     def walk(node) -> None:
+        """
+        Walk the abstract syntax tree (AST) of the JavaScript source code, collecting information about definition-like constructs.
+
+        This function recursively traverses the AST, identifying and processing functions, classes, methods, variables,
+        and object methods. It creates DefInfoJS instances for each definition, which contain information such as the
+        qualified name, type, start and end lines, header start and end lines, depth, parent ID, and children IDs.
+
+        Parameters:
+        - `node`: The current node in the AST being processed.
+
+        Returns:
+        - None
+        """
+
         t = node.type
 
         def mk_info(qualname: str, kind: str) -> DefInfoJS:
+            """
+            Create a DefInfoJS instance for the given definition.
+
+            Parameters:
+            - `qualname`: The qualified name of the definition.
+            - `kind`: The type of definition (e.g. function, class, variable).
+
+            Returns:
+            - A DefInfoJS instance containing information about the definition, including its node, kind, start and end lines,
+              header start and end lines, depth, parent ID, and children IDs.
+            """
+
             start_1b, end_1b = _line_span_from_node(node)
             header_end = _header_end_for_function_like(node)
             return DefInfoJS(
@@ -321,6 +598,23 @@ def iter_defs_with_info_js(source_blob: str) -> List[DefInfoJS]:
 
 def deepest_first_js(defs: List[DefInfoJS]) -> List[DefInfoJS]:
     # depth desc; stable: start asc, end desc
+    """
+    Sort the definitions in a deepest-first order.
+
+    This function takes a list of `DefInfoJS` instances and returns them sorted by depth, start line, and end line.
+    The sorting is stable, meaning that equal elements maintain their original order. The sort key is defined as:
+
+    - Depth (deepest first)
+    - Start line (earlier lines come first)
+    - End line (later lines come first)
+
+    Parameters:
+    - `defs`: A list of `DefInfoJS` instances to be sorted.
+
+    Returns:
+    - A sorted list of `DefInfoJS` instances.
+    """
+
     return sorted(defs, key=lambda d: (d.depth, d.start, -d.end), reverse=True)
 
 
@@ -328,6 +622,21 @@ def deepest_first_js(defs: List[DefInfoJS]) -> List[DefInfoJS]:
 
 
 def _render_jsdoc_block(text: str, base_indent: str) -> List[str]:
+    """
+    Render a JSDoc comment block with the given text and base indentation.
+
+    This function takes a string of text and an indentation string, splits the text into lines,
+    and formats it as a JSDoc comment block. If the input text is empty, it displays a message
+    indicating that there is no documentation.
+
+    Parameters:
+    - `text`: The input text to be formatted as a JSDoc comment block.
+    - `base_indent`: The base indentation string for the comment block.
+
+    Returns:
+    - A list of strings representing the formatted JSDoc comment block.
+    """
+
     lines = text.splitlines()
     out = [f"{base_indent}/**"]
     if lines:
@@ -340,6 +649,20 @@ def _render_jsdoc_block(text: str, base_indent: str) -> List[str]:
 
 
 def _extract_first_comment_block(reply: str) -> str:
+    """
+    Extract the first comment block from a reply string.
+
+    This function removes any leading whitespace and dedents the input string, then searches for the first occurrence of
+    a JSDoc-style comment block (starting with `/**`). It extracts the comment block up to the matching `*/`, removes any
+    leading asterisks from each line, and returns the resulting comment block as a single string.
+
+    Parameters:
+    - `reply`: The input string containing the reply.
+
+    Returns:
+    - The extracted comment block, or an empty string if no JSDoc-style comment block is found.
+    """
+
     lines = textwrap.dedent(reply).split("\n")
     stripped = [ln.strip() for ln in lines]
     start_idx = None
@@ -368,9 +691,22 @@ def assemble_snippet_for_js(
     docs_by_id: Dict[int, str],
 ) -> str:
     """
-    Header: lines header_start..header_end
-    Body:   direct children replaced with [JSDoc + header], body omitted; other lines preserved.
-    We splice by line ranges to preserve indentation and comments.
+    Assemble a snippet of JavaScript code for a given node ID.
+
+    This function generates a snippet by splicing together the header and body of the source code.
+    The header is obtained from the `source_lines` chunk, spanning from `header_start` to `header_end`.
+    The body is constructed by replacing direct children with their corresponding JSDoc comments and headers,
+    and preserving other lines. The replacement is done in a deepest-first order to ensure that parents see
+    child stubs.
+
+    Parameters:
+    - `info_by_id`: A dictionary mapping node IDs to `DefInfoJS` objects.
+    - `source_lines`: A chunk of source code lines.
+    - `node_id`: The ID of the node for which to assemble the snippet.
+    - `docs_by_id`: A dictionary mapping node IDs to their corresponding JSDoc comments.
+
+    Returns:
+    - A string representing the assembled snippet of JavaScript code.
     """
     info = info_by_id[node_id]
 
@@ -416,7 +752,25 @@ def generate_comments_js(
     source_lines: Chunk
 ) -> Dict[str, str]:
     """
-    Generate JSDoc content for JS definitions. Deepest-first so parents see child stubs.
+    Generate JSDoc content for JS definitions in a deepest-first order, ensuring parents see child stubs.
+
+    This function orchestrates the generation of JSDoc comments for JavaScript definitions by:
+
+    1.  Assembling snippets of code for each definition.
+    2.  Prompting the LLM to generate documentation comments for these snippets.
+    3.  Processing the LLM output to extract the first comment block.
+    4.  Storing the generated comments in dictionaries keyed by qualification name and node ID.
+
+    Parameters:
+        - `llm`: The LocalChatModel instance used to interact with the LLM.
+        - `cfg`: The GenerationConfig instance containing configuration settings.
+        - `messages`: A list of messages exchanged with the LLM.
+        - `defs`: A list of DefInfoJS instances representing JavaScript definitions.
+        - `source_blob`: The source code as a string.
+        - `source_lines`: A Chunk object containing the source code lines.
+
+    Returns:
+        - A dictionary mapping qualification names to generated JSDoc comments.
     """
     docs_by_qualname: Dict[str, str] = {}
     docs_by_node_id: Dict[int, str] = {}
@@ -454,10 +808,13 @@ def generate_comments_js(
 
 def _scan_existing_comment_block_above(source_lines: Chunk, header_start_line_1b: int) -> Optional[Tuple[int, int]]:
     """
-    Detect an existing comment block immediately above header_start_line:
-      - a block comment '/* ... */' whose last line ends just above the header, or
-      - a contiguous run of '//' lines immediately above the header (no blank line).
-    Returns (start_line_1b, end_line_1b), or None.
+    Detect an existing comment block immediately above the header.
+
+    This function scans the source code lines above the specified header start line to identify either:
+    - a block comment '/* ... */' whose last line ends just above the header, or
+    - a contiguous run of '//' lines immediately above the header (no blank line).
+
+    Returns a tuple containing the start and end line numbers of the existing comment block, or `None` if no such block is found.
     """
     i = header_start_line_1b - 2  # zero-based line just above header
     if i < 0:
@@ -493,9 +850,20 @@ def _scan_existing_comment_block_above(source_lines: Chunk, header_start_line_1b
 
 def patch_comments_textually_js(source_lines: Chunk, defs: List[DefInfoJS], doc_map: Dict[str, str]) -> Chunk:
     """
-    Insert or replace documentation blocks for each JS definition:
-    - If there is a block comment or a contiguous '//' block ending immediately above the header, replace it.
-    - Otherwise insert a new JSDoc block immediately above the header.
+    Insert or replace documentation blocks for each JS definition.
+
+    This function iterates over the definitions in a deepest-first order and inserts or replaces
+    documentation blocks above their corresponding headers. If an existing block comment or contiguous
+    '//' block is found immediately above the header, it is replaced with a new JSDoc block. Otherwise,
+    a new JSDoc block is inserted immediately above the header.
+
+    Parameters:
+    - `source_lines`: The input source code as a list of lines.
+    - `defs`: A list of `DefInfoJS` objects representing the definitions to be processed.
+    - `doc_map`: A dictionary mapping definition names to their corresponding documentation strings.
+
+    Returns:
+    - The modified source code with inserted or replaced documentation blocks.
     """
     out_lines = source_lines[:]
 
@@ -532,12 +900,25 @@ def generate_language_comments(
     source_lines: Chunk
 ) -> Chunk:
     """
-    End-to-end for JavaScript using Tree-sitter:
-      - parse,
-      - collect DefInfoJS,
-      - generate JSDoc text with the LLM (deepest-first),
-      - patch textually by inserting/replacing comment blocks above headers,
-      - return the updated source lines.
+    Generate JSDoc comments for a JavaScript source code chunk.
+
+    This function orchestrates the end-to-end process of generating JSDoc comments for a given JavaScript source code:
+
+    1. Parse the JavaScript source using Tree-sitter.
+    2. Collect information about definition-like constructs (e.g., functions, classes, methods, variables) in the source code.
+    3. Generate JSDoc comments for each definition using a large language model (LLM), following a deepest-first order to ensure
+       that parent definitions see child stubs.
+    4. Textually patch the source code by inserting or replacing existing comment blocks above headers with the generated JSDoc comments.
+
+    Parameters:
+    - `llm`: The local chat model used for generating JSDoc comments.
+    - `cfg`: The generation configuration.
+    - `messages`: The messages object.
+    - `source_blob`: The JavaScript source code as a string.
+    - `source_lines`: The source code chunk.
+
+    Returns:
+    - The updated source code chunk with generated JSDoc comments.
     """
     echo("Parsing JavaScript source with Tree-sitter...")
     defs = iter_defs_with_info_js(source_blob)

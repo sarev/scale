@@ -114,11 +114,31 @@ python -m venv .llm-venv
 python -m pip install --upgrade pip wheel setuptools
 ```
 
-## Run the CUDA activation script - bash version
+## Run the CUDA activation script
+
+This program attempts to locate important parts of typical AI software ingrastructure on your system and
+updates PATH in the local shell to ensure that the right things are present. It should work on Linux and
+Windows (including in bash on Windows - e.g. Git Bash for Windows).
+
+### Running bash in Windows
 
 ```bash
-. ./cuda-activate.sh     
+eval "$(python cuda_activate.py --shell bash)"
 ```
+
+### Running in Windows PowerShell
+
+```powershell
+python cuda_activate.py --shell powershell | Invoke-Expression
+```
+
+### Running in Windows cmd.exe
+
+```batch
+for /f "usebackq delims=" %i in (`python cuda_activate.py --shell cmd`) do %i
+```
+
+This script is probably a little fragile and may require some tweaks for your setup.
 
 ## Install the CUDA-aware llama-cpp (large language models)
 

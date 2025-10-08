@@ -1,44 +1,23 @@
 #!/usr/bin/env python3
 """
-This program provides a robust framework for generating or updating docstrings in Python source code, ensuring that the generated
-documentation is precise and aligned with the actual code structure.
+This program generates or updates docstrings in Python source code, ensuring that the generated documentation is precise and aligned with the
+actual code structure.
 
-This program is designed to generate or update docstrings for functions, classes, and properties in Python source code.
+**Key Functionalities:**
 
-Here are the key functionalities and highlights of its internal workings:
+1. **DefInfo Data Structure**: The `DefInfo` class captures detailed information about each definition (function, class, property) in the source code.
+2. **AST Traversal**: The program uses the Abstract Syntax Tree (AST) to traverse and analyse the source code.
+3. **Docstring Generation**: The `generate_docstrings` function generates new or updated docstrings for each definition using a Large Language Model (LLM).
+4. **Snippet Assembly**: The `assemble_snippet_for` function constructs the code snippet for each definition, including its header and body.
+5. **Patch Application**: The `patch_docstrings_textually` function applies the generated or updated docstrings to the source code.
 
-1. **DefInfo Data Structure**: The `DefInfo` class captures detailed information about each definition (function, class, property)
-   in the source code. It includes attributes like `qualname`, `node`, `start`, `end`, `def_line`, `header_start`, `header_end`,
-   and more. This structure helps in precisely identifying and manipulating definitions within the AST.
+**Highlights:**
 
-2. **AST Traversal**: The program uses the Abstract Syntax Tree (AST) to traverse and analyze the source code. Functions like
-   `_is_def_node`, `_node_kind`, and `_header_span` are used to identify and extract relevant information from the AST nodes.
-
-3. **Docstring Generation**: The `generate_docstrings` function generates new or updated docstrings for each definition. It processes
-   definitions in a depth-first manner, ensuring that parent definitions are handled before their children. The function uses an LLM
-   (Large Language Model) to generate docstrings based on the provided prompts and existing code snippets.
-
-4. **Snippet Assembly**: The `assemble_snippet_for` function constructs the code snippet for each definition, including its header
-   and body. It replaces direct child definitions with stubs that include their docstrings, ensuring that the overall structure of the
-   code is preserved while updating the docstrings.
-
-5. **Docstring Extraction**: The `extract_first_docstring` function extracts the first fenced docstring block from the LLM's response.
-   If no docstring is found, it generates a default message indicating that the docstring generation failed.
-
-6. **Patch Application**: The `patch_docstrings_textually` function applies the generated or updated docstrings to the source code.
-   It ensures that comments and blank lines are preserved while updating the docstrings. The function processes the definitions in
-   reverse order to maintain index stability during updates.
-
-7. **Main Functionality**: The `generate_language_comments` function orchestrates the entire process, from parsing the source code to
-   applying the generated docstrings. It uses the other functions to identify definitions, generate docstrings, and apply the patches.
-
-### Highlights
-
-- **Precision in Definition Identification**: The program uses the `DefInfo` class to precisely identify and manipulate definitions
-  within the AST.
-- **Depth-First Processing**: Definitions are processed in a depth-first manner, ensuring that parent definitions are handled after
-  their children.
-- **LLM Integration**: The program leverages an LLM to generate docstrings based on the provided prompts and existing code snippets.
+* **Precision in Definition Identification**: The program uses the `DefInfo` class to precisely identify and manipulate definitions within the AST.
+* **Depth-First Processing**: Definitions are processed in a depth-first manner, ensuring that parent definitions are handled after their children.
+* **LLM Integration**: The program leverages an LLM to generate docstrings based on the provided prompts and existing code snippets.
+* **Stability during Updates**: The program ensures stability during updates by processing definitions in reverse order by start position.
+* **Preservation of Comments and Formatting**: The program preserves all comments, blank lines, and formatting while updating docstrings.
 """
 
 from __future__ import annotations
@@ -92,7 +71,7 @@ def _is_def_node(n: ast.AST) -> bool:
     Determine whether the given AST node represents a function definition, async function definition, or class definition.
 
     Parameters:
-    - n: The AST node to check.
+    - `n`: The AST node to check.
 
     Returns:
     - `True` if the node is a function definition, async function definition, or class definition, otherwise `False`.
@@ -123,7 +102,8 @@ def _node_kind(n: ast.AST) -> str:
 
 def _header_span(n: ast.AST) -> Tuple[int, int]:
     """
-    Return the start and end lines for the node's header, including decorators and the full (possibly multi-line) signature, ending on the line before the first body statement.
+    Return the start and end lines for the node's header, including decorators and the full (possibly multi-line) signature,
+    ending on the line before the first body statement.
 
     Parameters:
     - `n`: An Abstract Syntax Tree (AST) node representing a definition.
@@ -146,10 +126,13 @@ def _header_span(n: ast.AST) -> Tuple[int, int]:
 
 def _property_accessor_role(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> Optional[Tuple[str, str]]:
     """
-    Detect @prop.getter / @prop.setter / @prop.deleter on a function.
+    Detect the role of a function as a property accessor.
+
+    This function inspects the function's decorator list to identify whether it is a getter, setter, or deleter for a property.
 
     Returns:
-        (property_name, role) where role ∈ {"getter","setter","deleter"}, or None.
+        A tuple containing the property name and its corresponding role, where role ∈ {"getter", "setter", "deleter"}, or None
+        if no matching decorator is found.
     """
     roles = {"getter", "setter", "deleter"}
     for deco in getattr(fn, "decorator_list", []) or []:
@@ -162,6 +145,9 @@ def _property_accessor_role(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> Optio
 def iter_defs_with_info(tree: ast.AST) -> List[DefInfo]:
     """
     Walk the AST using a scope stack to produce precise, nested definition info.
+
+    This function traverses the Abstract Syntax Tree (AST) and returns a sorted list of `DefInfo` objects,
+    each representing a definition in the code. The definitions are ordered by their start line.
 
     Parameters:
     - `tree`: The Abstract Syntax Tree (AST) to traverse and process.
@@ -183,7 +169,9 @@ def iter_defs_with_info(tree: ast.AST) -> List[DefInfo]:
         - `parent_node`: The parent node in the Abstract Syntax Tree (AST).
         - `child_node`: The child node to be added.
 
-        If the parent node is `None`, no action is taken.
+        Notes:
+        If the parent node is `None`, no action is taken. Otherwise, the child node's ID is added to the parent's
+        children map under its unique identifier.
         """
 
         if parent_node is None:
@@ -193,12 +181,12 @@ def iter_defs_with_info(tree: ast.AST) -> List[DefInfo]:
 
     def walk(node: ast.AST) -> None:
         """
-        Traverse and process each child node of the given AST node.
+        Process each child node of the given AST node, capturing relevant metadata for definitions.
 
-        This function recursively traverses the Abstract Syntax Tree (AST) to process each child node. For each
-        definition node, it builds a qualified name (qualname) and captures relevant line information such as
-        start, end, and definition lines. The qualname is constructed based on the node's type and any property
-        accessors, and is stored in the `DefInfo` data structure along with other metadata.
+        This function recursively traverses the Abstract Syntax Tree (AST) to process each child node. For each definition
+        node, it builds a qualified name (qualname) and captures relevant line information such as start, end, and definition
+        lines. The qualname is constructed based on the node's type and any property accessors, and is stored in the `DefInfo`
+        data structure along with other metadata.
 
         Parameters:
         - `node`: The current AST node to process.
@@ -274,7 +262,8 @@ def iter_defs_with_info(tree: ast.AST) -> List[DefInfo]:
 def deepest_first(defs: List[DefInfo]) -> List[DefInfo]:
     # depth desc; for stability: start asc, end desc
     """
-    Sort the definitions in deepest-first order, ensuring stability by starting with ascending depths, then start positions, and finally descending end positions.
+    Sort the definitions in deepest-first order, ensuring stability by starting with ascending depths, then start positions,
+    and finally descending end positions.
 
     Parameters:
     - `defs`: A list of `DefInfo` objects representing the definitions to be sorted.
@@ -317,14 +306,17 @@ def generate_docstrings(
 
     def extract_first_docstring(reply: str) -> str:
         """
-        Extract the first fenced docstring block (\"\"\", ''' or ```). If none,
-        treat the entire reply as the candidate. Dedent and strip. Returns "" if empty.
+        Extract the first fenced docstring block from a reply string.
+
+        This function searches for the first occurrence of a triple-quoted or triple-backtick block,
+        and returns its contents, dedented and stripped. If no such block is found, it treats the entire
+        reply as the candidate docstring.
 
         Parameters:
         - `reply`: The input string from which to extract the docstring.
 
         Returns:
-        - The extracted docstring, dedented and stripped. Returns "" if no docstring is found.
+        - The extracted docstring, dedented and stripped. Returns an empty string if no docstring is found.
         """
         lines = reply.split("\n")
         stripped = [ln.strip() for ln in lines]
@@ -354,14 +346,19 @@ def generate_docstrings(
 
     def get_text_for_lines(line_a: int, line_b: int) -> str:
         """
-        Return source text for inclusive 1-based line range [line_a, line_b].
+        Return source text for an inclusive 1-based line range [line_a, line_b].
 
         Parameters:
-        - line_a: The start of the line range (1-based).
-        - line_b: The end of the line range (1-based).
+        - `line_a`: The start of the line range (1-based).
+        - `line_b`: The end of the line range (1-based).
 
         Returns:
         - A string containing the source text for the specified line range.
+
+        Notes:
+        - The function ensures that the line range is valid by clamping `line_a` to at least 1 and `line_b` to at most the
+          number of source lines.
+        - If the line range is invalid, an empty string is returned.
         """
         a = max(1, line_a)
         b = min(len(source_lines), line_b)
@@ -403,13 +400,13 @@ def generate_docstrings(
 
     def make_child_stub(child_node_id: int) -> str:
         """
-        Return 'decorators + header + child docstring' for a direct child.
+        Return a string containing the combined decorators, header, and child docstring for a direct child node.
 
         Parameters:
         - `child_node_id`: The ID of the child node for which to generate the stub.
 
         Returns:
-        - A string containing the combined decorators, header, and child docstring.
+        - A string combining the decorators, header, and child docstring.
         """
         child_info = info_by_node_id[child_node_id]
         header_text = get_text_for_lines(child_info.header_start, child_info.header_end)
@@ -430,10 +427,10 @@ def generate_docstrings(
 
     def assemble_snippet_for(node_id: int) -> str:
         """
-        For the given node:
-        - include header (decorators + signature),
-        - include body statements verbatim except:
-          direct child definitions are replaced by stubs (header + docstring).
+        Assemble a code snippet for the given node.
+
+        This function constructs a code snippet by including the node's header (decorators and signature) and body statements.
+        Direct child definitions are replaced with stubs, containing only their headers and docstrings.
 
         Parameters:
         - `node_id`: The ID of the node for which to assemble the snippet.
@@ -514,8 +511,9 @@ def generate_docstrings(
 
 def patch_docstrings_textually(source_lines: Chunk, defs: List[DefInfo], doc_map: Dict[str, str]) -> Chunk:
     """
-    Return new source lines with docstrings replaced or inserted, preserving all comments,
-    blank lines, and formatting.
+    Replace or insert docstrings in the source code, preserving comments, blank lines, and formatting.
+
+    This function applies edits to the source code in reverse order by start position, ensuring that earlier slices remain valid.
 
     Parameters:
     - `source_lines`: A list of strings representing the source code lines.
@@ -526,10 +524,10 @@ def patch_docstrings_textually(source_lines: Chunk, defs: List[DefInfo], doc_map
     - A list of strings representing the modified source code lines.
 
     Notes:
-    - Uses `DefInfo` (qualname, node, start/end, def_line, header_start/header_end, etc.) to identify definitions.
-    - Applies edits in reverse order by start position so earlier slices remain valid.
-    - If an existing docstring is present (first body expression is a string), it is replaced.
-      Otherwise, a new docstring is inserted immediately after the header block.
+    - Uses `DefInfo` to identify definitions and compute the indent for the docstring block.
+    - If an existing docstring is present, it is replaced; otherwise, a new docstring is inserted immediately after the header block.
+    - Preserves surrounding code as-is when replacing an existing docstring.
+    - Applies edits in reverse order by start position to ensure stability during updates.
     """
 
     out_lines = source_lines[:]  # mutable copy
@@ -580,7 +578,10 @@ def generate_language_comments(
     source_lines: Chunk
 ) -> Chunk:
     """
-    Process Python source code and generate new/updated docstrings for each def/class.
+    Process Python source code and generate new/updated docstrings for each definition.
+
+    This function takes in the language model, generation configuration, message history, source code text,
+    and source code lines, and returns a patched source file with updated docstrings.
 
     Parameters:
     - llm: The language-model interface used to generate text.

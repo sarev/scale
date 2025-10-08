@@ -1,6 +1,36 @@
 #!/usr/bin/env python3
 """
-This module TODO.
+This program is a Python implementation of a chatbot using the llama_cpp library, which is a wrapper around the LLaMA
+(Large Language Model Application) model. The program allows users to interact with the chatbot by providing a list of
+messages, which are then formatted into a prompt that is used to generate a response from the LLaMA model.
+
+Here's a high-level overview of how the program works:
+
+1. The user provides a list of messages, which are stored in a data structure called `messages`.
+2. The program uses a formatter function (selected by the user or automatically detected from the model filename) to
+   format the messages into a prompt.
+3. The formatted prompt is then used to generate a response from the LLaMA model using the `create_completion` method
+   of the llama_cpp library.
+4. The generated response is returned to the user as a string.
+
+Some highlights of the internal workings of the program include:
+
+* The use of a formatter function to format the messages into a prompt. This allows the program to support different
+  chat formats, such as Qwen, LLaMA 3, and Mistral.
+* The use of the llama_cpp library to interact with the LLaMA model. This library provides a Python interface to the
+  model, allowing users to easily generate responses from the model.
+* The use of a `GenerationConfig` class to store generation settings, such as the maximum number of tokens to generate
+  and the temperature of the model.
+* The use of a `LocalChatModel` class to encapsulate the chatbot's behavior. This class provides methods for generating
+  responses, detecting the chat format, and counting tokens.
+
+Some notable features of the program include:
+
+* Support for multiple chat formats, including Qwen, LLaMA 3, and Mistral.
+* Automatic detection of the chat format from the model filename.
+* Support for generating responses from the LLaMA model using the `create_completion` method.
+* Use of a `GenerationConfig` class to store generation settings.
+* Use of a `LocalChatModel` class to encapsulate the chatbot's behaviour.
 """
 
 from __future__ import annotations
@@ -20,27 +50,32 @@ Chunk = List[str]
 
 
 def _strip_none(xs: Sequence[Optional[str]]) -> List[str]:
-    """Remote all `None` values from a sequence of optional strings."""
+    """
+    Remove all `None` values from a sequence of optional strings.
+
+    This function filters out any `None` values from the input sequence, returning a new list containing only the non-`None` string values.
+
+    Parameters:
+    - `xs`: A sequence of optional strings, where each element may be either a string or `None`.
+
+    Returns:
+    - A list of strings, with all `None` values removed.
+    """
     return [x for x in xs if x]
 
 
 def _normalise_messages(messages: Messages) -> Messages:
     """
-    Defensive normalisation. Keeps only known keys, coerces to strings.
+    Normalise a list of message dictionaries to ensure they contain only valid and expected key-value pairs.
 
-    This function ensures that the messages dictionary contains only valid and expected key-value pairs.
-    It strips any leading or trailing whitespace from the 'role' and 'content' fields and discards any
-    messages where either field is empty.
+    This function strips any leading or trailing whitespace from the 'role' and 'content' fields and discards
+    any messages where either field is empty. It assumes that the input messages are dictionaries.
 
     Parameters:
     - messages: The input list of message dictionaries to be normalised.
 
     Returns:
-    - out: A new list of message dictionaries with only valid and normalised entries.
-
-    Notes:
-    - This function assumes that the input messages are dictionaries. If this assumption is violated,
-      it will raise a TypeError.
+    - A new list of message dictionaries with only valid and normalised entries.
     """
 
     out: Messages = []
@@ -55,18 +90,18 @@ def _normalise_messages(messages: Messages) -> Messages:
 
 def format_chat_qwen(messages: Messages) -> Tuple[str, Chunk]:
     """
-    Qwen2.5 ChatML format:
+    Format the input messages into a Qwen2.5 ChatML prompt.
 
-    <|im_start|>system
-    ...<|im_end|>
-    <|im_start|>user
-    ...<|im_end|>
-    <|im_start|>agent
-    ...<|im_end|>
-    <|im_start|>assistant
-    ...<|im_end|>
+    This function takes a list of normalised messages and formats them into a prompt
+    structured according to the Qwen2.5 ChatML format. The prompt includes separate
+    turns for the system, user, agent, and assistant.
 
-    Returns (prompt, stop_tokens).
+    Parameters:
+    - `messages`: A list of normalised messages.
+
+    Returns:
+    - `prompt`: The formatted Qwen2.5 ChatML prompt as a string.
+    - `stop_tokens`: A list of tokens that mark the end of the prompt.
     """
     parts: Chunk = []
     for m in _normalise_messages(messages):
@@ -81,21 +116,30 @@ def format_chat_qwen(messages: Messages) -> Tuple[str, Chunk]:
 
 def format_chat_llama3(messages: Messages) -> Tuple[str, Chunk]:
     """
-    Llama 3 Instruct style with header tokens.
+    Format a list of messages into a prompt for the LLaMA 3 model.
 
-    <|start_header_id|>system<|end_header_id|>
+    This function takes a list of messages and formats them into a prompt in the style of LLaMA 3 Instruct.
+    The prompt is constructed by iterating over the messages, formatting each one as a block with a specified role,
+    and then joining the blocks together. The resulting prompt is returned along with a list of stop tokens.
 
-    ...<|eot_id|><|start_header_id|>user<|end_header_id|>
+    Parameters:
+    - `messages`: A list of messages to be formatted into a prompt.
 
-    ...<|eot_id|><|start_header_id|>agent<|end_header_id|>
-
-    ...<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-
-    ...<|eot_id|>
-
-    We open an assistant header without the trailing <|eot_id|>.
+    Returns:
+    - A tuple containing the formatted prompt and a list of stop tokens.
     """
     def block(role: str, content: str) -> str:
+        """
+        Format a block of content with a specified role.
+
+        Parameters:
+        - `role`: The role of the block (e.g. "header", "paragraph", etc.).
+        - `content`: The content to be formatted.
+
+        Returns:
+        - A string representing the formatted block.
+        """
+
         return f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>"
 
     parts: Chunk = []
@@ -113,9 +157,18 @@ def format_chat_llama3(messages: Messages) -> Tuple[str, Chunk]:
 
 def format_chat_llama2(messages: Messages) -> Tuple[str, Chunk]:
     """
-    Llama 2 Chat style using [INST] and optional <<SYS>>.
+    Format chat messages into a prompt for the LLaMA 2 model.
 
-    If the first message is system, it is folded into the first user turn per Meta guide.
+    This function takes a list of chat messages and formats them into a prompt using the LLaMA 2 chat style.
+    The first message is folded into the first user turn if it is a system message. The formatted prompt is then
+    returned along with a list of stop tokens.
+
+    Parameters:
+    - `messages`: A list of chat messages, where each message is a dictionary containing the role and content of the message.
+
+    Returns:
+    - `prompt`: The formatted prompt as a string.
+    - `stops`: A list of stop tokens used by the LLaMA 2 model.
     """
     msgs = _normalise_messages(messages)
     sys_txt = ""
@@ -154,7 +207,16 @@ def format_chat_llama2(messages: Messages) -> Tuple[str, Chunk]:
 
 def format_chat_mistral(messages: Messages) -> Tuple[str, Chunk]:
     """
-    Mistral/Mixtral Instruct uses [INST] ... [/INST] blocks without <<SYS>> by default.
+    Format the input messages into a Mistral/Mixtral Instruct prompt.
+
+    This function takes a list of messages and formats them into a prompt suitable for the LLaMA model.
+    It uses the [INST] ... [/INST] blocks without <<SYS>> by default, as specified in the Mistral format.
+
+    Parameters:
+    - `messages`: A list of messages to be formatted, where each message is a dictionary with 'role' and 'content' keys.
+
+    Returns:
+    - A tuple containing the formatted prompt as a string and a list of stop tokens.
     """
     msgs = _normalise_messages(messages)
     parts: Chunk = []
@@ -178,18 +240,21 @@ def format_chat_mistral(messages: Messages) -> Tuple[str, Chunk]:
 
 def format_chat_phi3(messages: Messages) -> Tuple[str, Chunk]:
     """
-    Phi-3 style:
+    Format the input messages into a Phi-3 style prompt.
 
-    <|system|>
-    ...<|end|>
-    <|user|>
-    ...<|end|>
-    <|agent|>
-    ...<|end|>
-    <|assistant|>
-    ...<|end|>
+    This function takes a list of messages and formats them into a string, following the Phi-3 style:
+    - System messages are prefixed with `<|system|>` and suffixed with `<|end|>`.
+    - User messages are prefixed with `<|user|>` and suffixed with `<|end|>`.
+    - Agent messages are prefixed with `<|agent|>` and suffixed with `<|end|>`.
+    - Assistant messages are prefixed with `<|assistant|>` and suffixed with `<|end|>`, but the final assistant
+      message is left open without a closing `<|end|>`.
 
-    Open assistant tag without <|end|> to anchor generation.
+    Parameters:
+    - `messages`: A list of messages to be formatted, where each message is a dictionary containing the role and
+      content of the message.
+
+    Returns:
+    - A tuple containing the formatted prompt string and a list of stop tokens.
     """
     parts: Chunk = []
     for m in _normalise_messages(messages):
@@ -223,13 +288,33 @@ FORMATTERS = {
 
 
 def llm_formatters() -> List[str]:
+    """
+    Return a list of available LLaMA model formatters.
+
+    This function returns a list of formatter names that are currently supported by the program.
+    The list includes the names of all registered formatters, which can be used to format messages
+    into a prompt for the LLaMA model.
+
+    Returns:
+    - A list of strings, where each string is the name of a supported formatter.
+    """
+
     return FORMATTERS.keys()
 
 
 def _auto_detect_format(model_path: str) -> str:
     """
-    Light heuristic based on filename. Returns a key present in FORMATTERS.
-    Defaults to 'qwen' if unsure to avoid silent mismatches.
+    Detect the chat format from the model filename.
+
+    This function uses a light heuristic based on the filename to determine the chat format.
+    It returns a key present in the `FORMATTERS` dictionary. If unsure, it defaults to 'qwen'
+    to avoid silent mismatches.
+
+    Parameters:
+    - `model_path`: The path to the model file.
+
+    Returns:
+    - A string representing the detected chat format (e.g. 'qwen', 'llama3', etc.).
     """
     name = os.path.basename(model_path).lower()
     if re.search(r"qwen", name):
@@ -251,35 +336,23 @@ def _auto_detect_format(model_path: str) -> str:
 @dataclass
 class GenerationConfig:
     """
-    Settings that control how text is generated. Values are safe defaults for small 7B models.
-    All counts refer to tokens, not characters.
+    Settings that control how text is generated.
 
     Attributes
     ----------
     max_new_tokens : int
         Hard limit on how many tokens to generate after the prompt. Generation may stop earlier
-        if an end-of-sequence token or a stop string is produced. Larger values take longer and
-        use more memory for the KV cache.
-
+        if an end-of-sequence token or a stop string is produced.
     temperature : float
         Controls randomness by smoothing the probability distribution. 0 gives greedy decoding
-        and is deterministic. Higher values increase diversity. Typical ranges:
-        0.0–0.3 for factual or tool use, 0.7–1.0 for creative writing.
-
+        and is deterministic.
     top_p : float
         Nucleus sampling. At each step keep the smallest set of tokens whose cumulative
-        probability ≥ top_p, then sample from that set. 1.0 effectively disables nucleus
-        sampling. Lower values (for example 0.8–0.95) reduce riskier tokens.
-
+        probability ≥ top_p, then sample from that set.
     top_k : int
-        Top-k sampling. At each step consider only the top_k most likely tokens. 0 usually
-        disables this cap in most runtimes. Values in the 20–100 range are common. If both
-        top_p and top_k are set, most backends apply both filters, which is more restrictive.
-
+        Top-k sampling. At each step consider only the top_k most likely tokens.
     repeat_penalty : float
-        Penalises tokens that have appeared recently to reduce repetition. 1.0 means no penalty.
-        Values slightly above 1.0, such as 1.05–1.2, are typical. Excessive penalties can harm
-        fluency or cause early stops.
+        Penalises tokens that have appeared recently to reduce repetition.
 
     Notes
     -----
@@ -300,6 +373,9 @@ class LocalChatModel:
     """
     Wraps llama_cpp.Llama with explicit chat formatting and raw completion.
 
+    This class provides a Python interface to the LLaMA model, allowing users to easily generate responses from the model.
+    It abstracts over the underlying llama_cpp library, providing a simple and intuitive API for building chatbots.
+
     You can set `chat_format` to any key in FORMATTERS or "auto".
     """
 
@@ -308,10 +384,8 @@ class LocalChatModel:
         """
         Download a LLM model (.gguf file or files) into a local models folder.
 
-        - Downloads into `<models_path>/<basename(repo_id)>`.
-        - Filters with `include` (same idea as `--include`).
-        - Returns the path to the downloaded file, or the first shard if present (`*-00001-of-*.gguf`).
-        - `models_path` is relative to CWD or absolute; the returned path will be likewise.
+        Downloads into `<models_path>/<basename(repo_id)>`, filters with `include` (same idea as `--include`),
+        and returns the path to the downloaded file, or the first shard if present (`*-00001-of-*.gguf`).
 
         Parameters
         ----------
@@ -320,8 +394,8 @@ class LocalChatModel:
         include : str | Iterable[str]
             Glob pattern(s) to include (mirrors `--include`), e.g. "qwen2.5-7b-instruct-*.gguf".
         models_path : str, optional
-            Base directory for all models. Defaults to "./models". A subdirectory named after the
-            basename of `repo_id` is created inside this directory.
+            Base directory for all models. Defaults to "./models". A subdirectory named after the basename of `repo_id`
+            is created inside this directory.
 
         Returns
         -------
@@ -336,13 +410,13 @@ class LocalChatModel:
         Examples
         --------
 
-        Find the LLM repository you want at https://huggingface.co/ (and generally request access) then locate
-        the "Files and versions" to see how the model file(s) is/are named. E.g. "*.safetensors" or "*.gguf".
+        Find the LLM repository you want at <https://huggingface.co/> (and generally request access) then locate
+        the "Files and versions" to see how the model file(s) is/are named. E.g. "*.gguf".
 
+        ```python
         model_file = LocalChatModel.download_model("Qwen/Qwen2.5-7B-Instruct-GGUF", " qwen2.5-7b-instruct-q4_k_m-*.gguf", "/d/Programming/llm/models")
-
         model_file = LocalChatModel.download_model("bartowski/Meta-Llama-3.1-8B-Instruct-GGUF", "Meta-Llama-3.1-8B-Instruct-Q6_K.gguf")
-
+        ```
         """
 
         from huggingface_hub import snapshot_download
@@ -463,18 +537,58 @@ class LocalChatModel:
         self.ctx_margin = int(n_ctx * 0.10)     # Safety margin in calculation for whether the prompt risks exceeding the context window
 
     def set_chat_format(self, chat_format: str) -> None:
-        """Allow manual override of the chat format for this instance."""
+        """
+        Set the chat format for this instance.
+
+        This call allows manual override of the chat format, overriding automatic detection from the model filename.
+        The chat format must be one of the supported formats, listed below.
+
+        Parameters:
+        - `chat_format`: The desired chat format (e.g. Qwen, LLaMA 3, Mistral).
+
+        Raises:
+        - `ValueError`: If an unsupported chat format is specified.
+
+        Notes:
+        Supported chat formats: {sorted(FORMATTERS.keys())}
+        """
         key = chat_format.lower()
         if key not in FORMATTERS:
             raise ValueError(f"Unknown chat_format '{chat_format}'. Valid: {sorted(FORMATTERS.keys())}")
         self.chat_format = key
 
     def _build_prompt(self, messages: Messages) -> Tuple[str, Chunk]:
+        """
+        Build a prompt from the given list of messages.
+
+        This call selects the appropriate formatter function based on the chat format and uses it to format the messages into a prompt.
+
+        Parameters:
+        - `messages`: The list of messages to be formatted into a prompt.
+
+        Returns:
+        - A tuple containing the formatted prompt as a string and the chunk of text that was used to generate the prompt.
+        """
+
         formatter = FORMATTERS[self.chat_format]
         return formatter(messages)
 
     def _trim_needed(self, cfg: GenerationConfig, prompt: str):
         # Get prompt text as raw UTF-8 bytes
+        """
+        Determine if the prompt needs trimming to fit within the context window.
+
+        This method estimates the number of tokens in the prompt and checks if it exceeds the available context window size.
+        If the prompt is too long, it may be trimmed to fit within the allowed context.
+
+        Parameters:
+        - `cfg`: The generation configuration for this instance.
+        - `prompt`: The input prompt text as a string.
+
+        Returns:
+        - `True` if the prompt needs trimming, `False` otherwise.
+        """
+
         prompt_utf8 = prompt.encode("utf-8")
         prompt_bytes = len(prompt_utf8)
 
@@ -496,30 +610,29 @@ class LocalChatModel:
         stop: Optional[Chunk] = None,
     ) -> str:
         """
-        Produce a single non-streaming completion using an explicit chat-formatted prompt. The method
-        builds a prompt for the selected `chat_format`, opens an assistant turn to anchor generation, and
-        calls `llama_cpp.Llama.create_completion`.
+        Produce a single non-streaming completion using an explicit chat-formatted prompt.
+
+        This method builds a prompt for the selected `chat_format`, opens an assistant turn to anchor generation,
+        and calls `llama_cpp.Llama.create_completion`.
 
         Parameters
         ----------
         messages : List[Dict[str, str]]
-            Ordered chat transcript as dictionaries with keys {"role", "content"}. Expected roles are
-            "system", "user", and "assistant". Unknown roles are ignored by formatters. The list must be
-            non-empty.
+            Ordered chat transcript as dictionaries with keys {"role", "content"}. Expected roles are "system",
+            "user", and "assistant". Unknown roles are ignored by formatters. The list must be non-empty.
         cfg : Optional[GenerationConfig], default None
-            Generation settings. If None, defaults are used:
-            `max_new_tokens=512`, `temperature=0.3`, `top_p=0.9`, `top_k=60`, `repeat_penalty=1.05`.
-            These map to the corresponding `create_completion` parameters.
+            Generation settings. If None, defaults are used: `max_new_tokens=512`, `temperature=0.3`,
+            `top_p=0.9`, `top_k=60`, `repeat_penalty=1.05`. These map to the corresponding `create_completion`
+            parameters.
         stop : Optional[Chunk], default None
-            Additional stop strings to append after the formatter specific stop set. Duplicates are removed
-            with first occurrence preserved. Use this to prevent the model from starting new turns that are
-            specific to your application protocol.
+            Additional stop strings to append after the formatter specific stop set. Duplicates are removed with
+            first occurrence preserved. Use this to prevent the model from starting new turns that are specific to
+            your application protocol.
 
         Returns
         -------
         str
-            The assistant text returned by llama.cpp for the open assistant turn, with trailing whitespace
-            stripped.
+            The assistant text returned by llama.cpp for the open assistant turn, with trailing whitespace stripped.
 
         Raises
         ------
@@ -531,8 +644,9 @@ class LocalChatModel:
         Behaviour
         ---------
         Each formatter supplies a conservative default stop list to avoid the model emitting role markers or
-        end-of-text tokens. You can pass a `seed` via `**llama_kwargs` at construction time if you need
-        reproducibility. The call is synchronous and does not stream tokens.
+        end-of-text tokens.
+        You can pass a `seed` via `**llama_kwargs` at construction time if you need reproducibility.
+        The call is synchronous and does not stream tokens.
         """
 
         if not isinstance(messages, list) or not messages:
@@ -675,8 +789,7 @@ class LocalChatModel:
         Parameters
         ----------
         model_path : str | None, default None
-            Filesystem path or filename used for heuristic detection. If omitted, the instance's
-            `self.model_path` is used.
+            Filesystem path or filename used for heuristic detection. If omitted, the instance's `self.model_path` is used.
 
         Returns
         -------
@@ -685,7 +798,7 @@ class LocalChatModel:
 
         Notes
         -----
-        This uses the same filename-based heuristic as the constructor: it looks for substrings like "qwen",
+        This uses a filename-based heuristic to determine the most likely chat format. It looks for substrings like "qwen",
         "llama3", "llama", "mistral" or "mixtral", and "phi3". If no match is found, it defaults to "qwen".
         """
         target = model_path or self.model_path
@@ -708,7 +821,7 @@ class LocalChatModel:
         -------
         int
             The number of tokens for the formatted prompt, as tokenised by the
-            underlying model's tokenizer.
+            underlying model's tokeniser.
 
         Raises
         ------

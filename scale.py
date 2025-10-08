@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-This module TODO.
-"""
+ This program is a source code annotation tool called SCALE, which uses a Large Language Model (LLM) to generate comments and
+ summaries for the provided source code. It supports various programming languages, including Python, JavaScript, and C.
+
+ The tool can be run from the command line with optional arguments to customise its behaviour. It loads the source file,
+ determines the language, and then primes the LLM with a system prompt and the source file as context. The LLM is then used
+ to generate comments and summaries for the code.
+ """
 
 from __future__ import annotations
 
@@ -31,23 +36,34 @@ def load_source(src_path: Path, language: Optional[str] = None) -> Tuple[str, Ch
     """
     Load a source file and return its contents, along with other information.
 
+    This function loads the specified source file, determines its line ending, and guesses the programming language.
+    It returns a tuple containing the complete source file text, individual lines, line ending string, and file suffix.
+
     Parameters:
-    - source: The source file path.
+    - `src_path`: The path to the source file to be loaded.
+    - `language`: The optional language identifier (default: None).
 
     Returns:
     - A tuple containing:
-      - The complete text of the source file as a single string (with original line endings).
-      - The source file split into individual lines.
-      - The source file line ending string ('\n', '\r', or '\r\n').
-      - The file suffix for the source language (e.g. "python" or "c").
+      - `source_blob`: The complete text of the source file as a single string (with original line endings).
+      - `source_lines`: The source file split into individual lines.
+      - `line_ending`: The source file line ending string ('\n', '\r', or '\r\n').
+      - `language`: The guessed language identifier, e.g. "c", "cpp", "js", etc.
+
+    Notes:
+    - If the file is not found, an error message is printed and the program exits.
+    - If the language is not specified, it is guessed based on the source code heuristics.
     """
 
     def guess_language(source_lines: List[str]) -> str:
         """
-        Apply heuristics to try to guess the programming language from the supplied lines of source code.
+        Guess the programming language from the supplied lines of source code.
+
+        This function applies heuristics to determine the likely programming language
+        based on the presence of specific keywords, syntax, and patterns in the source code.
 
         Args:
-        - source_lines: the list of source file lines of interest.
+        - source_lines: The list of source file lines of interest.
 
         Returns:
         - The guessed language identifier, e.g.
@@ -183,7 +199,19 @@ def prime_llm_for_comments(
     source_blob: str,
     language: str
 ) -> Messages:
-    """."""
+    """
+    Prepare the Large Language Model (LLM) for generating comments by priming it with a system prompt and the source file as context.
+
+    Parameters:
+    - `llm`: The LocalChatModel instance to be primed.
+    - `cfg`: The GenerationConfig instance controlling the LLM's behavior.
+    - `scale_path`: The path to the SCALE tool's configuration directory.
+    - `source_blob`: The source code as a string.
+    - `language`: The programming language of the source code.
+
+    Returns:
+    - A list of messages exchanged between the system and the LLM, including the priming prompts and the generated responses.
+    """
 
     echo("Priming LLM...")
 
@@ -240,7 +268,26 @@ def generate_comments(
     language: Optional[str] = None
 ) -> int:
     """
-    .
+    Generate comments for the provided source code using a Large Language Model (LLM).
+
+    This function loads the source file, primes the LLM with a system prompt and the source file as context,
+    and then uses the LLM to generate comments and summaries for the code. The generated comments are
+    written to the specified destination path.
+
+    Parameters:
+    - `llm`: The LocalChatModel instance used for generating comments.
+    - `cfg`: The GenerationConfig instance containing configuration settings.
+    - `scale_path`: The path to the SCALE tool installation directory.
+    - `src_path`: The path to the source file to be annotated.
+    - `dst_path`: The path where the updated source file will be written (optional).
+    - `language`: The programming language of the source code (optional).
+
+    Returns:
+    - 0 if the operation was successful, or an error number.
+
+    Notes:
+    - Supported languages are Python, JavaScript, and C.
+    - If the destination path is not provided, the generated comments will be printed to the console.
     """
 
     source_blob, source_lines, line_ending, language = load_source(src_path, language)
@@ -272,8 +319,26 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """
     Parse command-line arguments and return an argparse.Namespace object.
 
+    This function takes optional command-line arguments, parses them using the ArgumentParser,
+    and returns an argparse.Namespace object containing the parsed arguments.
+
     Parameters:
     - argv: Optional list of strings to parse as command-line arguments. If not provided, sys.argv[1:] is used.
+    - model: Path to GGUF model file (optional).
+    - output: Output filename (optional).
+    - comment: Add and update comments in the source code (optional).
+    - language: Source file language (optional). SCALE currently supports 'python', 'js'.
+    - verbose: Output progress information to stdout (optional).
+    - very-verbose: Output LLM debug information to stdout (optional).
+    - n-ctx: Number of tokens to use as context (default: 32 * 1024).
+    - max-new-tokens: Maximum number of new tokens to generate (default: 8 * 1024).
+    - format: Chat format override (default: 'auto').
+    - temperature: Temperature value for the LLM (default: 0.2).
+    - top-p: Top-p value for the LLM (default: 0.9).
+    - top-k: Top-k value for the LLM (default: 60).
+    - repeat-penalty: Repeat penalty value for the LLM (default: 1.05).
+    - n-batch: Number of batches to process (default: 512).
+    - n-gpu-layers: Number of GPU layers to use (default: -1).
 
     Returns:
     - An argparse.Namespace object containing the parsed arguments.
