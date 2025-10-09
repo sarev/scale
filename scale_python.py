@@ -146,8 +146,8 @@ def _property_accessor_role(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> Optio
     This function inspects the function's decorator list to identify whether it is a getter, setter, or deleter for a property.
 
     Returns:
-        A tuple containing the property name and its corresponding role, where role ∈ {"getter", "setter", "deleter"}, or None
-        if no matching decorator is found.
+    - A tuple containing the property name and its corresponding role, where role ∈ {"getter", "setter", "deleter"}, or None
+      if no matching decorator is found.
     """
     roles = {"getter", "setter", "deleter"}
     for deco in getattr(fn, "decorator_list", []) or []:
@@ -178,10 +178,10 @@ def iter_defs_with_info(tree: ast.AST) -> List[DefInfo]:
 
     def add_child(parent_node: Optional[ast.AST], child_node: ast.AST) -> None:
         """
-        Add a child node to the parent's list of children.
+        Add a child node to the parent's list of children in the Abstract Syntax Tree (AST).
 
         Parameters:
-        - `parent_node`: The parent node in the Abstract Syntax Tree (AST).
+        - `parent_node`: The parent node in the AST.
         - `child_node`: The child node to be added.
 
         Notes:
@@ -196,18 +196,17 @@ def iter_defs_with_info(tree: ast.AST) -> List[DefInfo]:
 
     def walk(node: ast.AST) -> None:
         """
-        Process each child node of the given AST node, capturing relevant metadata for definitions.
+        Recursively traverse the Abstract Syntax Tree (AST) to process each child node, capturing relevant metadata for definitions.
 
-        This function recursively traverses the Abstract Syntax Tree (AST) to process each child node. For each definition
-        node, it builds a qualified name (qualname) and captures relevant line information such as start, end, and definition
-        lines. The qualname is constructed based on the node's type and any property accessors, and is stored in the `DefInfo`
-        data structure along with other metadata.
+        This function processes each child node of the given AST node, building a qualified name (qualname) and capturing relevant
+        line information such as start, end, and definition lines. The qualname is constructed based on the node's type and any
+        property accessors, and is stored in the `DefInfo` data structure along with other metadata.
 
         Parameters:
         - `node`: The current AST node to process.
 
         Returns:
-        - None: This function does not return a value; it populates the `results` list with `DefInfo` objects.
+        - None: This function does not return a value; it populates the `results` list with `DefInfo` objects as a side-effect.
         """
 
         for child in ast.iter_child_nodes(node):
@@ -274,8 +273,148 @@ def iter_defs_with_info(tree: ast.AST) -> List[DefInfo]:
     return sorted(completed, key=lambda d: d.start)
 
 
+def _format_from_source(module: Optional[str], level: int) -> str:
+    """
+    Render the 'from' target, preserving relative dots.
+
+    This function formats the `module` parameter with a specified number of leading dots (`level`).
+
+    Parameters:
+    - `module`: The module name to be formatted (optional).
+    - `level`: The number of leading dots to include.
+
+    Returns:
+    - A string representing the formatted 'from' target.
+    """
+    dots = "." * level
+    return f"{dots}{module or ''}" or "."
+
+
+class _ImportDescriber(ast.NodeVisitor):
+    """
+    Abstract class for describing import statements in the Abstract Syntax Tree (AST).
+
+    This class provides a way to record and process import statements, including `Import` and `ImportFrom` nodes.
+
+    Parameters:
+    - `_items`: A list of tuples containing line numbers and import text.
+
+    Notes:
+    - The class is designed to be subclassed and extended for specific use cases.
+    - The `visit_Import` and `visit_ImportFrom` methods are responsible for iterating over the AST and extracting information about import statements.
+    - The `results` method returns a sorted list of text results, ensuring robustness in case the visitor order differs from the source order.
+
+    Subclasses should override the following methods to customize the import description process:
+
+    - `visit_Import`: Process `Import` nodes.
+    - `visit_ImportFrom`: Process `ImportFrom` nodes.
+    - `results`: Return a sorted list of text results.
+    """
+
+    def __init__(self) -> None:
+        """
+        Initialise the object.
+
+        Create an empty list to store items, where each item is a tuple containing an integer key and a string value.
+        """
+
+        self._items: List[tuple[int, str]] = []
+
+    def visit_Import(self, node: ast.Import) -> None:
+        """
+        Record the import statement.
+
+        This method iterates over the names imported by the `Import` node and appends a tuple containing the line number and import text to the `_items` list.
+
+        Parameters:
+        - `node`: The `Import` node being visited.
+        """
+
+        for alias in node.names:
+            if alias.asname:
+                text = f"- Imports {alias.name} as {alias.asname}"
+            else:
+                text = f"- Imports {alias.name}"
+            self._items.append((getattr(node, "lineno", 0), text))
+        # No children to visit for Import
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        """
+        Process an import from statement.
+
+        This method visits an `ImportFrom` node in the Abstract Syntax Tree (AST) and extracts information about the imported modules.
+
+        Parameters:
+        - `node`: The `ImportFrom` node to process.
+
+        Notes:
+        - The module name is formatted according to its source location.
+        - Aliases are processed and added to the list of items to be documented.
+        - If an alias imports everything, a corresponding message is generated.
+        - Otherwise, messages are generated for each imported item, including its name and source location.
+        - The line number of the import statement is recorded for later use.
+        """
+
+        src = _format_from_source(node.module, getattr(node, "level", 0) or 0)
+        for alias in node.names:
+            if alias.name == "*":
+                text = f"- Imports everything from {src}"
+            elif alias.asname:
+                text = f"- Imports {alias.name} from {src} as {alias.asname}"
+            else:
+                text = f"- Imports {alias.name} from {src}"
+            self._items.append((getattr(node, "lineno", 0), text))
+        # No children to visit for ImportFrom
+
+    def results(self) -> List[str]:
+        """
+        Return a sorted list of text results.
+
+        The results are sorted based on the original source order to ensure robustness in case the visitor order differs.
+        """
+
+        self._items.sort(key=lambda t: t[0])
+        return [text for _, text in self._items]
+
+
+def describe_imports_from_tree(
+    llm: LocalChatModel,
+    cfg: GenerationConfig,
+    messages: Messages,
+    tree: ast.AST,
+) -> List[str]:
+    """
+    Produce plain-English descriptions of all imports found in an AST.
+
+    Parameters:
+    - `llm`: The LocalChatModel instance.
+    - `cfg`: The GenerationConfig instance.
+    - `messages`: The Messages instance.
+    - `tree`: A module AST produced by `ast.parse(...)`.
+
+    Returns:
+    - A list of strings describing each imported name in source order.
+    """
+    if not isinstance(tree, ast.AST):
+        raise TypeError("tree must be an ast.AST")
+
+    # Build the imports list
+    visitor = _ImportDescriber()
+    visitor.visit(tree)
+    imports = visitor.results()
+
+    # If we found anything, pass the list to the LLM to provide more context
+    if imports:
+        imports = "\n".join(imports)
+        echo(f"\n[Python] Imports...\n{imports}")
+        prompt = f"For additional context, here is a list of imports within this program:\n\n{imports}\n\nPlease respond by saying 'OK'."
+        messages.append({"role": "user", "content": prompt})
+        reply = llm.generate(messages, cfg=cfg)
+        echo(f"\n[Python] LLM output:\n\n{reply}")
+        messages.append({"role": "assistant", "content": reply})
+
+
 def deepest_first(defs: List[DefInfo]) -> List[DefInfo]:
-    # depth desc; for stability: start asc, end desc
     """
     Sort the definitions in deepest-first order, ensuring stability by starting with ascending depths, then start positions,
     and finally descending end positions.
@@ -373,7 +512,6 @@ def generate_docstrings(
         Notes:
         - The function ensures that the line range is valid by clamping `line_a` to at least 1 and `line_b` to at most the
           number of source lines.
-        - If the line range is invalid, an empty string is returned.
         """
         a = max(1, line_a)
         b = min(len(source_lines), line_b)
@@ -415,13 +553,13 @@ def generate_docstrings(
 
     def make_child_stub(child_node_id: int) -> str:
         """
-        Return a string containing the combined decorators, header, and child docstring for a direct child node.
+        Generate a string containing the combined decorators, header, and child docstring for a direct child node.
 
         Parameters:
         - `child_node_id`: The ID of the child node for which to generate the stub.
 
         Returns:
-        - A string combining the decorators, header, and child docstring.
+        - A formatted string combining the decorators, header, and child docstring.
         """
         child_info = info_by_node_id[child_node_id]
         header_text = get_text_for_lines(child_info.header_start, child_info.header_end)
@@ -445,7 +583,7 @@ def generate_docstrings(
         Assemble a code snippet for the given node.
 
         This function constructs a code snippet by including the node's header (decorators and signature) and body statements.
-        Direct child definitions are replaced with stubs, containing only their headers and docstrings.
+        Direct child definitions are replaced with stubs, containing only their headers and docstrings to avoid recursive expansion.
 
         Parameters:
         - `node_id`: The ID of the node for which to assemble the snippet.
@@ -612,6 +750,10 @@ def generate_language_comments(
     # Parse the source file
     echo("Parsing Python source code...")
     tree = ast.parse(source_blob)
+
+    # Provide a list of imports to the LLM (if there are any)
+    echo("Identifying imports...")
+    describe_imports_from_tree(llm, cfg, messages, tree)
 
     # Find all of the defs
     echo("Identifying definitions...")

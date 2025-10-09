@@ -61,6 +61,10 @@ useful to give SCALE some understanding of the whole file, because it helps with
 class, and method as it is processing, but we just use the summary to help keep the context window small (i.e.
 to help performance).
 
+Then, the parser looks for all imports in the program (if any) and outputs that list for the LLM, because this
+can prodivde critical contextual information (e.g. `import numpy as np` is important for knowing what `np` means
+when encountered in the code).
+
 The 'conversation' that is maintained during this process is between the 'user' (the tool) and the 'assistant'
 (the LLM). On each turn, the user asks the assistant to generate a comment for the block of code they have
 supplied (a function, method, or class). These turns are not recorded, so the LLM isn't building an
@@ -69,7 +73,8 @@ ever-increasing context window - we discard each chunk once it's done. All the L
 1. The system prompt
 2. The summary of the program as a whole
 3. The comment template prompt
-4. The function/method/class it's been asked to generate a comment for
+4. A list of any imports/includes (or similar) found in the program
+5. The function/method/class it's been asked to generate a comment for
 
 In the Python example above, SCALE will extract the `mad()` function - its signature, any preceding decorators,
 and the body code - and write the docstring for it. If there was already a docstring following the signature,
