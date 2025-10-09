@@ -179,7 +179,8 @@ def load_source(src_path: Path, language: Optional[str] = None) -> Tuple[str, Ch
         sys.exit(1)
 
     # Load the whole file into a string
-    source_blob = src_path.read_text(encoding="utf-8")
+    raw = src_path.read_bytes()
+    source_blob = raw.decode("utf-8", errors="surrogateescape")
 
     # Count newline styles
     count_rn = source_blob.count("\r\n")
@@ -191,6 +192,10 @@ def load_source(src_path: Path, language: Optional[str] = None) -> Tuple[str, Ch
         line_ending = "\r\n"
     else:
         line_ending = "\r" if count_r > count_n else "\n"
+
+    # print(f"count_rn {count_rn} count_r {count_r} count_n {count_n}")
+    # print(f"line_ending = {ord(line_ending)}")
+    # exit(0)
 
     # Create a version of the source code as a 'chunk' (list of strings, one per line)
     source_lines = source_blob.split(line_ending)
@@ -318,7 +323,8 @@ def generate_comments(
 
     # Write the output
     if dst_path:
-        dst_path.write_text(line_ending.join(new_lines), encoding="utf-8")
+        source_blob = line_ending.join(new_lines).encode("utf-8", errors="surrogateescape")
+        dst_path.write_bytes(source_blob)
         echo(f"Updated source written to {dst_path}")
     else:
         print("\n".join(new_lines))
