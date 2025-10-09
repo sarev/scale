@@ -30,14 +30,11 @@ import argparse
 import sys
 
 
-# DEFAULT_MODEL = "../models/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf"
-
-
 # Based upon meta-llama/Llama-3.1-8B-Instruct
 #
 # 8B parameters, 6-bit quantised, 6.6GB, context length 131072.
 #
-DEFAULT_MODEL = "../models/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q6_K.gguf"
+DEFAULT_MODEL = "./models/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q6_K.gguf"
 
 
 # ---------------------------- CLI harness ----------------------------

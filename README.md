@@ -15,10 +15,10 @@ work.
 SCALE will ingest a source file, parse it to find routines (functions, methods, classes) and will create one
 comment per routine, following the comment style template (as defined in "scale-cfg"). The output will include
 these comments but aims to avoid touching the code itself, thus there should be no functional/behaviour change
-to the program, only comments are touched.
+to the program, only the main comments on each routine are touched.
 
 You are encouraged to look at the templates in "scale-cfg" and to adjust them to suit your needs (style guides,
-etc.) and your specific codebase. The more the examples given in these files align with the code you are likely
+etc.) and your specific codebase. The more the examples provided in these files align with the code you are likely
 to process, the more effective SCALE will be in useful comment generation. There is one template per supported
 language.
 
@@ -27,18 +27,6 @@ behaviour. You may also want to edit this, but in general this
 shouldn't be necessary.
 
 ## How it works
-
-1. **CLI entry** parses arguments such as model path, context size, sampling parameters, and the requested
-   operation (e.g. `--comment`). Defaults are tuned for small local models. 
-2. **Model wrapper** (`LocalChatModel`) loads the GGUF, normalises chat formatting to the target family (Qwen,
-   Llama-3, Llama-2, Mistral, Phi-3), and exposes non-streaming or streaming completions with consistent stop-tokens.
-   It can also download models from the Hub with pattern filters. 
-3. **Priming** reads the global comment prompt and a language template from `scale-cfg`, confirms ingestion, and
-   asks the model to summarise the full source once. The summary is then used as compact context for subsequent
-   chunked requests. 
-4. **Language worker**: parses the input file and adds/replaces comments on functions, classes, methods with
-   versions that align to the templates supplied in the configuration. Currently, there are three language
-   workers: Python, C, and JavaScript.
 
 Using Python as an example, SCALE will find every "class", "def", and "async def" in the input file and process
 them from the most deeply-nested up. For example:
@@ -62,7 +50,7 @@ class, and method as it is processing, but we just use the summary to help keep 
 to help performance).
 
 Then, the parser looks for all imports in the program (if any) and outputs that list for the LLM, because this
-can prodivde critical contextual information (e.g. `import numpy as np` is important for knowing what `np` means
+can provide critical contextual information (e.g. `import numpy as np` is important for knowing what `np` means
 when encountered in the code).
 
 The 'conversation' that is maintained during this process is between the 'user' (the tool) and the 'assistant'
@@ -99,19 +87,28 @@ locations, replacing any pre-existing docstrings as required. This patching proc
 code, indentation, other comments and empty lines are all preserved without any risk of the LLM inadvertently
 editing them or hallucinating more code!
 
-## Key design choices
+### Language support
 
-* **Local-first**: runs entirely against GGUF models; no cloud dependency. 
-* **Deterministic framing**: strict chat templates and stop strings per model family reduce role-token leaks and
-  over-generation. 
-* **Safe context management**: estimates bytes-per-token on the fly and warns before prompts approach the context
-  window. 
+| Language    | Parser / approach                 | Comments generated                                                  |
+|-------------|-----------------------------------|---------------------------------------------------------------------|
+| Python      | CPython `ast`                     | Docstrings for classes/functions/methods; import list passed to LLM |
+| JavaScript  | Tree-sitter (ESM + CommonJS)      | JSDoc for functions/classes; import/require list passed to LLM      |
+| C           | Tree-sitter                       | Function comments; `#include` list passed to LLM                    |
+
+### Line endings and encoding
+
+SCALE detects the dominant line ending (LF/CR/CRLF), preserves trailing newlines, and writes exactly what you specify.
+Files are treated as UTF-8 with `surrogateescape` to preserve undecodable bytes during round-trip. This avoids platform
+newline translation and keeps arbitrary input bytes intact.
 
 ## Using SCALE (typical)
 
 ```bash
 # Generate comments/docstrings for a source file with a local GGUF model
-python scale.py --verbose --comment -m /path/to/model.gguf /path/to/file.py -o /path/to/output.py
+python scale.py --model /path/to/model.gguf --comment /path/to/file.py --output /path/to/output.py --verbose
+
+# Generate comments and update the file in place (short form command line switches)
+python scale.py -m /path/to/model.gguf -c /path/to/file.py -o /path/to/file.py -v
 ```
 
 Use `--help` for more guidance on the CLI interface.
@@ -133,7 +130,82 @@ penalty, context size, batch size, and GPU offload layers to suit different mode
 * This has been tested on a Windows 11 laptop with an NVIDIA RTX 4060 mobile GPU. Better hardware than this will
   be able to utilise stronger LLMs.
 
-# Installation
+# Installation Guide for Linux Users
+
+Most Linux systems will come with Python 3.xx pre-installed. This guide assumes you are on a Debian-based OS
+and _haven't_ got Python installed yet. You have a recent NVIDIA GPU but haven't yet installed the drivers.
+
+
+```bash
+# Basic Python components
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip python3-dev build-essential git cmake pkg-config
+
+# Add contrib and non-free-firmware components
+sudo sed -i 's/main$/main contrib non-free-firmware/' /etc/apt/sources.list
+sudo apt update
+
+# Install the packaged NVIDIA driver - skip to the virtual environment steps if you don't have a GPU
+sudo apt install -y nvidia-driver
+
+# Reboot to load the driver
+sudo reboot
+
+# Verify CUDA available (and which version you have)
+nvidia-smi
+
+# Create Python virtual environment
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -U pip setuptools wheel
+
+# Install Python deps used by SCALE
+pip install -U "tree-sitter==0.21.0" "tree-sitter-c==0.21.0" "tree-sitter-javascript==0.21.0" huggingface-hub
+
+# Install llama.cpp bindings...
+
+# Use the wheel index that hosts CUDA-enabled builds (cuXXX is your CUDA version)
+pip install -U "llama-cpp-python[cuda]" --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+
+# If you can't find a matching wheel, you can compile with...
+export CMAKE_ARGS="-DLLAMA_CUDA=on -DLLAMA_CUBLAS=on"
+export FORCE_CMAKE=1
+pip install -U llama-cpp-python
+
+# If you don't even have CUDA/NVIDIA GPU, use a CPU-only build (very slow!
+pip install -U llama-cpp-python
+
+# Get SCALE
+# If you already have the repo contents in ./scale, skip the clone
+git clone https://github.com/sarev/scale.git
+cd scale
+
+# Download a local LLM from https://huggingface.co/models?library=gguf&sort=trending
+
+# Log in (opens a browser or takes a token)
+huggingface-cli login
+
+# Make a local models folder
+mkdir -p models
+
+# Download a quantised GGUF (example: Q4_K_M)
+huggingface-cli download \
+  bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
+  --include "*Q6_K.gguf" \
+  --local-dir models \
+  --local-dir-use-symlinks False
+
+MODEL_PATH="models/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q6_K.gguf"
+
+# Example: annotate a Python file
+python scale.py \
+  --model "$MODEL_PATH" \
+  --comment path/to/input.py \
+  --output  out/annotated.py \
+  --verbose
+```
+
+# Installation Guide for Windows Users
 
 I've included a lot of optional steps below. Skip over them if you just want to try SCALE out - these are only
 really useful for people who are looking to have more of a play (e.g. write extensions, use other AI and ML
@@ -151,6 +223,29 @@ suites that relate to AI and ML are quite slow-moving and have a lot of dependen
 bleeding edge, you're usually ahead of what all of those support.
 
 Make sure you tick any options to add Python to your PATH during the installation procedure!
+
+## Create and initialise a Python venv
+
+Assuming you've created a folder called 'scale' and put all of these files into it...
+
+```bash
+cd scale
+python -m venv .llm-venv
+
+# if you're running in bash on Windows
+. .llm-venv/Scripts/activate      
+# if you're running in PowerShell
+.\.venv\Scripts\Activate.ps1
+
+# Update the venv    
+python -m pip install --upgrade pip wheel setuptools
+```
+
+## Install Tree-sitter (language parser framework)
+
+```bash
+pip install -U "tree-sitter==0.21.0" "tree-sitter-c==0.21.0" "tree-sitter-javascript==0.21.0"
+```
 
 ## Optional - NVIDIA CUDA Toolkit and cuDNN
 
@@ -180,17 +275,6 @@ on a Windows system.
 - Install Visual Studio C and C++ support...
   - Pick the "Desktop development with C++ workload" in the installer
   - [Install C and C++ support in Visual Studio](https://learn.microsoft.com/en-us/cpp/build/vscpp-step-0-installation?view=msvc-170)
-
-## Create and initialise a Python venv
-
-Assuming you've created a folder called 'scale' and put all of these files into it...
-
-```bash
-cd scale
-python -m venv .llm-venv
-. .llm-venv/Scripts/activate
-python -m pip install --upgrade pip wheel setuptools
-```
 
 ## Optional - run the CUDA activation script
 
@@ -243,12 +327,6 @@ a specific Python version (3.11), a specific OS (Windows), and a specific CPU ar
 You can have a look around pages like [this](https://abetlen.github.io/llama-cpp-python/whl/cu124/llama-cpp-python/)
 to see which wheels exist. 
 
-## Tree-sitter (language parser framework)
-
-```bash
-pip install -U "tree-sitter==0.21.0" "tree-sitter-c==0.21.0" "tree-sitter-javascript==0.21.0"
-```
-
 ## Download a Large Language Model...
 
 I have tried various models from <https://huggingface.co>, notably:
@@ -275,3 +353,16 @@ Here's a slightly silly tier list of relative performance of GPU rigs for this s
 * **D**: RTX 4060 Laptop 8 GB (my machine), 4050 Laptop 6 GB. 7–8B decent in Q4, 13B only with compromises.
 * **E**: RTX 3050/1650 class laptops, older Quadros. 7B OK, anything larger is painful.
 * **F**: CPU-only or iGPU. Proof-of-concept only (awful!).
+
+## Licence
+
+Copyright 2025 7th software Ltd.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the
+License. You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
+language governing permissions and limitations under the License.
