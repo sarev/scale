@@ -5,7 +5,7 @@ via `llama.cpp`. It is designed to slot into existing build or CI pipelines and 
 tight output control.
 
 While SCALE can take a lot of the pain out of creating and maintaining comments on a codebase, you should still
-review its output and potantially make an editorial pass - just like you would in a code review of a team mate's
+review its output and potentially make an editorial pass - just like you would in a code review of a team mate's
 work.
 
 ![Illustration](./scale.png)
@@ -130,6 +130,10 @@ penalty, context size, batch size, and GPU offload layers to suit different mode
 
 # Installation
 
+I've included a lot of optional steps below. Skip over them if you just want to try SCALE out - these are only
+really useful for people who are looking to have more of a play (e.g. write extensions, use other AI and ML
+related Python components, such as tensorflow, mediapipe, transformers, StableDiffusion, pycuda, etc.)
+
 ## Python
 
 SCALE is written in Python, so you'll need to have that installed. Most Linux distros will come with this by
@@ -162,6 +166,16 @@ you want to do more experimentation with AI and machine learning, then these are
   - Create "C:\Program Files\NVIDIA\TensorRT\v10.13.3.9"
   - Copy TensorRT zipfile contents into that directory
 
+## Optional - Visual Studio C/C++ Compiler
+
+This is only required if you need to compile CUDA kernels or build Python wheels, etc. You shouldn't need this
+just to run SCALE, but I include it for completeness for those who are looking to do AI-related development
+on a Windows system.
+
+- Install Visual Studio C and C++ support...
+  - Pick the "Desktop development with C++ workload" in the installer
+  - [Install C and C++ support in Visual Studio](https://learn.microsoft.com/en-us/cpp/build/vscpp-step-0-installation?view=msvc-170)
+
 ## Create and initialise a Python venv
 
 Assuming you've created a folder called 'scale' and put all of these files into it...
@@ -177,23 +191,25 @@ python -m pip install --upgrade pip wheel setuptools
 
 Don't do this unless you are planning on doing more sophisticated things than just running SCALE...
 
-This program attempts to locate important parts of typical AI software ingrastructure on your system and
+This program attempts to locate important parts of typical AI software infrastructure on your system and
 updates PATH in the local shell to ensure that the right things are present. It should work on Linux and
 Windows (including in bash on Windows - e.g. Git Bash for Windows).
 
-### Optional - Running bash in Windows
+It only affects the terminal session that it is run within.
+
+### Optional - Running `cuda_activate.py` bash in Windows
 
 ```bash
 eval "$(python cuda_activate.py --shell bash)"
 ```
 
-### Optional - Running in Windows PowerShell
+### Optional - Running `cuda_activate.py` in Windows PowerShell
 
 ```powershell
 python cuda_activate.py --shell powershell | Invoke-Expression
 ```
 
-### Optional - Running in Windows cmd.exe
+### Optional - Running `cuda_activate.py` in Windows cmd.exe
 
 ```batch
 for /f "usebackq delims=" %i in (`python cuda_activate.py --shell cmd`) do %i
@@ -208,6 +224,9 @@ Precise version depends upon the host system:
     `nvidia-smi`
  
 should tell you the CUDA version you have. In my case, it's 12.4...
+
+If you don't have a suitable GPU, there are other flavours of llama-cpp-python that you can install,
+including a CPU-only version (which will probably be very slow!).
 
 ```bash
 pip install --no-cache-dir --force-reinstall https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.4-cu124/llama_cpp_python-0.3.4-cp311-cp311-win_amd64.whl
