@@ -130,6 +130,19 @@ penalty, context size, batch size, and GPU offload layers to suit different mode
 
 # Installation
 
+## Python
+
+SCALE is written in Python, so you'll need to have that installed. Most Linux distros will come with this by
+default. If not, you'll need to `sudo apt -y install python3` or similar.
+
+For Windows, you should download and install a copy of [Python 3.xx for Windows](https://www.python.org/downloads/windows/).
+I would typically go for a stable release that's a couple of versions older than the latest one, e.g. if the
+latest is 3.14.x, then I'd find and install 3.12.x. This is because a lot of the (huge and complex) Python
+suites that relate to AI and ML are quite slow-moving and have a lot of dependencies. If you're on the
+bleeding edge, you're usually ahead of what all of those support.
+
+Make sure you tick any options to add Python to your PATH during the installation procedure!
+
 ## Optional - NVIDIA CUDA Toolkit and cuDNN
 
 I don't *think* you need to do any of this, but if you run into issues getting the later pip installs to work or

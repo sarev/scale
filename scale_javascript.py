@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
 """
+Copyright 2025 7th software Ltd.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the
+License. You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
+language governing permissions and limitations under the License.
+
 This Python program is a tool for generating JSDoc comments for JavaScript code using a large language model (LLM)
-as a content generator. It leverages the Tree-sitter library to parse and analyse the JavaScript source code,
-identifying definition-like constructs such as functions, classes, methods, and variables. The LLM is then used to
-generate documentation comments for these definitions in a deepest-first order, ensuring that parents see child stubs.
-Finally, the program applies textual patches to insert or replace existing comment blocks above headers, resulting in
-an updated source code with generated JSDoc comments.
+as a content generator.
+
+It leverages the Tree-sitter library to parse and analyse the JavaScript source code, identifying definition-like constructs
+such as functions, classes, methods, and variables. The LLM is then used to generate documentation comments for these
+definitions in a deepest-first order, ensuring that parents see child stubs. Finally, the program applies textual patches to
+insert or replace existing comment blocks above headers, resulting in an updated source code with generated JSDoc comments.
 
 # Highlights of Internal Workings
 

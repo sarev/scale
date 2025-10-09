@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
- This program is a source code annotation tool called SCALE, which uses a Large Language Model (LLM) to generate comments and
- summaries for the provided source code. It supports various programming languages, including Python, JavaScript, and C.
+Copyright 2025 7th software Ltd.
 
- The tool can be run from the command line with optional arguments to customise its behaviour. It loads the source file,
- determines the language, and then primes the LLM with a system prompt and the source file as context. The LLM is then used
- to generate comments and summaries for the code.
- """
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the
+License. You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
+language governing permissions and limitations under the License.
+
+This program is a source code annotation tool called SCALE, which uses a Large Language Model (LLM) to generate comments and
+summaries for the provided source code. It supports various programming languages, including Python, JavaScript, and C.
+
+The tool can be run from the command line with optional arguments to customise its behaviour. It loads the source file,
+determines the language, and then primes the LLM with a system prompt and the source file as context. The LLM is then used
+to generate comments and summaries for the code.
+"""
 
 from __future__ import annotations
 

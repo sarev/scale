@@ -1,15 +1,30 @@
 #!/usr/bin/env python3
 """
-This program generates or updates docstrings in Python source code, ensuring that the generated documentation is precise and aligned with the
-actual code structure.
+Copyright 2025 7th software Ltd.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the
+License. You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
+language governing permissions and limitations under the License.
+
+This program generates or updates docstrings in Python source code, ensuring that the generated documentation is precise
+and aligned with the actual code structure.
 
 **Key Functionalities:**
 
-1. **DefInfo Data Structure**: The `DefInfo` class captures detailed information about each definition (function, class, property) in the source code.
+1. **DefInfo Data Structure**: The `DefInfo` class captures detailed information about each definition (function, class,
+   property) in the source code.
 2. **AST Traversal**: The program uses the Abstract Syntax Tree (AST) to traverse and analyse the source code.
-3. **Docstring Generation**: The `generate_docstrings` function generates new or updated docstrings for each definition using a Large Language Model (LLM).
-4. **Snippet Assembly**: The `assemble_snippet_for` function constructs the code snippet for each definition, including its header and body.
-5. **Patch Application**: The `patch_docstrings_textually` function applies the generated or updated docstrings to the source code.
+3. **Docstring Generation**: The `generate_docstrings` function generates new or updated docstrings for each definition
+   using a Large Language Model (LLM).
+4. **Snippet Assembly**: The `assemble_snippet_for` function constructs the code snippet for each definition, including
+   its header and body.
+5. **Patch Application**: The `patch_docstrings_textually` function applies the generated or updated docstrings to the
+   source code.
 
 **Highlights:**
 

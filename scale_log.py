@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
 """
-This module provides a basic logging and verbosity control system for the application.
-It defines three main functions: `echo`, `error`, and `set_verbosity`. The `echo` function
-writes messages to stdout if the verbosity level is enabled, while the `error` function writes
-error messages to stderr. The `set_verbosity` function allows the user to toggle the verbosity
-level globally.
+Copyright 2025 7th software Ltd.
 
-The module uses a global variable `VERBOSE` to track the current verbosity level. This variable
-is used by the `echo` function to determine whether to print messages or not. The `error` function,
-on the other hand, always writes error messages to stderr, regardless of the verbosity level.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the
+License. You may obtain a copy of the License at
 
-The `set_verbosity` function updates the global `VERBOSE` variable directly, which is a simple but
-effective way to control the verbosity level throughout the application.
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
+language governing permissions and limitations under the License.
+
+This module provides a basic logging and verbosity control system for the application. It defines three main functions:
+`echo`, `error`, and `set_verbosity`. The `echo` function writes messages to stdout if the verbosity level is enabled,
+while the `error` function writes error messages to stderr. The `set_verbosity` function allows the user to toggle the
+verbosity level globally.
+
+The module uses a global variable `VERBOSE` to track the current verbosity level. This variable is used by the `echo`
+function to determine whether to print messages or not. The `error` function, on the other hand, always writes error
+messages to stderr, regardless of the verbosity level.
+
+The `set_verbosity` function updates the global `VERBOSE` variable directly, which is a simple but effective way to
+control the verbosity level throughout the application.
 """
 
 from __future__ import annotations
