@@ -232,6 +232,12 @@ including a CPU-only version (which will probably be very slow!).
 pip install --no-cache-dir --force-reinstall https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.4-cu124/llama_cpp_python-0.3.4-cp311-cp311-win_amd64.whl
 ```
 
+Please note: that specific python wheel (pre-built binary) is tied to a specific CUDA version (12.4),
+a specific Python version (3.11), a specific OS (Windows), and a specific CPU architecture (amd-64).
+
+You can have a look around pages like [this](https://abetlen.github.io/llama-cpp-python/whl/cu124/llama-cpp-python/)
+to see which wheels exist. 
+
 ## Tree-sitter (language parser framework)
 
 ```bash
