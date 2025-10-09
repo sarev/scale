@@ -45,6 +45,7 @@ def echo(*args, **kwargs):
     message will be printed to stdout. The `flush` argument is always set to `True` to ensure timely
     output.
     """
+
     if VERBOSE:
         kwargs["flush"] = True
         print(*args, **kwargs)
@@ -67,6 +68,7 @@ def error(*args, **kwargs):
     then written to stderr followed by a newline character. The underlying file descriptor is flushed
     after writing to ensure the message is immediately visible.
     """
+
     msg = " ".join(str(a) for a in args)
     sys.stderr.write(msg + "\n")
     sys.stderr.flush()

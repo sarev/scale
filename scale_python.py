@@ -28,11 +28,16 @@ and aligned with the actual code structure.
 
 **Highlights:**
 
-* **Precision in Definition Identification**: The program uses the `DefInfo` class to precisely identify and manipulate definitions within the AST.
-* **Depth-First Processing**: Definitions are processed in a depth-first manner, ensuring that parent definitions are handled after their children.
-* **LLM Integration**: The program leverages an LLM to generate docstrings based on the provided prompts and existing code snippets.
-* **Stability during Updates**: The program ensures stability during updates by processing definitions in reverse order by start position.
-* **Preservation of Comments and Formatting**: The program preserves all comments, blank lines, and formatting while updating docstrings.
+* **Precision in Definition Identification**: The program uses the `DefInfo` class to precisely identify and manipulate
+  definitions within the AST.
+* **Depth-First Processing**: Definitions are processed in a depth-first manner, ensuring that parent definitions are
+  handled after their children.
+* **LLM Integration**: The program leverages an LLM to generate docstrings based on the provided prompts and existing
+  code snippets.
+* **Stability during Updates**: The program ensures stability during updates by processing definitions in reverse order
+  by start position.
+* **Preservation of Comments and Formatting**: The program preserves all comments, blank lines, and formatting while
+  updating docstrings.
 """
 
 from __future__ import annotations
@@ -126,12 +131,15 @@ def _header_span(n: ast.AST) -> Tuple[int, int]:
     Returns:
     - A tuple containing the start line and end line of the node's header.
     """
+
     assert _is_def_node(n)
+
     start = n.lineno
     if getattr(n, "decorator_list", None):
         deco_starts = [d.lineno for d in n.decorator_list if hasattr(d, "lineno")]
         if deco_starts:
             start = min(deco_starts + [start])
+
     if getattr(n, "body", None):
         end = n.body[0].lineno - 1
     else:
@@ -145,11 +153,16 @@ def _property_accessor_role(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> Optio
 
     This function inspects the function's decorator list to identify whether it is a getter, setter, or deleter for a property.
 
+    Parameters:
+    - `fn`: The function definition to inspect, which can be either a synchronous or asynchronous function.
+
     Returns:
     - A tuple containing the property name and its corresponding role, where role ∈ {"getter", "setter", "deleter"}, or None
       if no matching decorator is found.
     """
+
     roles = {"getter", "setter", "deleter"}
+
     for deco in getattr(fn, "decorator_list", []) or []:
         # Match Attribute(Name(prop), role)
         if isinstance(deco, ast.Attribute) and isinstance(deco.value, ast.Name) and deco.attr in roles:
@@ -170,6 +183,7 @@ def iter_defs_with_info(tree: ast.AST) -> List[DefInfo]:
     Returns:
     - List[DefInfo] sorted by start line ascending.
     """
+
     results: List[DefInfo] = []
     children_map: Dict[int, List[int]] = {}  # parent_id -> [child_ids]
 
@@ -275,7 +289,7 @@ def iter_defs_with_info(tree: ast.AST) -> List[DefInfo]:
 
 def _format_from_source(module: Optional[str], level: int) -> str:
     """
-    Render the 'from' target, preserving relative dots.
+    Format the 'from' target with a specified number of leading dots.
 
     This function formats the `module` parameter with a specified number of leading dots (`level`).
 
@@ -286,6 +300,7 @@ def _format_from_source(module: Optional[str], level: int) -> str:
     Returns:
     - A string representing the formatted 'from' target.
     """
+
     dots = "." * level
     return f"{dots}{module or ''}" or "."
 
@@ -301,10 +316,12 @@ class _ImportDescriber(ast.NodeVisitor):
 
     Notes:
     - The class is designed to be subclassed and extended for specific use cases.
-    - The `visit_Import` and `visit_ImportFrom` methods are responsible for iterating over the AST and extracting information about import statements.
-    - The `results` method returns a sorted list of text results, ensuring robustness in case the visitor order differs from the source order.
+    - The `visit_Import` and `visit_ImportFrom` methods are responsible for iterating over the AST and extracting
+      information about import statements.
+    - The `results` method returns a sorted list of text results, ensuring robustness in case the visitor order
+      differs from the source order.
 
-    Subclasses should override the following methods to customize the import description process:
+    Subclasses should override the following methods to customise the import description process:
 
     - `visit_Import`: Process `Import` nodes.
     - `visit_ImportFrom`: Process `ImportFrom` nodes.
@@ -324,7 +341,8 @@ class _ImportDescriber(ast.NodeVisitor):
         """
         Record the import statement.
 
-        This method iterates over the names imported by the `Import` node and appends a tuple containing the line number and import text to the `_items` list.
+        This method iterates over the names imported by the `Import` node and appends a tuple containing the line
+        number and import text to the `_items` list.
 
         Parameters:
         - `node`: The `Import` node being visited.
@@ -342,17 +360,14 @@ class _ImportDescriber(ast.NodeVisitor):
         """
         Process an import from statement.
 
-        This method visits an `ImportFrom` node in the Abstract Syntax Tree (AST) and extracts information about the imported modules.
+        This method visits an `ImportFrom` node in the Abstract Syntax Tree (AST) and extracts information about the
+        imported modules.
 
         Parameters:
         - `node`: The `ImportFrom` node to process.
 
-        Notes:
-        - The module name is formatted according to its source location.
-        - Aliases are processed and added to the list of items to be documented.
-        - If an alias imports everything, a corresponding message is generated.
-        - Otherwise, messages are generated for each imported item, including its name and source location.
-        - The line number of the import statement is recorded for later use.
+        Returns:
+        - A list of tuples containing the line number and a message describing each imported item.
         """
 
         src = _format_from_source(node.module, getattr(node, "level", 0) or 0)
@@ -371,6 +386,9 @@ class _ImportDescriber(ast.NodeVisitor):
         Return a sorted list of text results.
 
         The results are sorted based on the original source order to ensure robustness in case the visitor order differs.
+
+        Returns:
+        - A sorted list of text results.
         """
 
         self._items.sort(key=lambda t: t[0])
@@ -381,10 +399,13 @@ def describe_imports_from_tree(
     llm: LocalChatModel,
     cfg: GenerationConfig,
     messages: Messages,
-    tree: ast.AST,
+    tree: ast.AST
 ) -> List[str]:
     """
     Produce plain-English descriptions of all imports found in an AST.
+
+    This function traverses the provided Abstract Syntax Tree (AST) and generates a list of strings describing each
+    imported name in source order.
 
     Parameters:
     - `llm`: The LocalChatModel instance.
@@ -395,6 +416,7 @@ def describe_imports_from_tree(
     Returns:
     - A list of strings describing each imported name in source order.
     """
+
     if not isinstance(tree, ast.AST):
         raise TypeError("tree must be an ast.AST")
 
@@ -407,7 +429,11 @@ def describe_imports_from_tree(
     if imports:
         imports = "\n".join(imports)
         echo(f"\n[Python] Imports...\n{imports}")
-        prompt = f"For additional context, here is a list of imports within this program:\n\n{imports}\n\nPlease respond by saying 'OK'."
+        prompt = (
+            "For additional context, here is a list of imports within this program:\n\n"
+            f"{imports}\n\n"
+            "Please respond by saying 'OK'. No other commentary is required at this time."
+        )
         messages.append({"role": "user", "content": prompt})
         reply = llm.generate(messages, cfg=cfg)
         echo(f"\n[Python] LLM output:\n\n{reply}")
@@ -440,9 +466,9 @@ def generate_docstrings(
     """
     Generate or update docstrings for definitions in a Python source code AST.
 
-    This function processes the deepest definitions first, assembling snippets that include
-    headers and bodies while replacing direct child definitions with stubs containing their
-    docstrings. Non-definition statements are included verbatim from the source.
+    This function processes the deepest definitions first, assembling snippets that include headers and bodies while
+    replacing direct child definitions with stubs containing their docstrings. Non-definition statements are included
+    verbatim from the source.
 
     Parameters:
     - `llm`: The local chat model used to generate docstrings.
@@ -462,9 +488,9 @@ def generate_docstrings(
         """
         Extract the first fenced docstring block from a reply string.
 
-        This function searches for the first occurrence of a triple-quoted or triple-backtick block,
-        and returns its contents, dedented and stripped. If no such block is found, it treats the entire
-        reply as the candidate docstring.
+        This function searches for the first occurrence of a triple-quoted or triple-backtick block, and returns its
+        contents, dedented and stripped. If no such block is found, it treats the entire reply as the candidate
+        docstring.
 
         Parameters:
         - `reply`: The input string from which to extract the docstring.
@@ -472,6 +498,7 @@ def generate_docstrings(
         Returns:
         - The extracted docstring, dedented and stripped. Returns an empty string if no docstring is found.
         """
+
         lines = reply.split("\n")
         stripped = [ln.strip() for ln in lines]
 
@@ -513,6 +540,7 @@ def generate_docstrings(
         - The function ensures that the line range is valid by clamping `line_a` to at least 1 and `line_b` to at most the
           number of source lines.
         """
+
         a = max(1, line_a)
         b = min(len(source_lines), line_b)
         if a > b:
@@ -529,6 +557,7 @@ def generate_docstrings(
         Returns:
         - A string containing the exact source code for the statement, including preserved indentation.
         """
+
         s = getattr(stmt, "lineno", 1)
         e = getattr(stmt, "end_lineno", s)
         return get_text_for_lines(s, e)
@@ -561,6 +590,7 @@ def generate_docstrings(
         Returns:
         - A formatted string combining the decorators, header, and child docstring.
         """
+
         child_info = info_by_node_id[child_node_id]
         header_text = get_text_for_lines(child_info.header_start, child_info.header_end)
 
@@ -580,10 +610,11 @@ def generate_docstrings(
 
     def assemble_snippet_for(node_id: int) -> str:
         """
-        Assemble a code snippet for the given node.
+        Construct a code snippet for the given node.
 
-        This function constructs a code snippet by including the node's header (decorators and signature) and body statements.
-        Direct child definitions are replaced with stubs, containing only their headers and docstrings to avoid recursive expansion.
+        This function assembles a code snippet by including the node's header (decorators and signature) and body
+        statements. Direct child definitions are replaced with stubs, containing only their headers and docstrings
+        to avoid recursive expansion.
 
         Parameters:
         - `node_id`: The ID of the node for which to assemble the snippet.
@@ -591,6 +622,7 @@ def generate_docstrings(
         Returns:
         - A string containing the assembled snippet.
         """
+
         info = info_by_node_id[node_id]
         node = info.node
 
@@ -745,6 +777,11 @@ def generate_language_comments(
 
     Returns:
     - A patched source file text, containing the new docstrings, split into individual lines.
+
+    Notes:
+    - This function processes the source code in multiple stages, including parsing, import identification,
+      definition identification, docstring generation, and patch application.
+    - The `echo` statements are used for debugging purposes only and can be removed in production builds.
     """
 
     # Parse the source file

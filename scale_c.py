@@ -26,6 +26,7 @@ from scale_log import echo
 from tree_sitter import Parser, Language  # type: ignore
 from tree_sitter_c import language as c_language
 from typing import Dict, List, Optional, Tuple, Any
+import re
 import textwrap
 
 
@@ -35,14 +36,12 @@ def _load_c_language_and_parser() -> Tuple[Language, Parser]:
     """
     Load the C language and parser.
 
-    This function loads the C language and creates a parser instance. If the `c_language()` call returns a `Language` object, it
-    is used directly. Otherwise, it is assumed to be a label and a new `Language` instance is created with the label "C".
-
-    Parameters:
-    - None
+    This function loads the C language and creates a parser instance. It handles cases where `c_language()` returns a
+    `Language` object or a label, and returns a tuple containing the loaded `Language` object and the created `Parser`
+    instance.
 
     Returns:
-    - A tuple containing the loaded `Language` object and the created `Parser` instance.
+    - A tuple of two objects: the loaded `Language` object and the created `Parser` instance.
     """
 
     ptr_or_lang: Any = c_language()
@@ -87,8 +86,9 @@ def _row_of(point) -> int:
     """
     Return the row number of a tree-sitter point.
 
-    This function supports both tuple and object forms of points. If the input is an object with a `.row` attribute, it is used directly.
-    If the input is a tuple, its first element (the row number) is returned.
+    This function supports both tuple and object forms of points. If the input is an object with a `.row` attribute,
+    it is used directly. Otherwise, it assumes the input is a tuple (row, col) and returns the first element (the
+    row number).
 
     Parameters:
     - `point`: The tree-sitter point to extract the row from.
@@ -96,6 +96,7 @@ def _row_of(point) -> int:
     Returns:
     - The row number of the point as an integer.
     """
+    
     try:
         return point.row  # object with .row
     except AttributeError:
@@ -112,6 +113,7 @@ def _line_span_from_node(n) -> Tuple[int, int]:
     Returns:
     - A tuple of two integers representing the 1-based start and end line numbers.
     """
+
     return _to_1based(_row_of(n.start_point)), _to_1based(_row_of(n.end_point))
 
 
@@ -119,13 +121,16 @@ def _get_text_for_lines(source_lines: Chunk, a: int, b: int) -> str:
     """
     Extract a range of lines from the source code.
 
+    This method returns a string containing the specified range of lines, joined by newline characters.
+    If the start line number is greater than the end line number, an empty string is returned.
+
     Parameters:
     - `source_lines`: The list of source code lines.
     - `a`: The starting line number (inclusive).
     - `b`: The ending line number (exclusive).
 
     Returns:
-    - A string containing the extracted lines, joined by newline characters. If `a` is greater than `b`, an empty string is returned.
+    - A string containing the extracted lines.
     """
 
     a = max(1, a)
@@ -133,6 +138,25 @@ def _get_text_for_lines(source_lines: Chunk, a: int, b: int) -> str:
     if a > b:
         return ""
     return "\n".join(source_lines[a - 1:b])
+
+
+def _node_text(source_bytes: bytes, n) -> str:
+    """
+    Decode the exact source slice for a node.
+
+    Parameters:
+    - `source_bytes`: The bytes containing the source code.
+    - `n`: The node for which to decode the source slice.
+
+    Returns:
+    - A string representing the decoded source slice, or an empty string if `n` is `None`.
+    """
+
+    if n is None:
+        return ""
+
+    # Use 'replace' to be robust to any odd bytes in the file.
+    return source_bytes[n.start_byte:n.end_byte].decode("utf-8", errors="replace")
 
 
 def _leading_spaces_count(line: str) -> int:
@@ -164,6 +188,7 @@ def _scan_existing_comment_block_above(source_lines: Chunk, header_start_line_1b
     - A tuple `(start_line_1b, end_line_1b)` representing the start and end line numbers of the comment block,
       or `None` if no comment block is found.
     """
+
     i = header_start_line_1b - 2  # zero-based line just above header
     if i < 0:
         return None
@@ -198,10 +223,14 @@ def _scan_existing_comment_block_above(source_lines: Chunk, header_start_line_1b
 
 # ---------------- C DefInfo
 
+
 @dataclass(frozen=True)
 class DefInfoC:
     """
     Represents information about a C function definition.
+
+    This class abstracts over the details of a C function definition, providing a structured representation
+    that can be used to generate documentation comments for the function.
 
     Attributes:
         qualname (str): The name of the function.
@@ -214,21 +243,165 @@ class DefInfoC:
         depth (int): The nesting depth of the function, always 0 for C (no nested functions).
         parent_id (Optional[int]): The ID of the parent node, always None.
         children_ids (Tuple[int, ...]): A tuple of IDs of child nodes, always empty.
+
+    Note:
+        This class is designed to be used in conjunction with the `LLM exchange` module to generate
+        documentation comments for C functions.
     """
 
-    qualname: str            # function name
-    node: object             # tree_sitter.Node (function_definition)
-    kind: str                # "function"
-    start: int               # definition start line (1-based)
-    end: int                 # definition end line (inclusive)
-    header_start: int        # header start line
-    header_end: int          # header end line (line before body starts '{')
-    depth: int               # always 0 for C (no nested functions), but keep for shape parity
-    parent_id: Optional[int] # always None
-    children_ids: Tuple[int, ...] = field(default_factory=tuple)  # always empty
+    qualname: str
+    node: object
+    kind: str
+    start: int
+    end: int
+    header_start: int
+    header_end: int
+    depth: int
+    parent_id: Optional[int]
+    children_ids: Tuple[int, ...] = field(default_factory=tuple)
+
+
+# ---------------- Include discovery --------------------------------------------------------------
+
+
+def _display_include_target(tok: str) -> str:
+    """
+    Render the include target as it appeared, preserving any quotes or angle brackets.
+
+    If the token is already quoted (e.g. `"...` or `'...'`) or enclosed in angle brackets (`<...>`), return it unchanged.
+    Otherwise, return the bare token (e.g. a macro name).
+    """
+
+    tok = tok.strip()
+    # Already quoted or angled? keep as-is
+    if (len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in ('"', "'")) or (tok.startswith("<") and tok.endswith(">")):
+        return tok
+    return tok
+
+
+def _collect_includes_c(source_blob: str) -> List[Tuple[int, str]]:
+    """
+    Collect a list of #include directives in source order.
+
+    This function parses the given C source code and extracts a plain-English list of #include directives.
+    It supports various forms of includes, including:
+
+    *   `#include <...>`
+    *   `#include "..."`
+    *   `#include MACRO_NAME`
+
+    The function returns a list of tuples containing the line number and a description of each include directive.
+
+    Parameters:
+    - `source_blob`: The C source code as a string.
+
+    Returns:
+    - A list of tuples, where each tuple contains the line number (1-based) and a description of the include directive.
+    """
+
+    out: List[Tuple[int, str]] = []
+    source_bytes = source_blob.encode("utf-8", errors="replace")
+    tree = C_PARSER.parse(source_bytes)
+    root = tree.root_node
+
+    def add(n, payload: str) -> None:
+        """
+        Add a payload to the output list at the specified line number.
+
+        Parameters:
+        - `n`: A Tree-sitter node representing the position where the payload should be added.
+        - `payload`: The string to be appended to the output list.
+
+        Notes:
+        The line number is calculated from the 0-based row of the node's start point, converted to 1-based.
+        """
+
+        ln = _to_1based(_row_of(n.start_point))
+        out.append((ln, payload))
+
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        t = n.type
+
+        if t == "preproc_include":
+            # Prefer the grammar field if available
+            path_node = n.child_by_field_name("path")
+            if path_node is not None:
+                raw = _node_text(source_bytes, path_node).strip()
+                # Normalise display but preserve delimiters if present
+                target = _display_include_target(raw)
+                add(n, f"- {target}")
+            else:
+                # Fallback: parse the directive text
+                full = _node_text(source_bytes, n)
+                m = re.search(r"<([^>]+)>", full)
+                if m:
+                    add(n, f"- <{m.group(1)}>")
+                else:
+                    m = re.search(r'"([^"\n\r]+)"', full)
+                    if m:
+                        add(n, f'- "{m.group(1)}"')
+                    else:
+                        # Try to catch identifier-like includes (e.g. macros)
+                        m = re.search(r"#\s*include\s+([A-Za-z_]\w*)", full)
+                        target = m.group(1) if m else "<unknown>"
+                        add(n, f"- Includes {target}")
+            # Do not descend into children of this directive
+            continue
+
+        # Generic DFS over named children
+        for i in range(n.named_child_count - 1, -1, -1):
+            stack.append(n.named_child(i))
+
+    out.sort(key=lambda t: t[0])
+    return out
+
+
+def describe_includes_c(
+    llm: LocalChatModel,
+    cfg: GenerationConfig,
+    messages: Messages,
+    source_blob: str
+) -> None:
+    """
+    Build a list of #includes from the source code and feed it to the LLM as extra context.
+
+    This method mirrors the Python/JS flow by echoing the includes, then pushing a short 'OK' acknowledgement prompt.
+    It collects the includes using `_collect_includes_c`, formats them into a payload, and appends a prompt to the message list.
+    The LLM is then asked to generate a response based on the updated message list, which is echoed back to the user.
+
+    Parameters:
+    - `llm`: The LocalChatModel instance used for LLM interactions.
+    - `cfg`: The GenerationConfig instance used for LLM generation.
+    - `messages`: The Messages instance used for storing and sending messages.
+    - `source_blob`: The source code string from which to collect includes.
+
+    Notes:
+    This method does not return any value, as it is designed to update the message list and prompt the LLM for a response.
+    """
+
+    items = _collect_includes_c(source_blob)
+    if not items:
+        return
+    lines = [text for _, text in items]
+    payload = "\n".join(lines)
+
+    echo(f"\n[C] Includes...\n{payload}")
+    prompt = (
+        "For additional context, here is a list of includes within this program:\n\n"
+        f"{payload}\n\n"
+        "Please respond by saying 'OK'. No other commentary is required at this time."
+    )
+    messages.append({"role": "user", "content": prompt})
+
+    reply = llm.generate(messages, cfg=cfg)
+    echo(f"\n[C] LLM output: {reply}")
+    messages.append({"role": "assistant", "content": reply})
 
 
 # ---------------- Collect function definitions (ignores forward declarations)
+
 
 def iter_defs_with_info_c(source_blob: str) -> List[DefInfoC]:
     """
@@ -243,6 +416,7 @@ def iter_defs_with_info_c(source_blob: str) -> List[DefInfoC]:
     Returns:
     - A sorted list of `DefInfoC` objects, each containing information about a real function definition.
     """
+
     source_bytes = source_blob.encode("utf-8", errors="replace")
     tree = C_PARSER.parse(source_bytes)
     root = tree.root_node
@@ -256,6 +430,7 @@ def iter_defs_with_info_c(source_blob: str) -> List[DefInfoC]:
         The header ends on the line before the compound statement (body) begins, unless there is no body,
         in which case it spans the entire function definition.
         """
+
         # In C grammar, function_definition has field 'declarator' and 'body'
         body = fn_node.child_by_field_name("body")
         if body and body.type == "compound_statement":
@@ -270,12 +445,16 @@ def iter_defs_with_info_c(source_blob: str) -> List[DefInfoC]:
         """
         Extract function identifier text from the declarator subtree.
 
+        This function traverses the declarator subtree to find the function identifier node.
+        If found, it returns the identifier as a string. If not found, it returns "<anonymous>".
+
         Parameters:
         - `fn_node`: The declarator subtree node to extract the function identifier from.
 
         Returns:
         - The extracted function identifier as a string, or "<anonymous>" if not found.
         """
+
         # function_definition -> declarator (function_declarator) -> declarator (pointer? direct_declarator)
         decl = fn_node.child_by_field_name("declarator")
         if decl is None:
@@ -295,7 +474,7 @@ def iter_defs_with_info_c(source_blob: str) -> List[DefInfoC]:
     # DFS over named nodes
     def walk(n) -> None:
         """
-        Walk the abstract syntax tree (AST) and collect function definitions.
+        Collect function definitions from the abstract syntax tree (AST).
 
         This function recursively traverses the AST, identifying function definitions and collecting metadata.
         For each function definition, it extracts the qualified name, line span, header span, and other relevant information.
@@ -303,8 +482,11 @@ def iter_defs_with_info_c(source_blob: str) -> List[DefInfoC]:
         Parameters:
         - `n`: The current node in the AST to process.
 
-        Returns:
-        - None
+        Notes:
+        - Function definitions are identified by their type (`"function_definition"`).
+        - Anonymous functions are assigned a default qualified name (`"<anonymous>"`).
+        - The function collects metadata for each definition, including the qualified name, line span, header span, and more.
+        - The collected metadata is stored in a `DefInfoC` object.
         """
 
         if n.type == "function_definition":
@@ -347,6 +529,7 @@ def assemble_snippet_for_c(source_lines: Chunk, info: DefInfoC) -> str:
     Returns:
     - A string representing the assembled snippet of C code.
     """
+
     header_text = _get_text_for_lines(source_lines, info.header_start, info.header_end)
     body_text = _get_text_for_lines(source_lines, info.header_end + 1, info.end)
     parts: List[str] = [header_text]
@@ -363,6 +546,9 @@ def _render_c_block_comment(text: str, base_indent: str) -> List[str]:
     """
     Render a C-style block comment from the provided text.
 
+    This function takes in a string of text and an indentation level, then formats it as a multi-line
+    C-style block comment. If the input text is empty, it will render a placeholder comment instead.
+
     Parameters:
     - `text`: The text to be rendered as a block comment.
     - `base_indent`: The base indentation for the comment lines.
@@ -370,6 +556,7 @@ def _render_c_block_comment(text: str, base_indent: str) -> List[str]:
     Returns:
     - A list of strings representing the rendered C-style block comment.
     """
+
     lines = text.splitlines()
     out = [f"{base_indent}/*"]
     if lines:
@@ -394,12 +581,15 @@ def _extract_first_c_comment_block(reply: str) -> str:
     Returns:
     - The extracted C block comment body as a string.
     """
+
     txt = textwrap.dedent(reply)
+
     # Prefer fenced block
     start = txt.find("/*")
     end = txt.find("*/", start + 2) if start != -1 else -1
     if start != -1 and end != -1:
         inner = txt[start + 2:end]
+
         # strip leading '*' common to C doc blocks
         lines = inner.splitlines()
         cleaned = []
@@ -411,6 +601,7 @@ def _extract_first_c_comment_block(reply: str) -> str:
                     stripped = stripped[1:]
             cleaned.append(stripped.rstrip())
         return "\n".join(cleaned).strip()
+
     # Fallback: use all text, dedented
     return txt.strip()
 
@@ -442,6 +633,7 @@ def generate_comments_c(
     Returns:
     - A dictionary mapping each function's header span to its corresponding documentation comment.
     """
+
     doc_map: Dict[Tuple[int, int], str] = {}
 
     # No nesting to worry about; process in source order
@@ -491,6 +683,7 @@ def patch_comments_textually_c(source_lines: Chunk, defs: List[DefInfoC], doc_ma
     Returns:
     - The updated source code with inserted or replaced documentation blocks.
     """
+
     out_lines = source_lines[:]
 
     # Edit bottom-up to keep line numbers stable
@@ -546,9 +739,14 @@ def generate_language_comments(
     Returns:
     - The updated source lines with generated comments.
     """
+
     echo("Parsing C source with Tree-sitter...")
     defs = iter_defs_with_info_c(source_blob)
     echo(f"Found {len(defs)} C function definition(s)")
+
+    # Provide a list of #includes to the LLM (if there are any)
+    echo("Identifying #includes...")
+    describe_includes_c(llm, cfg, messages, source_blob)
 
     echo("Generating C comments...\n")
     doc_map = generate_comments_c(llm, cfg, messages, defs, source_blob, source_lines)

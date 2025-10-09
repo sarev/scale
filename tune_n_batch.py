@@ -65,11 +65,14 @@ def _fallback_formatter(messages: List[Dict[str, str]]) -> Tuple[str, List[str]]
     Returns:
     - A tuple containing the constructed plain prompt as a string and an empty list of stop tokens.
     """
+
     parts: List[str] = []
+
     for m in messages:
         role = m.get("role", "user")
         content = m.get("content", "")
         parts.append(f"[{role}]\n{content}\n")
+
     prompt = "\n".join(parts) + "[assistant]\n"
     return prompt, []
 
@@ -132,6 +135,7 @@ def _build_prompt(
     Returns:
     - A tuple containing the constructed prompt text and a list of stop tokens.
     """
+
     if messages_file:
         with open(messages_file, "r", encoding="utf-8") as f:
             msgs = json.load(f)
@@ -142,11 +146,14 @@ def _build_prompt(
             return _fallback_formatter(msgs)
         prompt_text, stops = fmt(msgs)
         return prompt_text, list(stops or [])
+
     if prompt_file:
         text = Path(prompt_file).read_text(encoding="utf-8")
         return text, []
+
     if prompt is not None:
         return prompt, []
+
     # last resort
     return "You are a concise assistant.\nUser: Say hello.\nAssistant:", []
 
@@ -197,6 +204,7 @@ def _measure_once(
     - A BatchProbeResult object containing the measured tokens/sec, eval count, prompt eval count,
       wall time, and any error message.
     """
+
     try:
         from llama_cpp import Llama  # import here to keep script import-light
     except Exception as e:
@@ -300,6 +308,7 @@ def probe_optimal_n_batch(
     Returns:
     - A tuple containing the best `n_batch` value and a list of batch probe results.
     """
+
     # Warm up at a conservative setting to avoid cold-start bias
     if warmup_passes > 0:
         _ = _measure_once(

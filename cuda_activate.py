@@ -69,11 +69,13 @@ def _strip_path_entries(path_value: str, needles: Tuple[str, ...], sep: str | No
     sep = sep or os.pathsep
     parts = path_value.split(sep) if path_value else []
     keep = []
+
     for d in parts:
         norm = d.lower()
         if any(n.lower() in norm for n in needles):
             continue
         keep.append(d)
+
     return sep.join(keep)
 
 
@@ -90,8 +92,10 @@ def _split_mixed_path(raw: str) -> List[str]:
     Returns:
     - A list of raw PATH segments.
     """
+
     if not raw:
         return []
+
     parts: List[str] = []
     buf: List[str] = []
     n = len(raw)
@@ -100,10 +104,12 @@ def _split_mixed_path(raw: str) -> List[str]:
             if ch == ':' and i >= 1:
                 prev = raw[i - 1]
                 nxt = raw[i + 1] if i + 1 < n else ''
+
                 # Detect drive letter pattern "C:\" or "C:/"
                 if prev.isalpha() and nxt in ('\\', '/'):
                     buf.append(ch)
                     continue
+
             # split here
             seg = ''.join(buf).strip()
             if seg:
@@ -112,6 +118,7 @@ def _split_mixed_path(raw: str) -> List[str]:
         else:
             buf.append(ch)
     last = ''.join(buf).strip()
+
     if last:
         parts.append(last)
     return parts
@@ -175,7 +182,7 @@ def _print_howto() -> None:
     Print a how-to guide for using the script.
 
     This function prints a formatted guide on how to use the script, including examples for Git Bash, PowerShell,
-    and Windows cmd.exe. It also documents optional flags that can be used to customize the script's behavior.
+    and Windows cmd.exe. It also documents optional flags that can be used to customise the script's behavior.
 
     Optional Flags:
     - `--cuda`: Specify the path to the CUDA home directory (e.g. Windows: C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.4, Linux: /usr/local/cuda-12.4).

@@ -62,13 +62,10 @@ def _load_js_language_and_parser() -> Tuple[Language, Parser]:
     """
     Load the JavaScript language and parser.
 
-    This function initializes the JavaScript language and parser, handling different API versions.
-
-    Parameters:
-    - None
+    This function initialises the JavaScript language and parser, handling different API versions.
 
     Returns:
-    - A tuple containing the loaded `Language` instance and the initialised `Parser` instance.
+        A tuple containing the loaded `Language` instance and the initialised `Parser` instance.
     """
 
     ptr_or_lang: Any = js_language()
@@ -115,18 +112,18 @@ class DefInfoJS:
         children_ids (Tuple[int, ...]): A tuple of IDs of child nodes.
 
     Note:
-        This class is an abstraction over various types of JavaScript definitions, including functions, classes, methods, and variables.
+        This class abstracts over various types of JavaScript definitions, including functions, classes, methods, and variables.
     """
 
-    qualname: str                  # e.g. "foo", "ClassName.method", "obj.method"
-    node: object                   # tree_sitter.Node
-    kind: str                      # "function" | "class" | "method" | "var_func" | "var_arrow" | "obj_method"
-    start: int                     # header start line (1-based; includes the 'function'/'class' etc.)
-    end: int                       # definition end line (inclusive)
-    header_start: int              # header start line (same as start)
-    header_end: int                # header end line (line before body block begins)
-    depth: int                     # 0 = module level
-    parent_id: Optional[int]       # id(parent node) or None
+    qualname: str
+    node: object
+    kind: str
+    start: int
+    end: int
+    header_start: int
+    header_end: int
+    depth: int
+    parent_id: Optional[int]
     children_ids: Tuple[int, ...] = field(default_factory=tuple)
 
 
@@ -152,7 +149,7 @@ def _line_span_from_node(n) -> Tuple[int, int]:
     Convert a Tree-sitter node to its corresponding line span.
 
     Returns:
-        A tuple of two integers representing the 1-based line numbers for the start and end points of the node.
+    - A tuple of two integers representing the 1-based line numbers for the start and end points of the node.
     """
 
     return _to_1based(_row_of(n.start_point)), _to_1based(_row_of(n.end_point))
@@ -191,13 +188,32 @@ def _node_text(source_bytes: bytes, n) -> str:
     return source_bytes[n.start_byte:n.end_byte].decode("utf-8", errors="replace")
 
 
+def _string_value(s: str) -> str:
+    """
+    Best-effort unquote of a JS string literal's contents.
+
+    Leaves the original text if it is not a simple quoted literal.
+
+    Parameters:
+    - `s`: The input string to be unquoted.
+
+    Returns:
+    - The unquoted string, or the original string if it is not a simple quoted literal.
+    """
+
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"', "`"):
+        return s[1:-1]
+    return s
+
+
 def _get_text_for_lines(source_lines: Chunk, a: int, b: int) -> str:
     """
-    Return a string representation of the specified lines in the source code.
+    Extract a contiguous range of lines from the source code.
 
-    This function extracts a contiguous range of lines from the input `source_lines` chunk, starting
-    from line `a` (inclusive) and ending at line `b` (inclusive). The range is clipped to ensure that
-    `a` is not less than 1 and `b` does not exceed the total number of lines in the chunk.
+    This function extracts a range of lines from the input `source_lines` chunk, starting from line `a`
+    (inclusive) and ending at line `b` (inclusive). The range is clipped to ensure that `a` is not less
+    than 1 and `b` does not exceed the total number of lines in the chunk.
 
     Parameters:
     - `source_lines`: The input chunk containing the source code.
@@ -233,9 +249,8 @@ def _row_of(point) -> int:
     """
     Return the 0-based row from a tree-sitter point.
 
-    This function supports both object and tuple representations of points.
-    For objects with a `.row` attribute, it directly returns the row value.
-    For tuples, it extracts the first element (the row) and returns it.
+    This function supports both object and tuple representations of points. For objects with a `.row` attribute,
+    it directly returns the row value. For tuples, it extracts the first element (the row) and returns it.
 
     Parameters:
     - `point`: The tree-sitter point from which to extract the row.
@@ -249,12 +264,205 @@ def _row_of(point) -> int:
         return point[0]             # tuple (row, column)
 
 
+# ---- Import discovery (ESM + CommonJS) -------------------------------------
+
+
+def _collect_imports_js(source_blob: str) -> List[Tuple[int, str]]:
+    """
+    Collect a plain-English list of import/require statements in source order.
+
+    This function supports ES module imports and CommonJS require(...) calls.
+    It returns a list of tuples, where each tuple contains the line number and a description of the import/require statement.
+
+    Parameters:
+    - `source_blob`: The JavaScript source code as a string.
+
+    Returns:
+    - A list of tuples, where each tuple contains the line number and a description of the import/require statement.
+    """
+    out: List[Tuple[int, str]] = []
+    src_b = source_blob.encode("utf-8", errors="replace")
+    tree = JS_PARSER.parse(src_b)
+    root = tree.root_node
+
+    def add(n, text: str) -> None:
+        """
+        Add a line of text to the output.
+
+        Parameters:
+        - `n`: The node to determine the line number from.
+        - `text`: The text to append to the output.
+
+        Returns:
+        - None
+        """
+
+        ln = _to_1based(_row_of(n.start_point))
+        out.append((ln, text))
+
+    # Walk everything; imports can appear anywhere at top-level in ESM, and
+    # require(...) can appear nested.
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        t = n.type
+
+        # ---- ES module: import ----
+        # Tree-sitter JavaScript/TypeScript use 'import_statement'.
+        # Be tolerant and also accept 'import_declaration' in case of grammar variants.
+        if t in ("import_statement", "import_declaration"):
+            src_node = _node_field(n, "source")
+            if src_node is None:
+                # Fallback: some versions expose the string as the last named child
+                cand = n.named_children[-1] if n.named_child_count else None
+                src_node = cand if cand and cand.type == "string" else None
+            module_text = _string_value(_node_text(src_b, src_node)) if src_node else "<unknown>"
+
+            clause = _node_field(n, "import_clause")
+            if clause is None:
+                # import 'mod';
+                add(n, f"- Imports {module_text} for side effects")
+            else:
+                # default import: identifier directly under clause
+                for c in (clause.named_children or []):
+                    if c.type in ("identifier",):
+                        local = _node_text(src_b, c)
+                        add(n, f"- Imports default from {module_text} as {local}")
+                    elif c.type == "namespace_import":
+                        # import * as ns from 'mod'
+                        name = _node_field(c, "name")
+                        local = _node_text(src_b, name) if name else "<namespace>"
+                        add(n, f"- Imports everything from {module_text} as {local}")
+                    elif c.type == "named_imports":
+                        # import { a, b as c } from 'mod'
+                        for spec in (c.named_children or []):
+                            if spec.type != "import_specifier":
+                                continue
+                            orig = _node_field(spec, "name") or _node_field(spec, "imported_name")
+                            alias = _node_field(spec, "alias")
+                            otext = _node_text(src_b, orig) if orig else "<unknown>"
+                            if alias:
+                                atext = _node_text(src_b, alias)
+                                add(n, f"- Imports {otext} from {module_text} as {atext}")
+                            else:
+                                add(n, f"- Imports {otext} from {module_text}")
+                # fall through: do not descend into children of import declarations further
+            continue
+
+        # ---- CommonJS: const X = require('mod') / const {a: b} = require('mod') ----
+        if t == "variable_declarator":
+            init = _node_field(n, "value")
+            callee = _node_field(init, "function") if init and init.type == "call_expression" else None
+            if callee and _node_text(src_b, callee) == "require":
+                # Extract module name from first argument if string literal
+                args = [init.child(i) for i in range(init.named_child_count)] if init else []
+                mod = None
+                for a in args:
+                    if a.type == "arguments" and a.named_child_count >= 1:
+                        arg0 = a.named_child(0)
+                        if arg0 and arg0.type == "string":
+                            mod = _string_value(_node_text(src_b, arg0))
+                mod = mod or "<unknown>"
+
+                # Binding side: identifier or object_pattern
+                name_node = _node_field(n, "name")
+                if name_node is not None and name_node.type == "identifier":
+                    local = _node_text(src_b, name_node)
+                    add(n, f"- Requires {mod} as {local}")
+                elif name_node is not None and name_node.type == "object_pattern":
+                    # const {a, b: c} = require('mod')
+                    props: List[str] = []
+                    for k in (name_node.named_children or []):
+                        if k.type == "pair":
+                            k_name = _node_field(k, "key")
+                            k_alias = _node_field(k, "value")
+                            oname = _node_text(src_b, k_name) if k_name else "<key>"
+                            aname = _node_text(src_b, k_alias) if k_alias else oname
+                            props.append(f"{oname} as {aname}" if aname != oname else oname)
+                        elif k.type in ("identifier", "shorthand_property_identifier_pattern"):
+                            props.append(_node_text(src_b, k))
+                    if props:
+                        add(n, f"- Requires {mod} (destructured: {', '.join(props)})")
+                    else:
+                        add(n, f"- Requires {mod}")
+                else:
+                    add(n, f"- Requires {mod}")
+                # do not descend further into this declarator
+                continue
+
+        # ---- CommonJS: bare require('mod') ----
+        if t == "call_expression":
+            callee = _node_field(n, "function")
+            if callee and _node_text(src_b, callee) == "require":
+                args = _node_field(n, "arguments")
+                mod = "<unknown>"
+                if args and args.named_child_count >= 1:
+                    arg0 = args.named_child(0)
+                    if arg0 and arg0.type == "string":
+                        mod = _string_value(_node_text(src_b, arg0))
+                add(n, f"- Requires {mod} for side effects")
+                # still descend, but not necessary; continue to keep traversal simple
+
+        # generic DFS
+        for i in range(n.named_child_count - 1, -1, -1):
+            stack.append(n.named_child(i))
+
+    out.sort(key=lambda t: t[0])
+    return out
+
+
+def describe_imports_js(
+    llm: LocalChatModel,
+    cfg: GenerationConfig,
+    messages: Messages,
+    source_blob: str
+) -> None:
+    """
+    Build a list of imports/requires from the JavaScript source code and feed it to the LLM as extra context.
+
+    This function mirrors the Python flow by echoing the imports, pushing a short 'OK' acknowledgement prompt,
+    and then generating LLM output with the provided context.
+
+    Parameters:
+    - `llm`: The LocalChatModel instance.
+    - `cfg`: The GenerationConfig instance.
+    - `messages`: The Messages instance.
+    - `source_blob`: The JavaScript source code as a string.
+
+    Notes:
+    - If no imports are found, this function returns immediately.
+    - The LLM output is echoed and appended to the messages list.
+    """
+
+    items = _collect_imports_js(source_blob)
+    if not items:
+        return
+
+    lines = [text for _, text in items]
+    payload = "\n".join(lines)
+
+    echo(f"\n[JS] Imports...\n{payload}")
+    prompt = (
+        "For additional context, here is a list of imports within this program:\n\n"
+        f"{payload}\n\n"
+        "Please respond by saying 'OK'. No other commentary is required at this time."
+    )
+    messages.append({"role": "user", "content": prompt})
+
+    reply = llm.generate(messages, cfg=cfg)
+    echo(f"\n[JS] LLM output:\n\n{reply}")
+    messages.append({"role": "assistant", "content": reply})
+
+
 # ---- Qualname extraction ----------------------------------------------------
 
 
 def _ident_text(source_bytes: bytes, n) -> Optional[str]:
     """
     Extract the text of an identifier or string node from the source code.
+
+    This function takes a bytes representation of the source code and a node to extract the text from.
+    It returns the extracted text as a string, or `None` if the node is not an identifier or string.
 
     Parameters:
     - `source_bytes`: The bytes representation of the source code.
@@ -289,8 +497,8 @@ def _qual_name(source_bytes: bytes, n, scope: List[str]) -> str:
 
     Parameters:
     - source_bytes: Source text as bytes (used by _ident_text).
-    - node:         Tree-sitter node for the declaration.
-    - scope:        Enclosing scope components, outermost to innermost.
+    - n: Tree-sitter node for the declaration.
+    - scope: Enclosing scope components, outermost to innermost.
 
     Returns:
     - Qualified name string, e.g. 'Outer.Inner.func' or '<anonymous>'.
@@ -338,7 +546,14 @@ def _header_end_for_function_like(n) -> int:
     For arrow functions with expression body, the header is on the function line.
     For method definitions, if the value has a statement block, the header ends on the line before the block's start.
     Otherwise, the header ends on the line of the method definition.
+
+    Parameters:
+    - `n`: The Tree-sitter node representing the function-like construct.
+
+    Returns:
+    - The 1-based line number of the end of the function-like header.
     """
+
     body = _node_field(n, "body") if n.type != "method_definition" else _node_field(n, "body")
     if body and body.type in ("statement_block", "class_body"):
         return _to_1based(_row_of(body.start_point)) - 1
@@ -359,7 +574,6 @@ def _iter_children(n) -> Iterable:
     Yield the named children of a node.
 
     This generator iterates over the named child nodes of the given node, yielding each child in turn.
-    The number of named child nodes is determined by the `named_child_count` attribute of the node.
 
     Parameters:
     - `n`: The node to iterate over its named children.
@@ -386,6 +600,7 @@ def iter_defs_with_info_js(source_blob: str) -> List[DefInfoJS]:
     Returns:
     - A sorted list of DefInfoJS instances representing the definition-like constructs in the source code.
     """
+
     source_bytes = source_blob.encode("utf-8", errors="replace")
     tree = JS_PARSER.parse(source_bytes)
     root = tree.root_node
@@ -403,6 +618,9 @@ def iter_defs_with_info_js(source_blob: str) -> List[DefInfoJS]:
         - `parent_node`: The parent node to add the child to. If `None`, do nothing.
         - `child_node`: The child node to be added.
 
+        Returns:
+        - None
+
         Notes:
         This method updates the internal children map, which is used to keep track of node relationships.
         The `children_map` dictionary is keyed by parent node IDs and contains lists of child node IDs.
@@ -414,17 +632,20 @@ def iter_defs_with_info_js(source_blob: str) -> List[DefInfoJS]:
 
     def walk(node) -> None:
         """
-        Walk the abstract syntax tree (AST) of the JavaScript source code, collecting information about definition-like constructs.
+        Collects information about definition-like constructs in the JavaScript source code.
 
-        This function recursively traverses the AST, identifying and processing functions, classes, methods, variables,
-        and object methods. It creates DefInfoJS instances for each definition, which contain information such as the
-        qualified name, type, start and end lines, header start and end lines, depth, parent ID, and children IDs.
+        This function recursively traverses the abstract syntax tree (AST), identifying and processing functions, classes,
+        methods, variables, and object methods. It creates DefInfoJS instances for each definition, which contain
+        information such as the qualified name, type, start and end lines, header start and end lines, depth, parent ID,
+        and children IDs.
 
         Parameters:
         - `node`: The current node in the AST being processed.
 
-        Returns:
-        - None
+        Notes:
+        - This function uses a recursive approach to traverse the AST.
+        - It relies on other functions (e.g. `_qual_name`, `_header_end_for_function_like`) to extract relevant information
+          from the node and its context.
         """
 
         t = node.type
@@ -440,6 +661,12 @@ def iter_defs_with_info_js(source_blob: str) -> List[DefInfoJS]:
             Returns:
             - A DefInfoJS instance containing information about the definition, including its node, kind, start and end lines,
               header start and end lines, depth, parent ID, and children IDs.
+
+            Notes:
+            - The `start_1b` and `end_1b` values are obtained from the `_line_span_from_node` function.
+            - The `header_end` value is obtained from the `_header_end_for_function_like` function.
+            - The `depth` value represents the nesting level of the definition within the current scope.
+            - The `parent_id` value is the ID of the parent node in the scope, or `None` if the definition is at the top level.
             """
 
             start_1b, end_1b = _line_span_from_node(node)
@@ -577,9 +804,9 @@ def _render_jsdoc_block(text: str, base_indent: str) -> List[str]:
     """
     Render a JSDoc comment block with the given text and base indentation.
 
-    This function takes a string of text and an indentation string, splits the text into lines,
-    and formats it as a JSDoc comment block. If the input text is empty, it displays a message
-    indicating that there is no documentation.
+    This function formats a string of text as a JSDoc comment block, including a leading `/**` marker
+    and a trailing `*/` terminator. If the input text is empty, it displays a message indicating that
+    there is no documentation.
 
     Parameters:
     - `text`: The input text to be formatted as a JSDoc comment block.
@@ -602,7 +829,7 @@ def _render_jsdoc_block(text: str, base_indent: str) -> List[str]:
 
 def _extract_first_comment_block(reply: str) -> str:
     """
-    Extract the first comment block from a reply string.
+    Extract the first JSDoc-style comment block from a reply string.
 
     This function removes any leading whitespace and dedents the input string, then searches for the first occurrence of
     a JSDoc-style comment block (starting with `/**`). It extracts the comment block up to the matching `*/`, removes any
@@ -623,7 +850,7 @@ def _extract_first_comment_block(reply: str) -> str:
     except ValueError:
         return ""
 
-    for end_idx in range(start_idx, len(lines) + 1):
+    for end_idx in range(start_idx, len(lines)):
         if "*/" in lines[end_idx]:
             break
     else:
@@ -640,7 +867,7 @@ def assemble_snippet_for_js(
     info_by_id: Dict[int, DefInfoJS],
     source_lines: Chunk,
     node_id: int,
-    docs_by_id: Dict[int, str],
+    docs_by_id: Dict[int, str]
 ) -> str:
     """
     Assemble a snippet of JavaScript code for a given node ID.
@@ -660,6 +887,7 @@ def assemble_snippet_for_js(
     Returns:
     - A string representing the assembled snippet of JavaScript code.
     """
+
     info = info_by_id[node_id]
 
     header_text = _get_text_for_lines(source_lines, info.header_start, info.header_end)
@@ -724,6 +952,7 @@ def generate_comments_js(
     Returns:
         - A dictionary mapping qualification names to generated JSDoc comments.
     """
+
     docs_by_qualname: Dict[str, str] = {}
     docs_by_node_id: Dict[int, str] = {}
     info_by_id: Dict[int, DefInfoJS] = {id(d.node): d for d in defs}
@@ -768,6 +997,7 @@ def _scan_existing_comment_block_above(source_lines: Chunk, header_start_line_1b
 
     Returns a tuple containing the start and end line numbers of the existing comment block, or `None` if no such block is found.
     """
+
     i = header_start_line_1b - 2  # zero-based line just above header
     if i < 0:
         return None
@@ -817,6 +1047,7 @@ def patch_comments_textually_js(source_lines: Chunk, defs: List[DefInfoJS], doc_
     Returns:
     - The modified source code with inserted or replaced documentation blocks.
     """
+
     out_lines = source_lines[:]
 
     for info in sorted(defs, key=lambda d: d.start, reverse=True):
@@ -872,9 +1103,14 @@ def generate_language_comments(
     Returns:
     - The updated source code chunk with generated JSDoc comments.
     """
+
     echo("Parsing JavaScript source with Tree-sitter...")
     defs = iter_defs_with_info_js(source_blob)
     echo(f"Found {len(defs)} JS definitions")
+
+    # Provide a list of imports/requires to the LLM (if there are any)
+    echo("Identifying imports/requires...")
+    describe_imports_js(llm, cfg, messages, source_blob)
 
     echo("Generating JSDoc comments...\n")
     doc_map = generate_comments_js(llm, cfg, messages, defs, source_blob, source_lines)

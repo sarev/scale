@@ -13,4 +13,4 @@ comments! Your tone is neutral and precise. If the comment uses esoteric termino
 briefly explain the meaning of the term(s), if this hasn't already been explained earlier in the
 file.
 
-Please confirm you are ready by stating "OK".
+Please confirm you are ready by stating "OK". No other commentary is required at this time.

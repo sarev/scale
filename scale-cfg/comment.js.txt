@@ -60,4 +60,4 @@ Finally, this is an example of a more trivial JavaScript function called `toggle
 8. If there are no returned values, the "Returns:" section may be omitted.
 9. You will use British English spellings where possible.
 
-Please reply with exactly "OK".
+Please reply with exactly "OK". No other commentary is required at this time.
