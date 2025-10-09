@@ -194,8 +194,7 @@ Precise version depends upon the host system:
 
     `nvidia-smi`
  
-should tell you the CUDA version you have (assuming you've installed the CUDA toolkit and cuDNN from
-NVIDIA already). In my case, it's 12.4
+should tell you the CUDA version you have. In my case, it's 12.4...
 
 ```bash
 pip install --no-cache-dir --force-reinstall https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.4-cu124/llama_cpp_python-0.3.4-cp311-cp311-win_amd64.whl
@@ -211,8 +210,8 @@ pip install -U "tree-sitter==0.21.0" "tree-sitter-c==0.21.0" "tree-sitter-javasc
 
 I have tried various models from <https://huggingface.co>, notably:
 
-- (Qwen/Qwen2.5-7B-Instruct)<https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF?show_file_info=qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf>
-- (bartowski/Meta-Llama-3.1-8B-Instruct)<https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF?show_file_info=Meta-Llama-3.1-8B-Instruct-Q6_K.gguf>
+- [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF?show_file_info=qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf)
+- [bartowski/Meta-Llama-3.1-8B-Instruct](https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF?show_file_info=Meta-Llama-3.1-8B-Instruct-Q6_K.gguf)
 
 You'll likely need to sign up to HuggingFace and various models require you to request access, which is
 straightforward and usually pretty quick.
