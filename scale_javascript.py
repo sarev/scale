@@ -47,7 +47,6 @@ ParserT = object
 
 
 def _load_js_language_and_parser() -> Tuple[Language, Parser]:
-    # Get the export (capsule or Language)
     """
     Load the JavaScript language and parser.
 
@@ -137,7 +136,6 @@ def _to_1based(row0: int) -> int:
 
 
 def _line_span_from_node(n) -> Tuple[int, int]:
-    # convert 0-based rows to 1-based line numbers
     """
     Convert a Tree-sitter node to its corresponding line span.
 
@@ -269,86 +267,28 @@ def _ident_text(source_bytes: bytes, n) -> Optional[str]:
     return None
 
 
-def _qual_for_function_decl(source_bytes: bytes, n, scope: List[str]) -> str:
+def _qual_name(source_bytes: bytes, n, scope: List[str]) -> str:
     """
-    Construct a qualified name for a function declaration.
+    Build a fully qualified name for any declaration-like node that exposes a 'name' field (functions,
+    classes, methods, variable declarators).
 
-    This function generates a string representing the fully qualified name of a function declaration.
-    It takes into account the scope and name of the function, handling anonymous functions by default.
+    The identifier is read from the node's 'name' field; if absent, '<anonymous>' is used. The resulting
+    name is prefixed by the dot-joined scope if provided.
 
     Parameters:
-    - `source_bytes`: The source code bytes containing the function declaration.
-    - `n`: The node object representing the function declaration.
-    - `scope`: A list of strings representing the scope of the function.
+    - source_bytes: Source text as bytes (used by _ident_text).
+    - node:         Tree-sitter node for the declaration.
+    - scope:        Enclosing scope components, outermost to innermost.
 
     Returns:
-    - A string representing the fully qualified name of the function declaration.
+    - Qualified name string, e.g. 'Outer.Inner.func' or '<anonymous>'.
     """
 
     name = _ident_text(source_bytes, _node_field(n, "name")) or "<anonymous>"
     return ".".join(scope + [name]) if scope else name
 
 
-def _qual_for_class_decl(source_bytes: bytes, n, scope: List[str]) -> str:
-    """
-    Construct the qualified name for a class declaration.
-
-    Parameters:
-    - `source_bytes`: The bytes of the source code.
-    - `n`: The Tree-sitter node representing the class declaration.
-    - `scope`: A list of strings representing the current scope.
-
-    Returns:
-    - The qualified name of the class as a string, or "<anonymous>" if the name is unknown.
-    """
-
-    name = _ident_text(source_bytes, _node_field(n, "name")) or "<anonymous>"
-    return ".".join(scope + [name]) if scope else name
-
-
-def _qual_for_method(source_bytes: bytes, n, scope: List[str]) -> str:
-    # method_definition: field 'name'
-    """
-    Construct the qualified name for a method.
-
-    This function generates the fully qualified name of a method by combining the scope and method name.
-    If the scope is empty, only the method name is returned.
-
-    Parameters:
-    - `source_bytes`: The bytes representing the source code.
-    - `n`: The node containing the method definition.
-    - `scope`: A list of strings representing the scope of the method.
-
-    Returns:
-    - The fully qualified name of the method as a string.
-    """
-
-    name = _ident_text(source_bytes, _node_field(n, "name")) or "<anonymous>"
-    return ".".join(scope + [name]) if scope else name
-
-
-def _qual_for_var_declarator(source_bytes: bytes, declarator, scope: List[str]) -> str:
-    # variable_declarator: field 'name' (identifier / pattern)
-    """
-    Construct a qualified name for a variable declarator.
-
-    This function generates the fully qualified name of a variable declarator by joining its scope and name components.
-
-    Parameters:
-    - `source_bytes`: The source code bytes containing the variable declarator.
-    - `declarator`: The Tree-sitter node representing the variable declarator.
-    - `scope`: A list of strings representing the scope of the variable declarator.
-
-    Returns:
-    - A string representing the fully qualified name of the variable declarator, or an anonymous name if it has no scope.
-    """
-
-    name = _ident_text(source_bytes, _node_field(declarator, "name")) or "<anonymous>"
-    return ".".join(scope + [name]) if scope else name
-
-
-def _qual_for_obj_method(source_bytes: bytes, pair_or_method, scope: List[str], enclosing_obj: Optional[str]) -> str:
-    # object literal method or pair with function value
+def _qual_name_for_obj_method(source_bytes: bytes, pair_or_method, scope: List[str], enclosing_obj: Optional[str]) -> str:
     """
     Construct a qualified name for an object method.
 
@@ -397,6 +337,7 @@ def _header_end_for_function_like(n) -> int:
             if blk and blk.type == "statement_block":
                 return _to_1based(_row_of(blk.start_point)) - 1
     return _to_1based(_row_of(n.start_point))
+
 
 # ---- AST walk and DefInfo collection ---------------------------------------
 
@@ -505,7 +446,7 @@ def iter_defs_with_info_js(source_blob: str) -> List[DefInfoJS]:
 
         # ---- function_declaration ----
         if t == "function_declaration":
-            qual = _qual_for_function_decl(source_bytes, node, scope_names)
+            qual = _qual_name(source_bytes, node, scope_names)
             info = mk_info(qual, "function")
             results.append(info)
             add_child(scope_nodes[-1] if scope_nodes else None, node)
@@ -519,7 +460,7 @@ def iter_defs_with_info_js(source_blob: str) -> List[DefInfoJS]:
 
         # ---- class_declaration ----
         if t == "class_declaration":
-            qual = _qual_for_class_decl(source_bytes, node, scope_names)
+            qual = _qual_name(source_bytes, node, scope_names)
             info = mk_info(qual, "class")
             results.append(info)
             add_child(scope_nodes[-1] if scope_nodes else None, node)
@@ -533,7 +474,7 @@ def iter_defs_with_info_js(source_blob: str) -> List[DefInfoJS]:
 
         # ---- method_definition (class body) ----
         if t == "method_definition":
-            qual = _qual_for_method(source_bytes, node, scope_names)
+            qual = _qual_name(source_bytes, node, scope_names)
             info = mk_info(qual, "method")
             results.append(info)
             add_child(scope_nodes[-1] if scope_nodes else None, node)
@@ -546,7 +487,7 @@ def iter_defs_with_info_js(source_blob: str) -> List[DefInfoJS]:
             init = _node_field(node, "value")
             if init and init.type in ("function", "function_expression", "arrow_function"):
                 # Node types vary slightly across grammar versions. Be permissive.
-                qual = _qual_for_var_declarator(source_bytes, node, scope_names)
+                qual = _qual_name(source_bytes, node, scope_names)
                 kind = "var_arrow" if init.type == "arrow_function" else "var_func"
                 info = mk_info(qual, kind)
                 results.append(info)
@@ -570,7 +511,7 @@ def iter_defs_with_info_js(source_blob: str) -> List[DefInfoJS]:
             value = _node_field(node, "value")
             is_method = (node.type == "method_definition") or (value and value.type in ("function", "function_expression", "arrow_function"))
             if is_method:
-                qual = _qual_for_obj_method(source_bytes, node, scope_names, enclosing)
+                qual = _qual_name_for_obj_method(source_bytes, node, scope_names, enclosing)
                 info = mk_info(qual, "obj_method")
                 results.append(info)
                 add_child(scope_nodes[-1] if scope_nodes else None, node)
@@ -597,7 +538,6 @@ def iter_defs_with_info_js(source_blob: str) -> List[DefInfoJS]:
 
 
 def deepest_first_js(defs: List[DefInfoJS]) -> List[DefInfoJS]:
-    # depth desc; stable: start asc, end desc
     """
     Sort the definitions in a deepest-first order.
 
