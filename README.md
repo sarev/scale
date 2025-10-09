@@ -172,11 +172,10 @@ export CMAKE_ARGS="-DLLAMA_CUDA=on -DLLAMA_CUBLAS=on"
 export FORCE_CMAKE=1
 pip install -U llama-cpp-python
 
-# If you don't even have CUDA/NVIDIA GPU, use a CPU-only build (very slow!
+# If you don't even have CUDA/NVIDIA GPU, use a CPU-only build (very slow!)
 pip install -U llama-cpp-python
 
-# Get SCALE
-# If you already have the repo contents in ./scale, skip the clone
+# Get SCALE. If you already have the repo contents in ./scale, skip the clone
 git clone https://github.com/sarev/scale.git
 cd scale
 
@@ -188,7 +187,7 @@ huggingface-cli login
 # Make a local models folder
 mkdir -p models
 
-# Download a quantised GGUF (example: Q4_K_M)
+# Download a quantised GGUF (example: Q4_K_M) - this can take a loooong time...
 huggingface-cli download \
   bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
   --include "*Q6_K.gguf" \

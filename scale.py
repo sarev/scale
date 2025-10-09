@@ -27,7 +27,9 @@ from scale_llm import LocalChatModel, GenerationConfig, llm_formatters, Messages
 from scale_log import echo, error, set_verbosity
 from typing import List, Optional, Sequence, Tuple
 import argparse
+import pickle
 import sys
+import uuid
 
 
 # Based upon meta-llama/Llama-3.1-8B-Instruct
@@ -205,12 +207,158 @@ def load_source(src_path: Path, language: Optional[str] = None) -> Tuple[str, Ch
     return source_blob, source_lines, line_ending, language
 
 
+class SummaryCache:
+    """
+    File-backed summary cache.
+
+    This class provides a file-backed cache for storing summaries of source code files. It maps a source file path to a
+    stable unique identifier (UID) stored in an index file, and stores the summary in a separate data file associated
+    with the UID.
+
+    The cache is designed to be atomic, ensuring that writes to both the index and summary files are atomic operations.
+
+    Parameters:
+    - `source_path`: The path to the source code file.
+
+    Notes:
+    - The cache directory is located at `<cache_dir>/<uid>.summary`, where `<cache_dir>` is a fixed directory
+      and `<uid>` is the unique identifier for the source file.
+    - The index file contains a dictionary mapping source file paths to their associated UIDs.
+    - The summary file contains a human-readable summary of the source code as a UTF-8 encoded string with surrogate escape.
+    """
+    _CACHE_DIR = (Path(__file__).resolve().parent) / "__cache__"
+    _CACHE_INDEX = _CACHE_DIR / "index.pkl"
+
+    def __init__(self, source_path: Path) -> None:
+        """
+        Initialise the instance with a source path.
+
+        This call loads or generates a unique identifier (UID) for the given source path and stores it in the index file.
+        The UID is used to identify the associated data file, which contains a summary of the source code.
+
+        Parameters:
+        - `source_path`: The path to the source code file.
+
+        Returns:
+        - None
+        """
+
+        self._summary: Optional[str] = None
+
+        # Load or create index
+        index = self._load_index()
+
+        key = str(source_path)
+        uid = index.get(key)
+        if uid is None:
+            uid = uuid.uuid4().hex
+            index[key] = uid
+            self._save_index(index)
+
+        self._uid = uid
+        self._data_path = self._CACHE_DIR / f"{self._uid}.txt"  # one file per uid
+
+        # Load existing summary if present
+        try:
+            raw = self._data_path.read_bytes()
+            self._summary = raw.decode("utf-8", errors="surrogateescape")
+        except FileNotFoundError:
+            self._summary = None
+
+    @property
+    def summary(self) -> Optional[str]:
+        """
+        Return a human-readable summary of this instance.
+
+        Returns:
+        - `str`: The summary string, or `None` if no summary is available.
+        """
+
+        return self._summary
+
+    @summary.setter
+    def summary(self, text: str) -> None:
+        """
+        Set the summary text for this instance and persist it in the cache.
+
+        Parameters:
+        - `text`: The new summary text as a string.
+        """
+
+        self._summary = text
+        self._atomic_write_bytes(
+            self._data_path,
+            text.encode("utf-8", errors="surrogateescape"),
+        )
+
+    @classmethod
+    def _load_index(cls) -> dict[str, str]:
+        """
+        Load the index from cache.
+
+        If the index file exists, load it from disc and return its contents as a dictionary.
+        If the file is missing or corrupt, start with an empty index.
+
+        Returns:
+            dict[str, str]: The loaded index, or an empty dictionary if loading failed.
+        """
+
+        try:
+            with cls._CACHE_INDEX.open("rb") as f:
+                obj = pickle.load(f)
+                return obj if isinstance(obj, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            # Corrupt index: start fresh rather than crashing
+            return {}
+
+    @classmethod
+    def _save_index(cls, index: dict[str, str]) -> None:
+        """
+        Save the index to a temporary file and then replace the existing cache index.
+
+        This method creates a new temporary file with a `.pkl.tmp` suffix, writes the index to it using pickle,
+        and then replaces the original cache index file with the temporary one.
+        """
+
+        cls._CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = cls._CACHE_INDEX.with_suffix(".pkl.tmp")
+        with tmp.open("wb") as f:
+            pickle.dump(index, f, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(cls._CACHE_INDEX)
+
+    @staticmethod
+    def _atomic_write_bytes(path: Path, data: bytes) -> None:
+        """
+        Atomically write bytes to a file.
+
+        Create the directory for the file if it does not exist, then write the data to a temporary file.
+        Finally, replace the original file with the temporary one, ensuring that the operation is atomic.
+
+        Parameters:
+        - `path`: The path to the file to be written.
+        - `data`: The bytes to be written to the file.
+
+        Returns:
+        - None
+        """
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("wb") as f:
+            f.write(data)
+        tmp.replace(path)
+
+
 def prime_llm_for_comments(
     llm: LocalChatModel,
     cfg: GenerationConfig,
     scale_path: Path,
+    src_path: Path,
     source_blob: str,
-    language: str
+    language: str,
+    no_cache: Optional[bool] = False
 ) -> Messages:
     """
     Prepare the Large Language Model (LLM) for generating comments by priming it with a system prompt and the source file as context.
@@ -219,12 +367,17 @@ def prime_llm_for_comments(
     - `llm`: The LocalChatModel instance to be primed.
     - `cfg`: The GenerationConfig instance controlling the LLM's behavior.
     - `scale_path`: The path to the SCALE tool's configuration directory.
+    - `src_path`: The path to the source file to be annotated.
     - `source_blob`: The source code as a string.
     - `language`: The programming language of the source code.
+    - `no_cache`: Generate new summary - don't use the cached version.
 
     Returns:
     - A list of messages exchanged between the system and the LLM, including the priming prompts and the generated responses.
     """
+
+    # Initialise the smmary cache
+    summary_cache = SummaryCache(src_path)
 
     echo("Priming LLM...")
 
@@ -246,14 +399,24 @@ def prime_llm_for_comments(
     messages.append({"role": "assistant", "content": reply})
 
     # Now provide the LLM with the entire source file as context
-    echo("Generating full source summary...")
-    source_context = "To help you understand the fuller context of each chunk that I supply, here is the original source file as a whole:\n\n"
-    source_context += f"{source_blob}\n\nPlease output a detailed summary of what this program does, along with some highlights of its internal workings.\n"
-    messages.append({"role": "user", "content": source_context})
-    reply = llm.generate(messages, cfg=cfg)
-    reply_length = reply.count("\n")
+    if no_cache is False and summary_cache.summary:
+        echo("Loaded full source summary from cache...")
+    else:
+        echo("Generating full source summary...")
+        source_context = (
+            "To help you understand the fuller context of each chunk that I supply, here is the original source file as a whole:\n\n"
+            f"{source_blob}\n\n"
+            "Please output a detailed summary of what this program does, along with some highlights of its internal workings.\n"
+            "Do not ask follow-up questions or add any conversational discussion. Just give me the detailed summary."
+        )
+        messages.append({"role": "user", "content": source_context})
+
+        # Generate (and cache) the summary text for the full source code
+        summary_cache.summary = llm.generate(messages, cfg=cfg)
+
+    reply_length = 1 + summary_cache.summary.count("\n")
     echo(f"Source file summarised? {reply_length} lines of summary created")
-    echo(f"\n{reply}\n")
+    echo(f"\n{summary_cache.summary}\n")
 
     # Replace the source file with its summary in the LLM's context
     messages.pop()
@@ -278,7 +441,8 @@ def generate_comments(
     scale_path: Path,
     src_path: Path,
     dst_path: Path,
-    language: Optional[str] = None
+    language: Optional[str] = None,
+    no_cache: Optional[bool] = False
 ) -> int:
     """
     Generate comments for the provided source code using a Large Language Model (LLM).
@@ -294,6 +458,7 @@ def generate_comments(
     - `src_path`: The path to the source file to be annotated.
     - `dst_path`: The path where the updated source file will be written (optional).
     - `language`: The programming language of the source code (optional).
+    - `no_cache`: Generate new summary - don't use the cached version.
 
     Returns:
     - 0 if the operation was successful, or an error number.
@@ -304,7 +469,7 @@ def generate_comments(
     """
 
     source_blob, source_lines, line_ending, language = load_source(src_path, language)
-    messages = prime_llm_for_comments(llm, cfg, scale_path, source_blob, language)
+    messages = prime_llm_for_comments(llm, cfg, scale_path, src_path, source_blob, language, no_cache=no_cache)
     if language == "python":
         from scale_python import generate_language_comments
         new_lines = generate_language_comments(llm, cfg, messages, source_blob, source_lines)
@@ -344,6 +509,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     - language: Source file language (optional). SCALE currently supports 'python', 'js'.
     - verbose: Output progress information to stdout (optional).
     - very-verbose: Output LLM debug information to stdout (optional).
+    - no-cache: Don't load the summary text for this file from cache.
     - n-ctx: Number of tokens to use as context (default: 32 * 1024).
     - max-new-tokens: Maximum number of new tokens to generate (default: 8 * 1024).
     - format: Chat format override (default: 'auto').
@@ -368,15 +534,16 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--language", "-l", default=None, help="Source file language. SCALE currently supports: 'python', 'js'")
     p.add_argument("--verbose", "-v", action="store_true", help="Output progress information to stdout")
     p.add_argument("--very-verbose", "-vv", action="store_true", help="Output LLM debug information to stdout")
-    p.add_argument("--n-ctx", type=int, default=12 * 1024)
-    p.add_argument("--max-new-tokens", "-M", type=int, default=8 * 1024)
+    p.add_argument("--no-cache", "-nc", action="store_true", help="Don't load the summary text for this file from cache")
+    p.add_argument("--n-ctx", type=int, default=12 * 1024, help="Number of tokens to use as context")
+    p.add_argument("--max-new-tokens", "-M", type=int, default=8 * 1024, help="Maximum number of new tokens to generate")
     p.add_argument("--format", "-f", default="auto", help=f"Chat format override. One of {formatters}")
-    p.add_argument("--temperature", "-T", type=float, default=0.2)
-    p.add_argument("--top-p", "-P", type=float, default=0.9)
-    p.add_argument("--top-k", "-K", type=int, default=60)
-    p.add_argument("--repeat-penalty", "-R", type=float, default=1.05)
-    p.add_argument("--n-batch", type=int, default=256)
-    p.add_argument("--n-gpu-layers", type=int, default=-1)
+    p.add_argument("--temperature", "-T", type=float, default=0.2, help="Temperature value for the LLM")
+    p.add_argument("--top-p", "-P", type=float, default=0.9, help="Top-p value for the LLM")
+    p.add_argument("--top-k", "-K", type=int, default=60, help="Top-k value for the LLM")
+    p.add_argument("--repeat-penalty", "-R", type=float, default=1.05, help="Repeat penalty value for the LLM")
+    p.add_argument("--n-batch", type=int, default=256, help="Number of batches to process")
+    p.add_argument("--n-gpu-layers", type=int, default=-1, help="Number of GPU layers to use")
 
     return p.parse_args(argv)
 
@@ -428,7 +595,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.comment:
         echo("Generating comments...")
         language = args.language.lower() if args.language else None
-        return generate_comments(llm, cfg, scale_path, src_path, dst_path, language)
+        return generate_comments(llm, cfg, scale_path, src_path, dst_path, language, no_cache=args.no_cache)
 
     return 0
 
