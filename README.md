@@ -172,14 +172,16 @@ huggingface-cli login
 # Make a local models folder
 mkdir -p models
 
-# Download a quantised GGUF (example: Q4_K_M) - this can take a loooong time...
+# Download a quantised GGUF - this can take a loooong time...
+# Qwen2.5.1-Coder-7B-Instruct is the default model and gave the best comments of
+# those tested (a code-specialised 7B; the Q5_K_M quant is ~5.2GB).
 huggingface-cli download \
-  bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
-  --include "*Q6_K.gguf" \
+  bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF \
+  --include "*Q5_K_M.gguf" \
   --local-dir models \
   --local-dir-use-symlinks False
 
-MODEL_PATH="models/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q6_K.gguf"
+MODEL_PATH="models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF/Qwen2.5.1-Coder-7B-Instruct-Q5_K_M.gguf"
 
 # Example: annotate a Python file
 python scale.py \
@@ -251,13 +253,14 @@ You'll likely need to sign up to [HuggingFace](ttps://huggingface.co/models?libr
 
 I have tried various models, notably:
 
+- [bartowski/Qwen2.5.1-Coder-7B-Instruct](https://huggingface.co/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF) - **the default**, and the best of those tested for generating comments (a code-specialised 7B).
 - [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF?show_file_info=qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf)
 - [bartowski/Meta-Llama-3.1-8B-Instruct](https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF?show_file_info=Meta-Llama-3.1-8B-Instruct-Q6_K.gguf)
 
 ```bash
 pip install -U "huggingface_hub[cli]"
 huggingface-cli login ...your login details...
-huggingface-cli download Qwen/Qwen2.5-7B-Instruct-GGUF --include "qwen2.5-7b-instruct-q4_k_m*.gguf" --local-dir models/Qwen2.5-7B-Instruct-GGUF --local-dir-use-symlinks False
+huggingface-cli download bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF --include "*Q5_K_M.gguf" --local-dir models/Qwen2.5.1-Coder-7B-Instruct-GGUF --local-dir-use-symlinks False
 ```
 
 # GPU Tier List

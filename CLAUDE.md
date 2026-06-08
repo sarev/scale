@@ -20,7 +20,7 @@ python scale.py -c file.py -o out.py -v --n-ctx 12288 --n-batch 256
 
 - `tests.sh` is the de-facto test harness: it runs the tool against JS/C/Python sample files (paths are machine-specific to the author — adjust before running). There is no unit-test suite.
 - `tune_n_batch.py` probes throughput to pick a good `--n-batch` for a given model/GPU.
-- The default model path (`DEFAULT_MODEL` in `scale.py`) is a local Llama-3.1-8B GGUF; override with `-m`.
+- The default model path (`DEFAULT_MODEL` in `scale.py`) is a local Qwen2.5.1-Coder-7B-Instruct GGUF (Q5_K_M); override with `-m`.
 
 ## Dependencies
 

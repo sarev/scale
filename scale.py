@@ -33,11 +33,12 @@ import sys
 import uuid
 
 
-# Based upon meta-llama/Llama-3.1-8B-Instruct
+# Based upon Qwen2.5.1-Coder-7B-Instruct (a code-specialised model that produces
+# the best comments of those tested here).
 #
-# 8B parameters, 6-bit quantised, 6.6GB, context length 131072.
+# 7B parameters, 5-bit quantised (Q5_K_M), ~5.2GB, context length 32768.
 #
-DEFAULT_MODEL = "./models/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q6_K.gguf"
+DEFAULT_MODEL = "./models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF/Qwen2.5.1-Coder-7B-Instruct-Q5_K_M.gguf"
 
 
 # Languages with a worker module wired into generate_comments().
