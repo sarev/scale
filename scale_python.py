@@ -400,21 +400,22 @@ def describe_imports_from_tree(
     cfg: GenerationConfig,
     messages: Messages,
     tree: ast.AST
-) -> List[str]:
+) -> None:
     """
-    Produce plain-English descriptions of all imports found in an AST.
+    Describe all imports found in an AST and feed them to the LLM as extra context.
 
-    This function traverses the provided Abstract Syntax Tree (AST) and generates a list of strings describing each
-    imported name in source order.
+    This function traverses the provided Abstract Syntax Tree (AST), builds a plain-English list of imported names in
+    source order, and (if any are found) appends them to the conversation so the model has that context. The message
+    list is mutated in place; nothing is returned.
 
     Parameters:
     - `llm`: The LocalChatModel instance.
     - `cfg`: The GenerationConfig instance.
-    - `messages`: The Messages instance.
+    - `messages`: The Messages instance (mutated in place).
     - `tree`: A module AST produced by `ast.parse(...)`.
 
     Returns:
-    - A list of strings describing each imported name in source order.
+    - None
     """
 
     if not isinstance(tree, ast.AST):
@@ -462,7 +463,7 @@ def generate_docstrings(
     defs: List[DefInfo],
     source_blob: str,
     source_lines: Chunk
-) -> Dict[str, str]:
+) -> Dict[int, str]:
     """
     Generate or update docstrings for definitions in a Python source code AST.
 
@@ -577,8 +578,7 @@ def generate_docstrings(
 
     # ---------------- snippet assembly ----------------
 
-    docs_by_qualname: Dict[str, str] = {}   # external return mapping
-    docs_by_node_id: Dict[int, str] = {}    # internal disambiguation
+    docs_by_node_id: Dict[int, str] = {}    # node identity -> generated docstring (avoids qualname collisions)
 
     def make_child_stub(child_node_id: int) -> str:
         """
@@ -650,10 +650,6 @@ def generate_docstrings(
 
     # Map node-id → DefInfo (unambiguous identity; avoids name collisions)
     info_by_node_id: Dict[int, DefInfo] = {id(info.node): info for info in defs}
-    # Map qualname → node-id list (only used if you need to resolve duplicates externally)
-    node_ids_by_qualname: Dict[str, List[int]] = {}
-    for info in defs:
-        node_ids_by_qualname.setdefault(info.qualname, []).append(id(info.node))
 
     # ---------------- LLM loop (deepest-first using DefInfo.depth) ----------------
 
@@ -688,13 +684,12 @@ def generate_docstrings(
         if not docstring:
             docstring = f"{info.kind} `{info.qualname}` - comment generation failed."
 
-        docs_by_qualname[info.qualname] = docstring
         docs_by_node_id[node_id] = docstring
 
-    return docs_by_qualname
+    return docs_by_node_id
 
 
-def patch_docstrings_textually(source_lines: Chunk, defs: List[DefInfo], doc_map: Dict[str, str]) -> Chunk:
+def patch_docstrings_textually(source_lines: Chunk, defs: List[DefInfo], doc_map: Dict[int, str]) -> Chunk:
     """
     Replace or insert docstrings in the source code, preserving comments, blank lines, and formatting.
 
@@ -719,20 +714,29 @@ def patch_docstrings_textually(source_lines: Chunk, defs: List[DefInfo], doc_map
 
     # Process in reverse source order to keep indices stable
     for info in sorted(defs, key=lambda d: d.start, reverse=True):
-        qualname = info.qualname
-        if qualname not in doc_map:
+        if id(info.node) not in doc_map:
             continue
 
-        doc = doc_map[qualname]
+        doc = doc_map[id(info.node)]
+
+        node = info.node
+        has_body = bool(getattr(node, "body", []))
+
+        # A docstring can only be placed cleanly when the first body statement begins its own
+        # line. For inline definitions (e.g. `def f(): return 1`, or a body that shares the
+        # closing signature line) inserting or replacing would corrupt the code, so skip them.
+        if has_body:
+            first_stmt = node.body[0]
+            prefix = source_lines[first_stmt.lineno - 1][:first_stmt.col_offset]
+            if prefix.strip() != "":
+                echo(f"Skipping inline definition '{info.qualname}' (body shares the header line)")
+                continue
 
         # Compute indent for the docstring block: one level deeper than the def/class header
         def_line_text = source_lines[info.def_line - 1]
         base_indent = def_line_text[: len(def_line_text) - len(def_line_text.lstrip())] + "    "
 
         new_doc_lines = [f'{base_indent}"""', *[f"{base_indent}{line}" for line in doc.splitlines()], f'{base_indent}"""']
-
-        node = info.node
-        has_body = bool(getattr(node, "body", []))
 
         existing_doc = (
             has_body

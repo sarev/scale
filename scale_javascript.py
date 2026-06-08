@@ -93,6 +93,26 @@ def _load_js_language_and_parser() -> Tuple[Language, Parser]:
 JS_LANGUAGE, JS_PARSER = _load_js_language_and_parser()
 
 
+def _parse_js(source_blob: str) -> Tuple[Any, bytes]:
+    """
+    Normalise line endings and parse JavaScript source once.
+
+    Tree-sitter counts rows by '\\n' only, whereas the source may use '\\r' or '\\r\\n'. Line endings are normalised to
+    '\\n' so that node rows line up with the caller's line-split source. The same normalised bytes are returned and used
+    for any node-text extraction, keeping byte offsets self-consistent with the parse tree.
+
+    Parameters:
+    - `source_blob`: The JavaScript source code as a string.
+
+    Returns:
+    - A tuple of the parsed tree and the normalised source bytes it was parsed from.
+    """
+
+    norm = source_blob.replace("\r\n", "\n").replace("\r", "\n")
+    source_bytes = norm.encode("utf-8", errors="replace")
+    return JS_PARSER.parse(source_bytes), source_bytes
+
+
 # ---- DefInfo for JavaScript --------------------------------------------------
 
 
@@ -269,7 +289,7 @@ def _row_of(point) -> int:
 # ---- Import discovery (ESM + CommonJS) -------------------------------------
 
 
-def _collect_imports_js(source_blob: str) -> List[Tuple[int, str]]:
+def _collect_imports_js(tree, source_bytes: bytes) -> List[Tuple[int, str]]:
     """
     Collect a plain-English list of import/require statements in source order.
 
@@ -277,14 +297,14 @@ def _collect_imports_js(source_blob: str) -> List[Tuple[int, str]]:
     It returns a list of tuples, where each tuple contains the line number and a description of the import/require statement.
 
     Parameters:
-    - `source_blob`: The JavaScript source code as a string.
+    - `tree`: The parsed Tree-sitter tree for the source.
+    - `source_bytes`: The (normalised) source bytes the tree was parsed from.
 
     Returns:
     - A list of tuples, where each tuple contains the line number and a description of the import/require statement.
     """
     out: List[Tuple[int, str]] = []
-    src_b = source_blob.encode("utf-8", errors="replace")
-    tree = JS_PARSER.parse(src_b)
+    src_b = source_bytes
     root = tree.root_node
 
     def add(n, text: str) -> None:
@@ -356,15 +376,13 @@ def _collect_imports_js(source_blob: str) -> List[Tuple[int, str]]:
             init = _node_field(n, "value")
             callee = _node_field(init, "function") if init and init.type == "call_expression" else None
             if callee and _node_text(src_b, callee) == "require":
-                # Extract module name from first argument if string literal
-                args = [init.child(i) for i in range(init.named_child_count)] if init else []
-                mod = None
-                for a in args:
-                    if a.type == "arguments" and a.named_child_count >= 1:
-                        arg0 = a.named_child(0)
-                        if arg0 and arg0.type == "string":
-                            mod = _string_value(_node_text(src_b, arg0))
-                mod = mod or "<unknown>"
+                # Extract module name from the first argument if it is a string literal
+                mod = "<unknown>"
+                args = _node_field(init, "arguments")
+                if args and args.named_child_count >= 1:
+                    arg0 = args.named_child(0)
+                    if arg0 and arg0.type == "string":
+                        mod = _string_value(_node_text(src_b, arg0))
 
                 # Binding side: identifier or object_pattern
                 name_node = _node_field(n, "name")
@@ -417,7 +435,8 @@ def describe_imports_js(
     llm: LocalChatModel,
     cfg: GenerationConfig,
     messages: Messages,
-    source_blob: str
+    tree,
+    source_bytes: bytes
 ) -> None:
     """
     Build a list of imports/requires from the JavaScript source code and feed it to the LLM as extra context.
@@ -429,14 +448,15 @@ def describe_imports_js(
     - `llm`: The LocalChatModel instance.
     - `cfg`: The GenerationConfig instance.
     - `messages`: The Messages instance.
-    - `source_blob`: The JavaScript source code as a string.
+    - `tree`: The parsed Tree-sitter tree for the source.
+    - `source_bytes`: The (normalised) source bytes the tree was parsed from.
 
     Notes:
     - If no imports are found, this function returns immediately.
     - The LLM output is echoed and appended to the messages list.
     """
 
-    items = _collect_imports_js(source_blob)
+    items = _collect_imports_js(tree, source_bytes)
     if not items:
         return
 
@@ -588,23 +608,22 @@ def _iter_children(n) -> Iterable:
         yield n.named_child(i)
 
 
-def iter_defs_with_info_js(source_blob: str) -> List[DefInfoJS]:
+def iter_defs_with_info_js(tree, source_bytes: bytes) -> List[DefInfoJS]:
     """
     Collect definition-like constructs from the given JavaScript source code.
 
-    This function parses the JS module and identifies functions, classes, methods, variables, and object methods.
+    This function walks a parsed JS module and identifies functions, classes, methods, variables, and object methods.
     It creates DefInfoJS instances for each definition, which contain information such as the qualified name, type,
     start and end lines, header start and end lines, depth, parent ID, and children IDs.
 
     Parameters:
-    - `source_blob`: The JavaScript source code to parse.
+    - `tree`: The parsed Tree-sitter tree for the source.
+    - `source_bytes`: The (normalised) source bytes the tree was parsed from.
 
     Returns:
     - A sorted list of DefInfoJS instances representing the definition-like constructs in the source code.
     """
 
-    source_bytes = source_blob.encode("utf-8", errors="replace")
-    tree = JS_PARSER.parse(source_bytes)
     root = tree.root_node
 
     results: List[DefInfoJS] = []
@@ -858,11 +877,19 @@ def _extract_first_comment_block(reply: str) -> str:
     else:
         end_idx = len(lines) + 1
 
-    lines = lines[start_idx:end_idx]
-    lines = [line.lstrip(" *") for line in lines]
-    lines = "\n".join(lines)
+    block = lines[start_idx:end_idx]
+    cleaned: List[str] = []
+    for ln in block:
+        stripped = ln.lstrip()
+        # Remove only the single leading JSDoc gutter '*' (and one following space),
+        # so genuine content like a '* bullet' is preserved rather than eaten.
+        if stripped.startswith("*"):
+            stripped = stripped[1:]
+            if stripped.startswith(" "):
+                stripped = stripped[1:]
+        cleaned.append(stripped.rstrip())
 
-    return textwrap.dedent(lines).strip()
+    return "\n".join(cleaned).strip()
 
 
 def assemble_snippet_for_js(
@@ -932,7 +959,7 @@ def generate_comments_js(
     defs: List[DefInfoJS],
     source_blob: str,
     source_lines: Chunk
-) -> Dict[str, str]:
+) -> Dict[int, str]:
     """
     Generate JSDoc content for JS definitions in a deepest-first order, ensuring parents see child stubs.
 
@@ -955,7 +982,6 @@ def generate_comments_js(
         - A dictionary mapping qualification names to generated JSDoc comments.
     """
 
-    docs_by_qualname: Dict[str, str] = {}
     docs_by_node_id: Dict[int, str] = {}
     info_by_id: Dict[int, DefInfoJS] = {id(d.node): d for d in defs}
 
@@ -980,10 +1006,9 @@ def generate_comments_js(
         doc = _extract_first_comment_block(reply)
         if not doc:
             doc = f"{info.kind} `{info.qualname}` - documentation generation failed."
-        docs_by_qualname[info.qualname] = doc
         docs_by_node_id[node_id] = doc
 
-    return docs_by_qualname
+    return docs_by_node_id
 
 
 # ---- Textual patcher (insert/replace above headers) -------------------------
@@ -1032,7 +1057,7 @@ def _scan_existing_comment_block_above(source_lines: Chunk, header_start_line_1b
     return None
 
 
-def patch_comments_textually_js(source_lines: Chunk, defs: List[DefInfoJS], doc_map: Dict[str, str]) -> Chunk:
+def patch_comments_textually_js(source_lines: Chunk, defs: List[DefInfoJS], doc_map: Dict[int, str]) -> Chunk:
     """
     Insert or replace documentation blocks for each JS definition.
 
@@ -1053,10 +1078,10 @@ def patch_comments_textually_js(source_lines: Chunk, defs: List[DefInfoJS], doc_
     out_lines = source_lines[:]
 
     for info in sorted(defs, key=lambda d: d.start, reverse=True):
-        qual = info.qualname
-        if qual not in doc_map:
+        node_id = id(info.node)
+        if node_id not in doc_map:
             continue
-        doc = doc_map[qual]
+        doc = doc_map[node_id]
 
         header_line_text = source_lines[info.header_start - 1]
         indent = header_line_text[: len(header_line_text) - len(header_line_text.lstrip())]
@@ -1107,12 +1132,13 @@ def generate_language_comments(
     """
 
     echo("Parsing JavaScript source with Tree-sitter...")
-    defs = iter_defs_with_info_js(source_blob)
+    tree, source_bytes = _parse_js(source_blob)
+    defs = iter_defs_with_info_js(tree, source_bytes)
     echo(f"Found {len(defs)} JS definitions")
 
     # Provide a list of imports/requires to the LLM (if there are any)
     echo("Identifying imports/requires...")
-    describe_imports_js(llm, cfg, messages, source_blob)
+    describe_imports_js(llm, cfg, messages, tree, source_bytes)
 
     echo("Generating JSDoc comments...\n")
     doc_map = generate_comments_js(llm, cfg, messages, defs, source_blob, source_lines)

@@ -27,6 +27,7 @@ from scale_llm import LocalChatModel, GenerationConfig, llm_formatters, Messages
 from scale_log import echo, error, set_verbosity
 from typing import List, Optional, Sequence, Tuple
 import argparse
+import hashlib
 import pickle
 import sys
 import uuid
@@ -37,6 +38,10 @@ import uuid
 # 8B parameters, 6-bit quantised, 6.6GB, context length 131072.
 #
 DEFAULT_MODEL = "./models/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q6_K.gguf"
+
+
+# Languages with a worker module wired into generate_comments().
+SUPPORTED_LANGUAGES = ("python", "js", "c")
 
 
 # ---------------------------- CLI harness ----------------------------
@@ -229,21 +234,25 @@ class SummaryCache:
     _CACHE_DIR = (Path(__file__).resolve().parent) / "__cache__"
     _CACHE_INDEX = _CACHE_DIR / "index.pkl"
 
-    def __init__(self, source_path: Path) -> None:
+    def __init__(self, source_path: Path, source_blob: str) -> None:
         """
-        Initialise the instance with a source path.
+        Initialise the instance with a source path and its current contents.
 
         This call loads or generates a unique identifier (UID) for the given source path and stores it in the index file.
-        The UID is used to identify the associated data file, which contains a summary of the source code.
+        The UID is used to identify the associated data file, which contains a summary of the source code. A SHA-256 hash
+        of `source_blob` is recorded alongside the summary so that a cached summary is only reused while the source file
+        is unchanged; editing the file invalidates the cache automatically.
 
         Parameters:
         - `source_path`: The path to the source code file.
+        - `source_blob`: The current contents of the source file (used to compute the invalidation hash).
 
         Returns:
         - None
         """
 
         self._summary: Optional[str] = None
+        self._hash = hashlib.sha256(source_blob.encode("utf-8", errors="surrogateescape")).hexdigest()
 
         # Load or create index
         index = self._load_index()
@@ -256,13 +265,23 @@ class SummaryCache:
             self._save_index(index)
 
         self._uid = uid
-        self._data_path = self._CACHE_DIR / f"{self._uid}.txt"  # one file per uid
+        self._data_path = self._CACHE_DIR / f"{self._uid}.txt"      # one summary file per uid
+        self._hash_path = self._CACHE_DIR / f"{self._uid}.sha256"   # content hash for invalidation
 
-        # Load existing summary if present
+        # Load the existing summary only if it was generated from the same source content.
         try:
-            raw = self._data_path.read_bytes()
-            self._summary = raw.decode("utf-8", errors="surrogateescape")
+            cached_hash = self._hash_path.read_text(encoding="utf-8").strip()
         except FileNotFoundError:
+            cached_hash = None
+
+        if cached_hash == self._hash:
+            try:
+                raw = self._data_path.read_bytes()
+                self._summary = raw.decode("utf-8", errors="surrogateescape")
+            except FileNotFoundError:
+                self._summary = None
+        else:
+            # Stale (or missing) hash: ignore any cached summary so it is regenerated.
             self._summary = None
 
     @property
@@ -290,6 +309,8 @@ class SummaryCache:
             self._data_path,
             text.encode("utf-8", errors="surrogateescape"),
         )
+        # Record the content hash so this summary is reused only while the source is unchanged.
+        self._atomic_write_bytes(self._hash_path, self._hash.encode("utf-8"))
 
     @classmethod
     def _load_index(cls) -> dict[str, str]:
@@ -376,8 +397,8 @@ def prime_llm_for_comments(
     - A list of messages exchanged between the system and the LLM, including the priming prompts and the generated responses.
     """
 
-    # Initialise the smmary cache
-    summary_cache = SummaryCache(src_path)
+    # Initialise the summary cache (keyed on path + a hash of the current contents)
+    summary_cache = SummaryCache(src_path, source_blob)
 
     echo("Priming LLM...")
 
@@ -414,14 +435,21 @@ def prime_llm_for_comments(
         # Generate (and cache) the summary text for the full source code
         summary_cache.summary = llm.generate(messages, cfg=cfg)
 
+        # Drop the full source blob from context now we have its summary; we
+        # re-introduce just the (much smaller) summary below to keep context tight.
+        messages.pop()
+
     reply_length = 1 + summary_cache.summary.count("\n")
     echo(f"Source file summarised? {reply_length} lines of summary created")
     echo(f"\n{summary_cache.summary}\n")
 
-    # Replace the source file with its summary in the LLM's context
-    messages.pop()
-    reply = f"To give you context, here is an overview of what the program as a whole does:\n\n{reply}\n\nPlease confirm you are ready to continue by saying 'OK'.\n"
-    messages.append({"role": "user", "content": reply})
+    # Provide the summary (not the whole file) as the working context.
+    prompt = (
+        "To give you context, here is an overview of what the program as a whole does:\n\n"
+        f"{summary_cache.summary}\n\n"
+        "Please confirm you are ready to continue by saying 'OK'.\n"
+    )
+    messages.append({"role": "user", "content": prompt})
     reply = llm.generate(messages, cfg=cfg)
     echo(f"Summary ingested? {reply}")
     messages.append({"role": "assistant", "content": reply})
@@ -441,15 +469,17 @@ def generate_comments(
     scale_path: Path,
     src_path: Path,
     dst_path: Path,
-    language: Optional[str] = None,
+    source_blob: str,
+    source_lines: List[str],
+    line_ending: str,
+    language: str,
     no_cache: Optional[bool] = False
 ) -> int:
     """
-    Generate comments for the provided source code using a Large Language Model (LLM).
+    Generate comments for the provided (already-loaded) source code using a Large Language Model (LLM).
 
-    This function loads the source file, primes the LLM with a system prompt and the source file as context,
-    and then uses the LLM to generate comments and summaries for the code. The generated comments are
-    written to the specified destination path.
+    This function primes the LLM with a system prompt and a summary of the source file as context, then uses the LLM
+    to generate comments for each routine. The annotated source is written to the destination path (or stdout).
 
     Parameters:
     - `llm`: The LocalChatModel instance used for generating comments.
@@ -457,7 +487,10 @@ def generate_comments(
     - `scale_path`: The path to the SCALE tool installation directory.
     - `src_path`: The path to the source file to be annotated.
     - `dst_path`: The path where the updated source file will be written (optional).
-    - `language`: The programming language of the source code (optional).
+    - `source_blob`: The complete source text (with original line endings).
+    - `source_lines`: The source text split into individual lines.
+    - `line_ending`: The detected line ending used to re-join the output.
+    - `language`: The programming language of the source code (already resolved and validated).
     - `no_cache`: Generate new summary - don't use the cached version.
 
     Returns:
@@ -468,7 +501,6 @@ def generate_comments(
     - If the destination path is not provided, the generated comments will be printed to the console.
     """
 
-    source_blob, source_lines, line_ending, language = load_source(src_path, language)
     messages = prime_llm_for_comments(llm, cfg, scale_path, src_path, source_blob, language, no_cache=no_cache)
     if language == "python":
         from scale_python import generate_language_comments
@@ -506,7 +538,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     - model: Path to GGUF model file (optional).
     - output: Output filename (optional).
     - comment: Add and update comments in the source code (optional).
-    - language: Source file language (optional). SCALE currently supports 'python', 'js'.
+    - language: Source file language (optional). SCALE currently supports 'python', 'js', 'c'.
     - verbose: Output progress information to stdout (optional).
     - very-verbose: Output LLM debug information to stdout (optional).
     - no-cache: Don't load the summary text for this file from cache.
@@ -531,7 +563,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--model", "-m", default="", help="Optional path to GGUF model file")
     p.add_argument("--output", "-o", default="", help="Optional output filename")
     p.add_argument("--comment", "-c", action="store_true", help="Add and update comments")
-    p.add_argument("--language", "-l", default=None, help="Source file language. SCALE currently supports: 'python', 'js'")
+    p.add_argument("--language", "-l", default=None, help="Source file language. SCALE currently supports: 'python', 'js', 'c'")
     p.add_argument("--verbose", "-v", action="store_true", help="Output progress information to stdout")
     p.add_argument("--very-verbose", "-vv", action="store_true", help="Output LLM debug information to stdout")
     p.add_argument("--no-cache", "-nc", action="store_true", help="Don't load the summary text for this file from cache")
@@ -572,6 +604,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     src_path = Path(args.source)
     dst_path = Path(args.output) if args.output else None
 
+    if not args.comment:
+        # Nothing to do without --comment.
+        return 0
+
+    # Load the source and resolve the language up front, so an unsupported file fails fast
+    # before the (slow) model load.
+    language = args.language.lower() if args.language else None
+    source_blob, source_lines, line_ending, language = load_source(src_path, language)
+    if language not in SUPPORTED_LANGUAGES:
+        error(f"Unsupported language '{language}'. SCALE supports: {', '.join(SUPPORTED_LANGUAGES)}")
+        return 1
+
     # Prepare model and config
     echo("Loading the LLM...")
     llm = LocalChatModel(
@@ -592,12 +636,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         repeat_penalty=args.repeat_penalty,
     )
 
-    if args.comment:
-        echo("Generating comments...")
-        language = args.language.lower() if args.language else None
-        return generate_comments(llm, cfg, scale_path, src_path, dst_path, language, no_cache=args.no_cache)
-
-    return 0
+    echo("Generating comments...")
+    return generate_comments(
+        llm, cfg, scale_path, src_path, dst_path,
+        source_blob, source_lines, line_ending, language,
+        no_cache=args.no_cache,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

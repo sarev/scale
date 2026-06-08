@@ -49,6 +49,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from llama_cpp import Llama
 from pathlib import Path
+from scale_log import echo
 from typing import Dict, List, Optional, Sequence, Tuple, Union, Iterable
 import math
 import os
@@ -584,34 +585,64 @@ class LocalChatModel:
         formatter = FORMATTERS[self.chat_format]
         return formatter(messages)
 
-    def _trim_needed(self, cfg: GenerationConfig, prompt: str):
-        # Get prompt text as raw UTF-8 bytes
+    def _estimate_prompt_tokens(self, prompt: str) -> int:
         """
-        Determine if the prompt needs trimming to fit within the context window.
+        Estimate the number of tokens in a prompt, periodically recalibrating against the real tokeniser.
 
-        This method estimates the number of tokens in the prompt and checks if it exceeds the available context window size.
-        If the prompt is too long, it may be trimmed to fit within the allowed context.
+        A cheap bytes-per-token heuristic is used most of the time to avoid tokenising on every turn. Every
+        `refine_every` turns the prompt is tokenised for real, both to return an exact count and to update the
+        `approx_bpt` ratio used by the heuristic.
 
         Parameters:
-        - `cfg`: The generation configuration for this instance.
-        - `prompt`: The input prompt text as a string.
+        - `prompt`: The fully formatted prompt text.
 
         Returns:
-        - `True` if the prompt needs trimming, `False` otherwise.
+        - An estimated (or, on calibration turns, exact) token count for the prompt.
         """
 
         prompt_utf8 = prompt.encode("utf-8")
         prompt_bytes = len(prompt_utf8)
 
-        # Estimate the number of tokens in the total prompt
-        approx_tokens = math.ceil(prompt_bytes / self.approx_bpt)
-
-        # Are we refining our estimate of the number of bytes per token?
+        # Periodically recalibrate the bytes-per-token ratio against the real tokeniser.
         if self.turn % self.refine_every == 0:
             true_tokens = len(self.llm.tokenize(prompt_utf8, add_bos=True))
-            self.approx_bpt = prompt_bytes / true_tokens
+            if true_tokens:
+                self.approx_bpt = prompt_bytes / true_tokens
+                return true_tokens
 
-        return approx_tokens > (self.n_ctx - self.ctx_margin)
+        return math.ceil(prompt_bytes / self.approx_bpt)
+
+    def _check_context_budget(self, cfg: GenerationConfig, prompt: str) -> None:
+        """
+        Guard against prompts that will not fit within the model's context window.
+
+        The real constraint is `prompt_tokens + max_new_tokens <= n_ctx`. If the prompt alone cannot fit, llama.cpp
+        would silently truncate it and produce garbage, so this raises with actionable guidance instead. If the prompt
+        fits but leaves too little room for the requested generation, a (verbose) warning is emitted and generation
+        proceeds — output may simply be cut short.
+
+        Parameters:
+        - `cfg`: Generation settings, used here for `max_new_tokens`.
+        - `prompt`: The fully formatted prompt text.
+
+        Raises:
+        - `ValueError`: If the prompt alone does not fit within `n_ctx`.
+        """
+
+        prompt_tokens = self._estimate_prompt_tokens(prompt)
+        available = self.n_ctx - self.ctx_margin
+
+        if prompt_tokens >= self.n_ctx:
+            raise ValueError(
+                f"Prompt is ~{prompt_tokens} tokens but the context window (n_ctx) is only {self.n_ctx}. "
+                f"Increase --n-ctx or process a smaller source file."
+            )
+
+        if prompt_tokens + cfg.max_new_tokens > available:
+            echo(
+                f"WARNING: prompt (~{prompt_tokens} tokens) plus max_new_tokens ({cfg.max_new_tokens}) "
+                f"exceeds the usable context ({available} of {self.n_ctx}); generated output may be truncated."
+            )
 
     def generate(
         self,
@@ -676,8 +707,7 @@ class LocalChatModel:
 
         cfg = cfg or GenerationConfig()
 
-        if self._trim_needed(cfg, prompt):
-            print("WARNING: we're getting close to the context window limit!")
+        self._check_context_budget(cfg, prompt)
 
         resp = self.llm.create_completion(
             prompt=prompt,
@@ -758,8 +788,7 @@ class LocalChatModel:
 
         cfg = cfg or GenerationConfig()
 
-        if self._trim_needed(cfg, prompt):
-            print("WARNING: we're getting close to the context window limit!")
+        self._check_context_budget(cfg, prompt)
 
         stream = self.llm.create_completion(
             prompt=prompt,

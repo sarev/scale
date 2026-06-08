@@ -68,6 +68,26 @@ def _load_c_language_and_parser() -> Tuple[Language, Parser]:
 C_LANGUAGE, C_PARSER = _load_c_language_and_parser()
 
 
+def _parse_c(source_blob: str) -> Tuple[Any, bytes]:
+    """
+    Normalise line endings and parse C source once.
+
+    Tree-sitter counts rows by '\\n' only, whereas the source may use '\\r' or '\\r\\n'. Line endings are normalised to
+    '\\n' so that node rows line up with the caller's line-split source. The same normalised bytes are returned and used
+    for any node-text extraction, keeping byte offsets self-consistent with the parse tree.
+
+    Parameters:
+    - `source_blob`: The C source code as a string.
+
+    Returns:
+    - A tuple of the parsed tree and the normalised source bytes it was parsed from.
+    """
+
+    norm = source_blob.replace("\r\n", "\n").replace("\r", "\n")
+    source_bytes = norm.encode("utf-8", errors="replace")
+    return C_PARSER.parse(source_bytes), source_bytes
+
+
 # ---------------- Utilities
 
 def _to_1based(row0: int) -> int:
@@ -281,7 +301,7 @@ def _display_include_target(tok: str) -> str:
     return tok
 
 
-def _collect_includes_c(source_blob: str) -> List[Tuple[int, str]]:
+def _collect_includes_c(tree, source_bytes: bytes) -> List[Tuple[int, str]]:
     """
     Collect a list of #include directives in source order.
 
@@ -295,15 +315,14 @@ def _collect_includes_c(source_blob: str) -> List[Tuple[int, str]]:
     The function returns a list of tuples containing the line number and a description of each include directive.
 
     Parameters:
-    - `source_blob`: The C source code as a string.
+    - `tree`: The parsed Tree-sitter tree for the source.
+    - `source_bytes`: The (normalised) source bytes the tree was parsed from.
 
     Returns:
     - A list of tuples, where each tuple contains the line number (1-based) and a description of the include directive.
     """
 
     out: List[Tuple[int, str]] = []
-    source_bytes = source_blob.encode("utf-8", errors="replace")
-    tree = C_PARSER.parse(source_bytes)
     root = tree.root_node
 
     def add(n, payload: str) -> None:
@@ -364,7 +383,8 @@ def describe_includes_c(
     llm: LocalChatModel,
     cfg: GenerationConfig,
     messages: Messages,
-    source_blob: str
+    tree,
+    source_bytes: bytes
 ) -> None:
     """
     Build a list of #includes from the source code and feed it to the LLM as extra context.
@@ -377,13 +397,14 @@ def describe_includes_c(
     - `llm`: The LocalChatModel instance used for LLM interactions.
     - `cfg`: The GenerationConfig instance used for LLM generation.
     - `messages`: The Messages instance used for storing and sending messages.
-    - `source_blob`: The source code string from which to collect includes.
+    - `tree`: The parsed Tree-sitter tree for the source.
+    - `source_bytes`: The (normalised) source bytes the tree was parsed from.
 
     Notes:
     This method does not return any value, as it is designed to update the message list and prompt the LLM for a response.
     """
 
-    items = _collect_includes_c(source_blob)
+    items = _collect_includes_c(tree, source_bytes)
     if not items:
         return
     lines = [text for _, text in items]
@@ -405,22 +426,21 @@ def describe_includes_c(
 # ---------------- Collect function definitions (ignores forward declarations)
 
 
-def iter_defs_with_info_c(source_blob: str) -> List[DefInfoC]:
+def iter_defs_with_info_c(tree, source_bytes: bytes) -> List[DefInfoC]:
     """
     Collect real function definitions from a C file.
 
-    This function parses the input C source code, identifies function definitions, and collects metadata.
+    This function walks a parsed C tree, identifies function definitions, and collects metadata.
     Forward declarations are excluded from the results.
 
     Parameters:
-    - `source_blob`: The input C source code as a string.
+    - `tree`: The parsed Tree-sitter tree for the source.
+    - `source_bytes`: The (normalised) source bytes the tree was parsed from.
 
     Returns:
     - A sorted list of `DefInfoC` objects, each containing information about a real function definition.
     """
 
-    source_bytes = source_blob.encode("utf-8", errors="replace")
-    tree = C_PARSER.parse(source_bytes)
     root = tree.root_node
 
     results: List[DefInfoC] = []
@@ -743,12 +763,13 @@ def generate_language_comments(
     """
 
     echo("Parsing C source with Tree-sitter...")
-    defs = iter_defs_with_info_c(source_blob)
+    tree, source_bytes = _parse_c(source_blob)
+    defs = iter_defs_with_info_c(tree, source_bytes)
     echo(f"Found {len(defs)} C function definition(s)")
 
     # Provide a list of #includes to the LLM (if there are any)
     echo("Identifying #includes...")
-    describe_includes_c(llm, cfg, messages, source_blob)
+    describe_includes_c(llm, cfg, messages, tree, source_bytes)
 
     echo("Generating C comments...\n")
     doc_map = generate_comments_c(llm, cfg, messages, defs, source_blob, source_lines)
