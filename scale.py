@@ -22,10 +22,11 @@ to generate comments and summaries for the code.
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 from scale_llm import LocalChatModel, GenerationConfig, llm_formatters, Messages, Chunk
 from scale_log import echo, error, set_verbosity
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 import argparse
 import hashlib
 import pickle
@@ -43,6 +44,11 @@ DEFAULT_MODEL = "./models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF/Qwen2.5.1-C
 
 # Languages with a worker module wired into generate_comments().
 SUPPORTED_LANGUAGES = ("python", "js", "c")
+
+
+# Reply-length cap (tokens) for summary generation. Summaries are kept short on purpose so the injected overview - and
+# therefore the persistent priming context used for every routine - stays small regardless of source file size.
+SUMMARY_MAX_TOKENS = 1024
 
 
 # ---------------------------- CLI harness ----------------------------
@@ -373,6 +379,238 @@ class SummaryCache:
         tmp.replace(path)
 
 
+def _hard_split_line(line: str, chunk_budget: int, estimate_fn: Callable[[str], int]) -> List[str]:
+    """
+    Hard-split a single over-long line into pieces that each fit a token budget.
+
+    This is a last resort for pathological input such as minified code with no usable line breaks. The split is by
+    character count, sized from the budget using the supplied token estimate.
+
+    Parameters:
+    - `line`: The over-long line.
+    - `chunk_budget`: The maximum estimated tokens per piece.
+    - `estimate_fn`: A cheap function estimating the token count of a string.
+
+    Returns:
+    - A list of substrings of `line`, each within budget.
+    """
+
+    if not line:
+        return [line]
+    # Estimate characters-per-token from this very line, then size pieces a little under budget.
+    per_token = max(1, len(line) // max(1, estimate_fn(line)))
+    piece_chars = max(1, int(chunk_budget * per_token * 0.9))
+    return [line[i:i + piece_chars] for i in range(0, len(line), piece_chars)]
+
+
+def _split_source(source_blob: str, chunk_budget: int, estimate_fn: Callable[[str], int]) -> List[str]:
+    """
+    Split source text into chunks that each fit within a token budget.
+
+    Splitting happens on line boundaries so chunks stay readable, and a break is preferred at a blank line once a
+    chunk is reasonably full. A single line longer than the whole budget (e.g. minified code) is hard-split by
+    characters as a last resort.
+
+    Parameters:
+    - `source_blob`: The complete source text.
+    - `chunk_budget`: The maximum estimated tokens per chunk.
+    - `estimate_fn`: A cheap function estimating the token count of a string.
+
+    Returns:
+    - A list of chunk strings. For input without over-long lines, these rejoin with '\\n' to the original text.
+    """
+
+    lines = source_blob.split("\n")
+    chunks: List[str] = []
+    current: List[str] = []
+    current_tokens = 0
+
+    def flush() -> None:
+        """Append the accumulated lines (if any) as a chunk and reset the accumulator."""
+        nonlocal current, current_tokens
+        if current:
+            chunks.append("\n".join(current))
+            current = []
+            current_tokens = 0
+
+    for line in lines:
+        cost = estimate_fn(line) + 1  # +1 approximates the joining newline
+
+        # A single over-long line cannot fit any chunk: flush, then hard-split it by characters.
+        if cost > chunk_budget:
+            flush()
+            chunks.extend(_hard_split_line(line, chunk_budget, estimate_fn))
+            continue
+
+        # Start a new chunk if appending this line would overflow the current one.
+        if current and current_tokens + cost > chunk_budget:
+            flush()
+
+        current.append(line)
+        current_tokens += cost
+
+        # Prefer to break at a blank line once the chunk is reasonably full.
+        if not line.strip() and current_tokens >= chunk_budget * 0.75:
+            flush()
+
+    flush()
+    return chunks
+
+
+def _group_by_budget(partials: List[str], budget: int, estimate_fn: Callable[[str], int]) -> List[List[str]]:
+    """
+    Group consecutive partial summaries so each group's combined text fits a token budget.
+
+    A minimum group size of two guarantees the reduction makes progress (the number of groups is always fewer than
+    the number of inputs), preventing unbounded recursion when summaries are individually large.
+
+    Parameters:
+    - `partials`: The partial summaries to group.
+    - `budget`: The maximum estimated tokens per group.
+    - `estimate_fn`: A cheap function estimating the token count of a string.
+
+    Returns:
+    - A list of groups, each a list of consecutive partial summaries.
+    """
+
+    groups: List[List[str]] = []
+    current: List[str] = []
+    current_tokens = 0
+    for s in partials:
+        cost = estimate_fn(s) + 8  # small allowance for the "Part N:" framing
+        if len(current) >= 2 and current_tokens + cost > budget:
+            groups.append(current)
+            current = []
+            current_tokens = 0
+        current.append(s)
+        current_tokens += cost
+    if current:
+        groups.append(current)
+
+    # Guarantee progress: if everything landed in one group, force a split so recursion shrinks the input.
+    if len(groups) == 1 and len(partials) > 1:
+        mid = len(partials) // 2
+        groups = [partials[:mid], partials[mid:]]
+    return groups
+
+
+def _reduce_summaries(
+    llm: LocalChatModel,
+    summary_cfg: GenerationConfig,
+    base_messages: Messages,
+    partials: List[str],
+    language: str,
+    limit: int,
+    base_overhead: int,
+) -> str:
+    """
+    Combine partial summaries into a single overall summary, recursing if they do not all fit at once.
+
+    Parameters:
+    - `llm`: The LocalChatModel instance.
+    - `summary_cfg`: The (capped) generation configuration to use for summaries.
+    - `base_messages`: The primed context to summarise against (not mutated).
+    - `partials`: The partial summaries to combine.
+    - `language`: The source language identifier (used to phrase the prompt).
+    - `limit`: The usable prompt-token limit (n_ctx minus margins and the summary reply reserve).
+    - `base_overhead`: The token cost of `base_messages`, precomputed.
+
+    Returns:
+    - The combined overall summary text.
+    """
+
+    if len(partials) == 1:
+        return partials[0]
+
+    combined = "\n\n".join(f"Part {i}: {s}" for i, s in enumerate(partials, start=1))
+    reduce_prompt = (
+        f"Below are summaries of consecutive parts of a single {language} source file. "
+        "Combine them into one concise overall summary of what the whole file does. "
+        "Do not add any conversational discussion:\n\n"
+        f"{combined}"
+    )
+
+    # If the combined summaries fit, reduce them in a single pass.
+    if base_overhead + llm.estimate_tokens(reduce_prompt) <= limit:
+        return llm.generate(base_messages + [{"role": "user", "content": reduce_prompt}], cfg=summary_cfg)
+
+    # Otherwise reduce in groups first, then recurse on the (smaller) set of group summaries.
+    groups = _group_by_budget(partials, max(1, limit - base_overhead - 64), llm.estimate_tokens)
+    reduced: List[str] = []
+    for group in groups:
+        sub = "\n\n".join(f"Part {i}: {s}" for i, s in enumerate(group, start=1))
+        prompt = (
+            f"Below are summaries of consecutive parts of a single {language} source file. "
+            "Combine them into one concise summary. Do not add any conversational discussion:\n\n"
+            f"{sub}"
+        )
+        reduced.append(llm.generate(base_messages + [{"role": "user", "content": prompt}], cfg=summary_cfg))
+    return _reduce_summaries(llm, summary_cfg, base_messages, reduced, language, limit, base_overhead)
+
+
+def _generate_file_summary(
+    llm: LocalChatModel,
+    cfg: GenerationConfig,
+    base_messages: Messages,
+    source_blob: str,
+    language: str,
+) -> str:
+    """
+    Summarise a whole source file, falling back to chunked map-reduce when it is too large for one pass.
+
+    The summary primes the per-routine commenting turns with an understanding of the file as a whole. Files that fit
+    the context window are summarised in a single request. Larger files are split into context-sized chunks, each
+    summarised independently (the "map" step), and those partial summaries are then combined into one overall summary
+    (the "reduce" step, applied recursively if the partials are themselves too large). Every request uses a capped
+    reply length so the resulting summary - and therefore the persistent priming context - stays small regardless of
+    file size.
+
+    Parameters:
+    - `llm`: The LocalChatModel instance.
+    - `cfg`: The base generation configuration (cloned with a smaller `max_new_tokens` for summaries).
+    - `base_messages`: The primed context to summarise against (typically the system prompt and its acknowledgement);
+      this list is not mutated.
+    - `source_blob`: The complete source text.
+    - `language`: The source language identifier (used to phrase the prompts).
+
+    Returns:
+    - The overall summary text for the file.
+    """
+
+    summary_cfg = replace(cfg, max_new_tokens=SUMMARY_MAX_TOKENS)
+    limit = llm.n_ctx - llm.ctx_margin - SUMMARY_MAX_TOKENS
+    base_overhead = llm.count_tokens(base_messages) if base_messages else 0
+
+    one_shot = (
+        "To help you understand the fuller context of each chunk that I supply, here is the original source file as a whole:\n\n"
+        f"{source_blob}\n\n"
+        "Please output a detailed summary of what this program does, along with some highlights of its internal workings.\n"
+        "Do not ask follow-up questions or add any conversational discussion. Just give me the detailed summary."
+    )
+
+    # Fast path: the whole file fits in a single summarisation turn.
+    if base_overhead + llm.estimate_tokens(one_shot) <= limit:
+        return llm.generate(base_messages + [{"role": "user", "content": one_shot}], cfg=summary_cfg)
+
+    # Map: summarise the file in context-sized chunks (64 tokens of headroom for the wrapper text).
+    chunk_budget = max(1, limit - base_overhead - 64)
+    chunks = _split_source(source_blob, chunk_budget, llm.estimate_tokens)
+    echo(f"Source too large for a single-pass summary; summarising in {len(chunks)} chunk(s)...")
+
+    partials: List[str] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        prompt = (
+            f"This is part {idx} of {len(chunks)} of a larger {language} source file. "
+            "Briefly summarise what this part of the code does. Do not add any conversational discussion:\n\n"
+            f"{chunk}"
+        )
+        partials.append(llm.generate(base_messages + [{"role": "user", "content": prompt}], cfg=summary_cfg))
+        echo(f"Summarised part {idx}/{len(chunks)}")
+
+    # Reduce: combine the partial summaries into a single overall summary.
+    return _reduce_summaries(llm, summary_cfg, base_messages, partials, language, limit, base_overhead)
+
+
 def prime_llm_for_comments(
     llm: LocalChatModel,
     cfg: GenerationConfig,
@@ -420,25 +658,13 @@ def prime_llm_for_comments(
     echo(f"System prompt ingested? {reply}")
     messages.append({"role": "assistant", "content": reply})
 
-    # Now provide the LLM with the entire source file as context
+    # Now summarise the whole file for context. This automatically switches to a chunked map-reduce
+    # approach when the file is too large to summarise in one pass (see _generate_file_summary).
     if no_cache is False and summary_cache.summary:
         echo("Loaded full source summary from cache...")
     else:
         echo("Generating full source summary...")
-        source_context = (
-            "To help you understand the fuller context of each chunk that I supply, here is the original source file as a whole:\n\n"
-            f"{source_blob}\n\n"
-            "Please output a detailed summary of what this program does, along with some highlights of its internal workings.\n"
-            "Do not ask follow-up questions or add any conversational discussion. Just give me the detailed summary."
-        )
-        messages.append({"role": "user", "content": source_context})
-
-        # Generate (and cache) the summary text for the full source code
-        summary_cache.summary = llm.generate(messages, cfg=cfg)
-
-        # Drop the full source blob from context now we have its summary; we
-        # re-introduce just the (much smaller) summary below to keep context tight.
-        messages.pop()
+        summary_cache.summary = _generate_file_summary(llm, cfg, messages, source_blob, language)
 
     reply_length = 1 + summary_cache.summary.count("\n")
     echo(f"Source file summarised? {reply_length} lines of summary created")

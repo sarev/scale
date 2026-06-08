@@ -41,6 +41,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from scale_llm import LocalChatModel, GenerationConfig, Messages, Chunk
 from scale_log import echo
+from scale_text import fit_snippet, MARKER_JS
 from tree_sitter import Parser, Language
 from tree_sitter_javascript import language as js_language
 from typing import Dict, List, Optional, Tuple, Iterable, Any
@@ -1011,6 +1012,12 @@ def generate_comments_js(
     for info in deepest_first_js(defs):
         node_id = id(info.node)
         snippet = assemble_snippet_for_js(info_by_id, source_lines, node_id, docs_by_node_id)
+
+        # Elide the body if this routine is too large for the context window (the patch is unaffected).
+        header_lines = max(1, info.header_end - info.header_start + 1)
+        snippet, omitted = fit_snippet(llm, cfg, messages, snippet, header_lines, MARKER_JS)
+        if omitted:
+            echo(f"[JS] Elided {omitted} body line(s) from '{info.qualname}' to fit the context window")
 
         echo("\n[JS] Snippet...\n")
         echo(snippet)

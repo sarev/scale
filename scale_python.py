@@ -45,6 +45,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from scale_llm import LocalChatModel, GenerationConfig, Messages, Chunk
 from scale_log import echo
+from scale_text import fit_snippet, MARKER_PYTHON
 from typing import Dict, List, Optional, Tuple
 import ast
 import textwrap
@@ -658,6 +659,12 @@ def generate_docstrings(
     for info in defs_deepest_first:
         node_id = id(info.node)
         snippet = assemble_snippet_for(node_id)
+
+        # Elide the body if this routine is too large for the context window (the patch is unaffected).
+        header_lines = max(1, info.header_end - info.header_start + 1)
+        snippet, omitted = fit_snippet(llm, cfg, messages, snippet, header_lines, MARKER_PYTHON)
+        if omitted:
+            echo(f"[Python] Elided {omitted} body line(s) from '{info.qualname}' to fit the context window")
 
         echo("\n[Python] Snippet...\n")
         echo(snippet)

@@ -69,6 +69,15 @@ Once all the docstrings have been generated, the original source code is patched
 
 SCALE detects the dominant line ending (LF/CR/CRLF), preserves trailing newlines, and writes exactly what you specify. Files are treated as UTF-8 with `surrogateescape` to preserve undecodable bytes during round-trip. This avoids platform newline translation and keeps arbitrary input bytes intact.
 
+### Large Files and Functions
+
+SCALE copes with source that is larger than the model's context window, using two tricks. Because comments are patched into the parsed source (and the LLM never re-emits code), reducing what the model *reads* never risks the output:
+
+* **Files too large to summarise in one pass** are summarised by *map-reduce*: the file is split into context-sized chunks, each chunk is summarised, and those partial summaries are combined into one overall summary (recursively if needed). The final summary is capped in length so the priming context stays small no matter how big the file is.
+* **Functions/classes too large for the context window** have their body *elided* for the model: the signature plus the head and tail of the body are kept and the middle is replaced with a `... N lines omitted ...` marker. The comment is written from that partial view; the real code is untouched, so nothing is lost in the output.
+
+Both behaviours trigger automatically based on the configured context size (`--n-ctx`) and are reported on `--verbose` runs.
+
 ## Using SCALE (typical)
 
 Install the dependencies, download an LLM in GGUF format and then:

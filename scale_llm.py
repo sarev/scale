@@ -61,6 +61,13 @@ Messages = List[Message]
 Chunk = List[str]
 
 
+# When budgeting how much of a routine snippet may be sent to the model, this many tokens are held back
+# as headroom for the comment the model will generate in reply. A comment is short, so reserving the full
+# `max_new_tokens` (often several thousand) would needlessly shrink the snippet budget. See
+# `LocalChatModel.snippet_budget`.
+COMMENT_GENERATION_RESERVE = 1024
+
+
 def _strip_none(xs: Sequence[Optional[str]]) -> List[str]:
     """
     Remove all `None` values from a sequence of optional strings.
@@ -643,6 +650,59 @@ class LocalChatModel:
                 f"WARNING: prompt (~{prompt_tokens} tokens) plus max_new_tokens ({cfg.max_new_tokens}) "
                 f"exceeds the usable context ({available} of {self.n_ctx}); generated output may be truncated."
             )
+
+    def estimate_tokens(self, text: str) -> int:
+        """
+        Cheaply estimate the number of tokens in a piece of text.
+
+        This uses the running bytes-per-token ratio (`approx_bpt`, periodically recalibrated against the real
+        tokeniser by `_estimate_prompt_tokens`) rather than tokenising, so it is fast enough to call per line when
+        sizing or eliding large snippets. The estimate is approximate; callers that need a hard guarantee should apply
+        a safety margin or verify with `count_tokens`.
+
+        Parameters:
+        - `text`: The text to estimate.
+
+        Returns:
+        - An approximate token count (always at least 0).
+        """
+
+        if not text:
+            return 0
+        return math.ceil(len(text.encode("utf-8")) / self.approx_bpt)
+
+    def snippet_budget(
+        self,
+        messages: Messages,
+        cfg: GenerationConfig,
+        *,
+        wrapper_reserve: int = 128,
+        reserve: Optional[int] = None,
+    ) -> int:
+        """
+        Compute how many tokens are available for a routine snippet within a generation turn.
+
+        A turn's prompt is the persistent priming context (`messages`) plus a short instruction wrapper plus the
+        snippet itself, and room must also be left for the model's reply. This returns the tokens the snippet may
+        occupy, so callers can elide an oversized routine to fit:
+
+            budget = n_ctx - ctx_margin - reply_reserve - wrapper_reserve - tokens(messages)
+
+        Parameters:
+        - `messages`: The persistent priming context the snippet will be appended to (must be non-empty).
+        - `cfg`: The generation configuration; its `max_new_tokens` caps the reply reserve.
+        - `wrapper_reserve`: Tokens to set aside for the fixed instruction text that wraps the snippet.
+        - `reserve`: Tokens to reserve for the model's reply; defaults to `COMMENT_GENERATION_RESERVE`, and is
+          always capped by `cfg.max_new_tokens`.
+
+        Returns:
+        - The token budget available for the snippet. May be small (or, on a pathologically small `n_ctx`,
+          non-positive); callers should treat a low budget as "send only the signature".
+        """
+
+        reply_reserve = min(reserve if reserve is not None else COMMENT_GENERATION_RESERVE, cfg.max_new_tokens)
+        overhead = self.count_tokens(messages) if messages else 0
+        return self.n_ctx - self.ctx_margin - reply_reserve - wrapper_reserve - overhead
 
     def generate(
         self,

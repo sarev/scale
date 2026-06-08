@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from scale_llm import LocalChatModel, GenerationConfig, Messages, Chunk
 from scale_log import echo
+from scale_text import fit_snippet, MARKER_C
 from tree_sitter import Parser, Language  # type: ignore
 from tree_sitter_c import language as c_language
 from typing import Dict, List, Optional, Tuple, Any
@@ -661,6 +662,12 @@ def generate_comments_c(
     # No nesting to worry about; process in source order
     for info in defs:
         snippet = assemble_snippet_for_c(source_lines, info)
+
+        # Elide the body if this function is too large for the context window (the patch is unaffected).
+        header_lines = max(1, info.header_end - info.header_start + 1)
+        snippet, omitted = fit_snippet(llm, cfg, messages, snippet, header_lines, MARKER_C)
+        if omitted:
+            echo(f"[C] Elided {omitted} body line(s) from '{info.qualname}' to fit the context window")
 
         echo("\n[C] Snippet...\n")
         echo(snippet)

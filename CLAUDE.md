@@ -41,7 +41,8 @@ generate_language_comments(llm, cfg, messages, source_blob, source_lines) -> Lis
 | Module | Role |
 | --- | --- |
 | `scale.py` | CLI parsing, language guessing, summary cache, LLM priming, dispatch, file I/O |
-| `scale_llm.py` | `LocalChatModel` (wraps `llama_cpp.Llama`) + `GenerationConfig` + per-family chat formatters |
+| `scale_llm.py` | `LocalChatModel` (wraps `llama_cpp.Llama`) + `GenerationConfig` + per-family chat formatters + token-budget helpers |
+| `scale_text.py` | Context-window helpers: `elide_to_budget`/`fit_snippet` for trimming oversized routine snippets |
 | `scale_python.py` | Python worker — CPython `ast` based |
 | `scale_javascript.py` | JS worker — tree-sitter (ESM + CommonJS) |
 | `scale_c.py` | C worker — tree-sitter |
@@ -50,7 +51,7 @@ generate_language_comments(llm, cfg, messages, source_blob, source_lines) -> Lis
 ### The annotation pipeline (per file)
 
 1. **Load** (`load_source`): read bytes, decode UTF-8 with `errors="surrogateescape"`, detect dominant line ending (`\n`/`\r`/`\r\n`). All subsequent splitting/joining uses that detected ending; output is written back with the same encoding+ending so undecodable bytes and newline style survive a round-trip. **Do not** use text-mode reads or `pathlib.read_text` for source content — that reintroduces newline translation (a previously-fixed bug).
-2. **Prime LLM** (`prime_llm_for_comments`): builds a `messages` transcript = system prompt (`scale-cfg/comment.txt`) + a whole-file summary + the language comment template (`scale-cfg/comment.<lang>.txt`). The summary is cached (see below) since it's slow.
+2. **Prime LLM** (`prime_llm_for_comments`): builds a `messages` transcript = system prompt (`scale-cfg/comment.txt`) + a whole-file summary + the language comment template (`scale-cfg/comment.<lang>.txt`). The summary is cached (see below) since it's slow. For files too large to summarise in one pass, `_generate_file_summary` falls back to **chunked map-reduce** (`_split_source` → per-chunk summaries → `_reduce_summaries`), capped at `SUMMARY_MAX_TOKENS` so the priming context stays small regardless of file size.
 3. **Worker** generates one comment per routine and patches them in.
 
 ### Worker pattern (shared by all three language workers)
@@ -58,6 +59,7 @@ generate_language_comments(llm, cfg, messages, source_blob, source_lines) -> Lis
 - Parse source into definition records (`DefInfo` / `DefInfoJS` / C equivalent) carrying qualname, node, and precise line spans (`header_start`/`header_end`, `start`/`end`).
 - Process **deepest-nested definitions first**. When generating a parent's comment, nested children are collapsed to *just their signature + the docstring just generated for them* — the LLM sees immediate children's contracts but not their bodies. This keeps the context window small and lets a class comment summarize its methods.
 - Each generation turn is appended to `messages`, then **popped after the reply** — turns are not accumulated, so context stays bounded (only system prompt + summary + template + current snippet are ever live).
+- **Oversized routines are elided to fit the context window** via `scale_text.fit_snippet` before sending: the signature/header is kept and the middle of the body is replaced with a `... N lines omitted ...` marker (sized from `LocalChatModel.snippet_budget`). This only affects what the model *reads* — patching still uses the real source, so no code is lost.
 - **Patch textually in reverse source order** (`patch_docstrings_textually` and JS/C analogues) so line indices stay valid as edits are applied. Existing docstrings/comment blocks are detected and replaced; otherwise a new block is inserted after the header. The LLM's reply is parsed to extract only the comment block (`extract_first_docstring` / `_extract_first_comment_block`) — never the surrounding code.
 
 ### Summary cache (`SummaryCache` in `scale.py`)
@@ -67,7 +69,8 @@ File-backed cache under `__cache__/`: `index.pkl` maps source path → UID; `<ui
 ### LLM layer (`scale_llm.py`)
 
 - `LocalChatModel` builds prompts via one of several **chat formatters** (`qwen`/`chatml`, `llama3`, `llama2`, `mistral`, `phi3`) registered in `FORMATTERS`. Format is auto-detected from the model **filename** (`_auto_detect_format`, defaults to `qwen`) unless `--format` overrides it. Each formatter returns `(prompt, stop_tokens)` and opens an assistant turn as the generation anchor.
-- `generate()` is the synchronous path used by workers; `progressive_generate()` streams. Both estimate prompt token count (`_trim_needed`, refining a bytes-per-token estimate every 8 turns) and warn when nearing `n_ctx`.
+- `generate()` is the synchronous path used by workers; `progressive_generate()` streams. Both call `_check_context_budget`, which estimates prompt tokens (`_estimate_prompt_tokens`, refining a bytes-per-token ratio every 8 turns) and raises if the prompt cannot fit / warns if it leaves too little room.
+- Token-budget helpers used by elision: `estimate_tokens(text)` (cheap, ratio-based) and `snippet_budget(messages, cfg)` (tokens free for a routine snippet = `n_ctx − ctx_margin − reply_reserve − count_tokens(messages)`; `reply_reserve` is `COMMENT_GENERATION_RESERVE`, not the full `max_new_tokens`).
 - `LocalChatModel.download_model(...)` is a classmethod helper for pulling GGUFs from HuggingFace.
 
 ## Editing the LLM's behaviour without code changes
@@ -85,6 +88,9 @@ Prompt behaviour lives in `scale-cfg/`: `comment.txt` is the system prompt; `com
 - `test_cr_line_endings.py` — bare `\r` (old-Mac) line endings still map tree-sitter rows to the right source lines, in both the C and JS workers.
 - `test_js_imports.py` — CommonJS `require()` (including destructured forms) is parsed via the grammar's `arguments` field rather than fragile index traversal.
 - `test_js_extractor.py` — the JS comment extractor accepts a `/** */` block, a ``` fence, or plain text, and preserves genuine content bullets instead of eating leading asterisks.
+- `test_elision.py` — `elide_to_budget` preserves the header, fits the token budget, and reports the omitted-line count (degrades to header-only on a tiny budget).
+- `test_chunk_split.py` — `_split_source` covers every line exactly once (chunks rejoin to the original), keeps each chunk within budget, and hard-splits over-long single lines.
+- `test_mapreduce_summary.py` — `_generate_file_summary` uses one pass when the file fits and switches to map-reduce (multiple map calls + a reduce) when it doesn't.
 
 ## Conventions
 
