@@ -74,8 +74,10 @@ def _load_js_language_and_parser() -> Tuple[Language, Parser]:
     if isinstance(ptr_or_lang, Language):
         lang = ptr_or_lang
     else:
-        # The second argument is just a label for the language; any string is fine.
-        lang = Language(ptr_or_lang, "JavaScript")
+        try:
+            lang = Language(ptr_or_lang)                 # new API (tree-sitter >= 0.22)
+        except TypeError:
+            lang = Language(ptr_or_lang, "JavaScript")   # old 0.21 API (second arg is a label)
 
     # Create a parser using whichever API this wheel exposes
     try:

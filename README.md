@@ -134,7 +134,7 @@ python3 -m venv .venv
 python -m pip install -U pip setuptools wheel
 
 # Install Python deps used by SCALE
-pip install -U "tree-sitter==0.21.0" "tree-sitter-c==0.21.0" "tree-sitter-javascript==0.21.0" huggingface-hub
+pip install -U tree-sitter tree-sitter-c tree-sitter-javascript huggingface-hub
 
 # Install llama.cpp bindings...
 
@@ -209,10 +209,10 @@ python -m pip install --upgrade pip wheel setuptools
 
 ## Install Tree-sitter (language parser framework)
 
-I found that I needed to version-pin these modules, because different versions of them seem to have made breaking changes to their internal ABI, so they won't talk to each other unless they are all the same version!
+SCALE works with current versions of these modules (tested with `tree-sitter` 0.25, `tree-sitter-c` 0.24, `tree-sitter-javascript` 0.25). The core runtime and the grammar packages share an internal ABI, so install/upgrade all three together rather than mixing old and new.
 
 ```bash
-pip install -U "tree-sitter==0.21.0" "tree-sitter-c==0.21.0" "tree-sitter-javascript==0.21.0"
+pip install -U tree-sitter tree-sitter-c tree-sitter-javascript
 ```
 
 ## Install the CUDA-aware llama-cpp (large language models)

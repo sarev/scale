@@ -50,8 +50,10 @@ def _load_c_language_and_parser() -> Tuple[Language, Parser]:
     if isinstance(ptr_or_lang, Language):
         lang = ptr_or_lang
     else:
-        # Second arg is a label only.
-        lang = Language(ptr_or_lang, "C")
+        try:
+            lang = Language(ptr_or_lang)        # new API (tree-sitter >= 0.22)
+        except TypeError:
+            lang = Language(ptr_or_lang, "C")   # old 0.21 API (second arg is a label)
 
     # Some builds expose Parser().set_language(...), others Parser(Language)
     try:
