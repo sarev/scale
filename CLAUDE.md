@@ -74,6 +74,18 @@ File-backed cache under `__cache__/`: `index.pkl` maps source path → UID; `<ui
 
 Prompt behaviour lives in `scale-cfg/`: `comment.txt` is the system prompt; `comment.python.txt` / `comment.js.txt` / `comment.c.txt` are per-language comment-style templates (with examples). Tuning these examples to match the target codebase is the primary lever for output quality — prefer this over changing code.
 
+## Tests
+
+`tests/` holds fast, **model-free** regression tests — the LLM is stubbed and only parsing/patching/caching run, so the suite finishes in seconds. Run all with `python tests/run_all.py`, or any single `tests/test_*.py` directly. Each guards a specific past bug; keep them green when touching the relevant area, and add one when fixing a new bug:
+
+- `test_summary_injection.py` — the whole-file summary is actually injected into the LLM context. Guards the critical regression where a stale `"OK"` was interpolated instead of the summary, silently disabling the feature.
+- `test_cache_invalidation.py` — `SummaryCache` reuses on identical content but regenerates when the source changes (content-hash keying), so edits don't get a stale summary.
+- `test_qualname_collision.py` — same-named definitions get distinct docstrings. Guards against doc maps keyed by qualname (now keyed by node identity).
+- `test_inline_def.py` — inline one-line `def`/`class` are skipped rather than corrupted, and output stays valid Python.
+- `test_cr_line_endings.py` — bare `\r` (old-Mac) line endings still map tree-sitter rows to the right source lines, in both the C and JS workers.
+- `test_js_imports.py` — CommonJS `require()` (including destructured forms) is parsed via the grammar's `arguments` field rather than fragile index traversal.
+- `test_js_extractor.py` — the JS comment extractor accepts a `/** */` block, a ``` fence, or plain text, and preserves genuine content bullets instead of eating leading asterisks.
+
 ## Conventions
 
 - The `temp/` directory holds generated/scratch outputs from `tests.sh`; it is not source.

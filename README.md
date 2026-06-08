@@ -90,6 +90,17 @@ You can override LLM features, such as the chat format detection (`--format`), t
 * Add new languages by implementing a `generate_language_comments` function matching the Python worker’s interface and wiring it in the dispatcher. 
 * Extend or swap prompt templates by editing files under `scale-cfg` without changing code. 
 
+## Tests
+
+SCALE ships with a small suite of fast, self-contained tests under `tests/`. They require **no GGUF model** — the LLM is stubbed and only the parsing, patching, and caching logic is exercised, so the whole suite runs in a second or two inside your virtual environment:
+
+```bash
+python tests/run_all.py          # run everything, with a pass/fail summary
+python tests/test_inline_def.py  # or run an individual test
+```
+
+Each test guards against a specific regression — for example, that the whole-file summary is actually sent to the model, that inline one-line definitions are never corrupted, that same-named definitions don't share a comment, and that bare-`\r` line endings map to the correct lines. A non-zero exit code means at least one test failed.
+
 ## Current Scope and Limits
 
 * The current implementation only supports Python, C and JavaScript source code.
