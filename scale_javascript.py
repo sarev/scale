@@ -848,48 +848,71 @@ def _render_jsdoc_block(text: str, base_indent: str) -> List[str]:
     return out
 
 
-def _extract_first_comment_block(reply: str) -> str:
+def _strip_jsdoc_gutters(block: List[str]) -> str:
     """
-    Extract the first JSDoc-style comment block from a reply string.
+    Strip the leading JSDoc gutter from each line of a comment block and join the result.
 
-    This function removes any leading whitespace and dedents the input string, then searches for the first occurrence of
-    a JSDoc-style comment block (starting with `/**`). It extracts the comment block up to the matching `*/`, removes any
-    leading asterisks from each line, and returns the resulting comment block as a single string.
+    Only a single leading '*' (and one following space) is removed per line, so genuine content such as a
+    '* bullet' is preserved rather than eaten.
 
     Parameters:
-    - `reply`: The input string containing the reply.
+    - `block`: The comment-body lines (without the surrounding '/**' and '*/' fences).
 
     Returns:
-    - The extracted comment block, or an empty string if no JSDoc-style comment block is found.
+    - The cleaned comment text as a single, stripped string.
+    """
+
+    cleaned: List[str] = []
+    for ln in block:
+        s = ln.lstrip()
+        if s.startswith("*"):
+            s = s[1:]
+            if s.startswith(" "):
+                s = s[1:]
+        cleaned.append(s.rstrip())
+    return "\n".join(cleaned).strip()
+
+
+def _extract_first_comment_block(reply: str) -> str:
+    """
+    Extract the documentation body from an LLM reply, tolerant of how the model wrapped it.
+
+    The model does not always honour the request for a bare JSDoc block, so several shapes are accepted, in order
+    of preference:
+
+    1. A JSDoc `/** ... */` block (the requested form).
+    2. A fenced code block ``` ... ``` (optionally tagged, e.g. ```js), using its contents.
+    3. As a last resort, the whole reply treated as the comment body.
+
+    Parameters:
+    - `reply`: The raw text returned by the LLM.
+
+    Returns:
+    - The extracted comment text, or an empty string only if the reply is effectively empty.
     """
 
     lines = textwrap.dedent(reply).split("\n")
     stripped = [ln.strip() for ln in lines]
-    start_idx = None
+
+    # 1. Preferred: a JSDoc '/** ... */' block.
     try:
         start_idx = stripped.index("/**") + 1
+        for end_idx in range(start_idx, len(lines)):
+            if "*/" in lines[end_idx]:
+                break
+        else:
+            end_idx = len(lines)
+        return _strip_jsdoc_gutters(lines[start_idx:end_idx])
     except ValueError:
-        return ""
+        pass
 
-    for end_idx in range(start_idx, len(lines)):
-        if "*/" in lines[end_idx]:
-            break
-    else:
-        end_idx = len(lines) + 1
+    # 2. Fallback: a fenced code block ``` ... ``` (the tag line, if any, is dropped).
+    fence_idxs = [i for i, s in enumerate(stripped) if s.startswith("```")]
+    if len(fence_idxs) >= 2:
+        return _strip_jsdoc_gutters(lines[fence_idxs[0] + 1:fence_idxs[1]])
 
-    block = lines[start_idx:end_idx]
-    cleaned: List[str] = []
-    for ln in block:
-        stripped = ln.lstrip()
-        # Remove only the single leading JSDoc gutter '*' (and one following space),
-        # so genuine content like a '* bullet' is preserved rather than eaten.
-        if stripped.startswith("*"):
-            stripped = stripped[1:]
-            if stripped.startswith(" "):
-                stripped = stripped[1:]
-        cleaned.append(stripped.rstrip())
-
-    return "\n".join(cleaned).strip()
+    # 3. Last resort: treat the whole reply as the comment body.
+    return _strip_jsdoc_gutters(lines)
 
 
 def assemble_snippet_for_js(
@@ -992,12 +1015,21 @@ def generate_comments_js(
         echo("\n[JS] Snippet...\n")
         echo(snippet)
 
-        prompt = (
-            "Write exactly the documentation comment for this JavaScript program chunk. "
-            "Return only the comment content (no code), suitable for a JSDoc block placed "
-            "immediately above the definition:\n\n"
-            f"{snippet}\n"
-        )
+        if info.kind == "class":
+            prompt = (
+                "Write exactly the documentation comment for this JavaScript class. "
+                "Use the nested method documentation to inform your description, but remember the class abstracts "
+                "over all of them: summarise the class as a whole rather than repeating any single method. "
+                "Return only the comment content (no code), suitable for a JSDoc block placed immediately above the class:\n\n"
+                f"{snippet}\n"
+            )
+        else:
+            prompt = (
+                "Write exactly the documentation comment for this JavaScript program chunk. "
+                "Return only the comment content (no code), suitable for a JSDoc block placed "
+                "immediately above the definition:\n\n"
+                f"{snippet}\n"
+            )
         messages.append({"role": "user", "content": prompt})
         reply = llm.generate(messages, cfg=cfg)
         echo(f"\n[JS] LLM output:\n\n{reply}")
