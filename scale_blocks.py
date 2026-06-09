@@ -191,6 +191,10 @@ class BlockTarget:
     - `indent_of`: Maps each boundary line to its exact leading-whitespace string.
     - `depth`: Nesting depth (0 = module level), used to order generation deepest-first.
     - `doc`: The routine's own docstring/header comment (or ""), used as brief context for the comment pass.
+    - `cognitive`: The routine's cognitive complexity, used by selective escalation to decide whether to defer this
+      routine's comments to a stronger model (0 when complexity is not being computed).
+    - `sig`: A structural signature of the routine (see `scale_python.node_sig`), used by selective escalation to
+      re-bind a deferred routine across the emit/apply phases ("" when not computed).
     """
 
     qualname: str
@@ -203,6 +207,8 @@ class BlockTarget:
     indent_of: Dict[int, str] = field(default_factory=dict)
     depth: int = 0
     doc: str = ""
+    cognitive: int = 0
+    sig: str = ""
 
 
 # ---------------------------- comment helpers ----------------------------
@@ -756,6 +762,7 @@ def annotate_blocks(
     comment_nudge: Optional[str] = None,
     note_short: Optional[str] = None,
     note_long: Optional[str] = None,
+    escalation=None,
 ) -> Chunk:
     """
     Run the full block pass over every routine and return the annotated source.
@@ -779,6 +786,9 @@ def annotate_blocks(
     - `comment_nudge`: Optional override for the comment retry nudge (defaults to `COMMENT_NUDGE`).
     - `note_short`/`note_long`: Optional overrides for the short-/long-routine length notes (defaults
       `COMMENT_NOTE_SHORT`/`COMMENT_NOTE_LONG`).
+    - `escalation`: Optional `scale_escalate.Escalation`. When supplied, a routine whose complexity exceeds the cutoff
+      has its (still-local) segmentation recorded as a manifest request and its comment turns deferred to a stronger
+      model - it is left untouched here and annotated later by the apply phase.
 
     Returns:
     - The annotated source split into lines.
@@ -800,6 +810,22 @@ def annotate_blocks(
             length_note = note_short or COMMENT_NOTE_SHORT
         else:
             length_note = note_long or COMMENT_NOTE_LONG
+
+        # Selective escalation: a complex routine's comment text is deferred to a stronger model. Segmentation has
+        # already run locally (it is structural), so we record the chunk recipe - each chunk's boundary index and its
+        # code - and skip the local comment turns, leaving this routine untouched for the apply phase.
+        if escalation is not None and escalation.should_escalate(target.qualname, target.cognitive):
+            chunks = [
+                {"bidx": target.boundary_lines.index(s), "text": "\n".join(source_lines[s - 1:e])}
+                for s, e in segments
+            ]
+            escalation.record_block(
+                qualname=target.qualname, kind=target.kind, sig_hash=target.sig,
+                cognitive=target.cognitive, doc_summary=_doc_summary(target.doc),
+                length_note=length_note, chunks=chunks,
+            )
+            echo(f"[blocks] Escalated '{target.qualname}' (cognitive {target.cognitive}); {len(chunks)} chunk(s) deferred")
+            continue
 
         # One comment turn per chunk, in body order, feeding earlier comments forward as narrative context.
         edits: List[Tuple[int, Optional[str], str]] = []

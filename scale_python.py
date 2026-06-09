@@ -49,6 +49,9 @@ from scale_log import echo
 from scale_text import fit_snippet, MARKER_PYTHON
 from typing import Dict, List, Optional, Tuple
 import ast
+import copy
+import hashlib
+import re
 import textwrap
 
 
@@ -120,6 +123,148 @@ def _node_kind(n: ast.AST) -> str:
     if isinstance(n, ast.AsyncFunctionDef):
         return "async def"
     return "def"
+
+
+def cognitive_complexity(node: ast.AST) -> int:
+    """
+    Compute the SonarSource-style Cognitive Complexity of a single routine's own body.
+
+    This is SCALE's escalation routing signal: a routine scoring above the configured cutoff has its
+    comment/docstring generation handed to a stronger model, while simpler routines stay on the local model. The
+    metric mirrors the one in the companion `codestats` tool (the SonarSource 2017 rules), computed here directly on
+    CPython's `ast` so the score lines up exactly with SCALE's own definition nodes and qualnames:
+
+      - +1 (and +1 per enclosing nesting level) for each `if` / `for` / `while` / `try` and ternary expression;
+      - +1 (with no nesting penalty) for each `elif` / `else` / `except` / `finally` continuation;
+      - +1 for each boolean-operator sequence (`and` / `or`).
+
+    `with` blocks add nothing and do not deepen nesting (matching codestats). Nested functions, async functions and
+    classes are opaque - the walk does not descend into them - so each routine is scored on its own control flow and
+    nested routines are scored separately when they are processed as their own targets.
+
+    Parameters:
+    - `node`: A function/async-function/class definition node whose body is scored.
+
+    Returns:
+    - The cognitive complexity as a non-negative integer.
+    """
+
+    score = 0
+
+    def visit(n: ast.AST, nesting: int) -> None:
+        """Walk `n`, adding to `score`; `nesting` is the count of enclosing nesting constructs."""
+        nonlocal score
+
+        # Nested definitions are opaque: they are scored separately as their own routines.
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            return
+
+        if isinstance(n, ast.If):
+            # Fold the elif chain iteratively so `elif` reads as a continuation (+1, no nesting penalty) rather than
+            # an ever-deeper nested `if`.
+            score += 1 + nesting
+            visit(n.test, nesting)
+            for c in n.body:
+                visit(c, nesting + 1)
+            orelse = n.orelse
+            while orelse:
+                if len(orelse) == 1 and isinstance(orelse[0], ast.If):
+                    elif_node = orelse[0]
+                    score += 1
+                    visit(elif_node.test, nesting)
+                    for c in elif_node.body:
+                        visit(c, nesting + 1)
+                    orelse = elif_node.orelse
+                else:
+                    score += 1
+                    for c in orelse:
+                        visit(c, nesting + 1)
+                    orelse = []
+            return
+
+        if isinstance(n, (ast.For, ast.AsyncFor, ast.While)):
+            score += 1 + nesting
+            visit(n.test if isinstance(n, ast.While) else n.iter, nesting)
+            for c in n.body:
+                visit(c, nesting + 1)
+            for c in n.orelse:  # `else` clause of a loop
+                visit(c, nesting + 1)
+            return
+
+        if isinstance(n, ast.Try):
+            score += 1 + nesting
+            for c in n.body:
+                visit(c, nesting + 1)
+            for handler in n.handlers:  # each `except` is a +1 continuation
+                score += 1
+                for c in handler.body:
+                    visit(c, nesting + 1)
+            for c in n.orelse:
+                visit(c, nesting + 1)
+            if n.finalbody:  # `finally` is a +1 continuation
+                score += 1
+                for c in n.finalbody:
+                    visit(c, nesting + 1)
+            return
+
+        if isinstance(n, ast.IfExp):  # ternary `a if cond else b`
+            score += 1 + nesting
+            visit(n.test, nesting)
+            visit(n.body, nesting + 1)
+            visit(n.orelse, nesting + 1)
+            return
+
+        if isinstance(n, ast.BoolOp):  # one `and`/`or` sequence scores once
+            score += 1
+            for c in n.values:
+                visit(c, nesting)
+            return
+
+        # `with` and everything else are transparent: recurse without changing nesting.
+        for c in ast.iter_child_nodes(n):
+            visit(c, nesting)
+
+    for stmt in getattr(node, "body", []):
+        visit(stmt, 0)
+    return score
+
+
+class _DocstringStripper(ast.NodeTransformer):
+    """AST transformer that removes the leading docstring from every function/class/module body in a tree."""
+
+    def _strip(self, node: ast.AST) -> ast.AST:
+        """Drop a leading string-constant statement from `node.body`, then recurse into nested definitions."""
+        body = getattr(node, "body", None)
+        if body and _is_docstring_stmt(body[0]):
+            node.body = body[1:]
+        self.generic_visit(node)
+        return node
+
+    visit_FunctionDef = _strip
+    visit_AsyncFunctionDef = _strip
+    visit_ClassDef = _strip
+    visit_Module = _strip
+
+
+def node_sig(node: ast.AST) -> str:
+    """
+    Return a short, stable structural fingerprint of a routine, ignoring docstrings and comments.
+
+    Selective escalation uses this to re-bind a manifest request to its routine across the emit and apply phases. It is
+    a hash of the node's `ast.dump` *without* source-position attributes and with every nested docstring stripped, so it
+    is invariant to: the line shifts caused by annotating other routines (no positions), block comments inserted into
+    the body (comments are absent from the AST), and the docstring the apply phase itself adds or replaces (stripped).
+    Two routines with the same qualname are distinguished by their differing bodies; a genuine code change changes it.
+
+    Parameters:
+    - `node`: A function/async-function/class definition node.
+
+    Returns:
+    - The first 12 hex characters of the SHA-256 of the structural dump.
+    """
+
+    stripped = _DocstringStripper().visit(copy.deepcopy(node))
+    return hashlib.sha256(ast.dump(stripped).encode("utf-8")).hexdigest()[:12]
 
 
 def _header_span(n: ast.AST) -> Tuple[int, int]:
@@ -464,7 +609,8 @@ def generate_docstrings(
     messages: Messages,
     defs: List[DefInfo],
     source_blob: str,
-    source_lines: Chunk
+    source_lines: Chunk,
+    escalation=None,
 ) -> Dict[int, str]:
     """
     Generate or update docstrings for definitions in a Python source code AST.
@@ -480,6 +626,9 @@ def generate_docstrings(
     - `defs`: A list of `DefInfo` objects representing definitions in the AST.
     - `source_blob`: The entire source code as a string.
     - `source_lines`: A chunk of source lines for context.
+    - `escalation`: Optional `scale_escalate.Escalation`. When supplied, a definition whose complexity exceeds the
+      cutoff has its docstring deferred to a stronger model: a manifest request carrying the assembled snippet is
+      recorded and no docstring is produced locally (the routine is left untouched for the apply phase).
 
     Returns:
     - A dictionary mapping qualified names to generated or updated docstrings.
@@ -660,6 +809,18 @@ def generate_docstrings(
     for info in defs_deepest_first:
         node_id = id(info.node)
         snippet = assemble_snippet_for(node_id)
+
+        # Selective escalation: defer a complex routine's docstring to a stronger model. Record the assembled snippet
+        # as a manifest request and leave the routine out of the doc map, so the patcher leaves it untouched here.
+        if escalation is not None:
+            score = cognitive_complexity(info.node)
+            if escalation.should_escalate(info.qualname, score):
+                escalation.record_def(
+                    qualname=info.qualname, kind=info.kind, sig_hash=node_sig(info.node),
+                    cognitive=escalation.score_for(info.qualname, score), snippet=snippet,
+                )
+                echo(f"[Python] Escalated docstring for '{info.qualname}' (cognitive {score}); deferred")
+                continue
 
         # Elide the body if this routine is too large for the context window (the patch is unaffected).
         header_lines = max(1, info.header_end - info.header_start + 1)
@@ -925,6 +1086,8 @@ def iter_block_targets(source_blob: str, source_lines: Chunk) -> List[BlockTarge
                 indent_of=indent_of,
                 depth=info.depth,
                 doc=ast.get_docstring(info.node) or "",
+                cognitive=cognitive_complexity(info.node),
+                sig=node_sig(info.node),
             )
         )
 
@@ -936,7 +1099,8 @@ def generate_language_comments(
     cfg: GenerationConfig,
     messages: Messages,
     source_blob: str,
-    source_lines: Chunk
+    source_lines: Chunk,
+    escalation=None,
 ) -> Chunk:
     """
     Process Python source code and generate new/updated docstrings for each definition.
@@ -950,6 +1114,8 @@ def generate_language_comments(
     - messages: The conversational message history to extend with new prompts and replies.
     - source_blob: The complete text of the source file as a single string (with original line endings).
     - source_lines: The source file split into individual lines.
+    - escalation: Optional `scale_escalate.Escalation`; when supplied, complex definitions are deferred to the manifest
+      rather than commented locally (see `generate_docstrings`).
 
     Returns:
     - A patched source file text, containing the new docstrings, split into individual lines.
@@ -974,7 +1140,121 @@ def generate_language_comments(
     echo(f"Found {len(defs)} definitions")
 
     echo("Generating docstrings...\n")
-    doc_map = generate_docstrings(llm, cfg, messages, defs, source_blob, source_lines)
+    doc_map = generate_docstrings(llm, cfg, messages, defs, source_blob, source_lines, escalation=escalation)
 
     echo("Applying Python patches...\n")
     return patch_docstrings_textually(source_lines, defs, doc_map)
+
+
+# ---------------------------- manifest apply (model-free) ----------------------------
+
+
+def _clean_docstring_answer(text: str) -> str:
+    """
+    Strip any surrounding code fence or triple quotes a model wrapped a docstring answer in.
+
+    The patcher adds its own `\"\"\"` delimiters, so the answer must be the docstring body alone. Leading/trailing
+    triple quotes or a ``` fence are removed; the inner text is returned dedented and stripped.
+
+    Parameters:
+    - `text`: The raw docstring answer from the manifest.
+
+    Returns:
+    - The cleaned docstring body (may be empty).
+    """
+
+    body = text.strip()
+    fence = re.match(r"^```[^\n]*\n(.*)\n```$", body, flags=re.DOTALL)
+    if fence:
+        body = fence.group(1).strip()
+    for q in ('"""', "'''"):
+        if body.startswith(q) and body.endswith(q) and len(body) >= 2 * len(q):
+            body = body[len(q):-len(q)]
+            break
+    return textwrap.dedent(body).strip()
+
+
+def apply_manifest(source_blob: str, source_lines: Chunk, manifest: dict) -> Chunk:
+    """
+    Patch a stronger model's answers from an escalation manifest into already-locally-annotated Python source.
+
+    This is the model-free apply phase. Each request is re-bound to its routine by `(qualname, node_sig)` - a structural
+    signature that survives the line shifts, inserted comments, and docstring changes between the emit and apply phases.
+    The deferred docstrings are patched in first; then the source is re-parsed and the block answers are patched (each
+    chunk placed by boundary index into the freshly recomputed boundaries). Doing docstrings first puts each docstring
+    directly under its signature, above the routine's block comments; re-parsing afterwards keeps the boundary lines
+    correct. Both steps go through the same insertion-only patchers and code-preservation guard as the local passes, so
+    the byte-for-byte code guarantee holds for the stronger model's output too.
+
+    Parameters:
+    - `source_blob`: The emit-phase output source as a single string.
+    - `source_lines`: The same source split into individual lines.
+    - `manifest`: The parsed manifest dictionary, with each request's `answer` slots filled in.
+
+    Returns:
+    - The fully annotated source split into individual lines.
+    """
+
+    from scale_blocks import PYTHON_STYLE, _apply_edits, code_preserved, _parse_comment_reply
+
+    requests = manifest.get("requests", [])
+    def_reqs = [r for r in requests if r.get("pass") == "def"]
+    block_reqs = [r for r in requests if r.get("pass") == "block"]
+
+    out_lines = source_lines
+
+    # ---- 1. Definition answers (docstring directly under each signature) ----
+    if def_reqs:
+        defs = iter_defs_with_info(ast.parse("\n".join(out_lines)))
+        wanted = {(r["qualname"], r["sig_hash"]): r for r in def_reqs}
+        doc_map: Dict[int, str] = {}
+        used: set = set()
+        for info in defs:
+            key = (info.qualname, node_sig(info.node))
+            req = wanted.get(key)
+            if req is None or key in used:
+                continue
+            answer = req.get("answer")
+            if not answer or not answer.strip():
+                echo(f"[apply] Def request '{req['id']}' has no answer; leaving docstring untouched")
+                continue
+            doc = _clean_docstring_answer(answer)
+            if doc:
+                doc_map[id(info.node)] = doc
+                used.add(key)
+        out_lines = patch_docstrings_textually(out_lines, defs, doc_map)
+
+    # ---- 2. Block answers (re-parse so spans/boundaries reflect any inserted docstrings) ----
+    if block_reqs:
+        targets = iter_block_targets("\n".join(out_lines), out_lines)
+        by_key: Dict[Tuple[str, str], BlockTarget] = {(t.qualname, t.sig): t for t in targets}
+
+        all_edits: List[Tuple[int, Optional[str], str]] = []
+        for req in block_reqs:
+            target = by_key.get((req["qualname"], req["sig_hash"]))
+            if target is None:
+                echo(f"[apply] No match for block request '{req['id']}'; skipping")
+                continue
+            if all(c.get("answer") is None for c in req["chunks"]):
+                echo(f"[apply] Block request '{req['id']}' has no answers; leaving routine untouched")
+                continue
+
+            edits: List[Tuple[int, Optional[str], str]] = []
+            for chunk in req["chunks"]:
+                bidx = chunk["bidx"]
+                if not (0 <= bidx < len(target.boundary_lines)):
+                    continue
+                boundary = target.boundary_lines[bidx]
+                comment = _parse_comment_reply(chunk.get("answer") or "", PYTHON_STYLE)
+                edits.append((boundary, comment, target.indent_of.get(boundary, "")))
+
+            # Per-routine guard: keep this routine's edits only if simulating them preserves its code.
+            trial = _apply_edits(out_lines, edits, PYTHON_STYLE)
+            if code_preserved(out_lines, trial, PYTHON_STYLE):
+                all_edits.extend(edits)
+            else:
+                echo(f"[apply] Skipped '{req['qualname']}': block edit would alter code; keeping original")
+
+        out_lines = _apply_edits(out_lines, all_edits, PYTHON_STYLE)
+
+    return out_lines

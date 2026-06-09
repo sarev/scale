@@ -26,6 +26,7 @@ from dataclasses import replace
 from pathlib import Path
 from scale_llm import LocalChatModel, GenerationConfig, llm_formatters, Messages, Chunk
 from scale_log import echo, error, set_verbosity
+import scale_escalate
 from typing import Callable, List, Optional, Sequence, Tuple
 import argparse
 import hashlib
@@ -708,6 +709,7 @@ def _def_pass(
     source_blob: str,
     source_lines: List[str],
     language: str,
+    escalation=None,
 ) -> List[str]:
     """
     Run the definition (docstring/header-comment) pass for the resolved language.
@@ -726,6 +728,8 @@ def _def_pass(
 
     if language == "python":
         from scale_python import generate_language_comments
+        # Only the Python worker understands selective escalation for now.
+        return generate_language_comments(llm, cfg, messages, source_blob, source_lines, escalation=escalation)
     elif language == "js":
         from scale_javascript import generate_language_comments
     elif language == "c":
@@ -806,6 +810,7 @@ def _block_pass(
     source_blob: str,
     source_lines: List[str],
     language: str,
+    escalation=None,
 ) -> List[str]:
     """
     Run the within-function "blob" pass: annotate logical groups of statements inside each routine body.
@@ -839,6 +844,7 @@ def _block_pass(
         comment_nudge=_read_optional(scale_path / "blocks.comment.nudge.txt"),
         note_short=_read_optional(scale_path / "blocks.note.short.txt"),
         note_long=_read_optional(scale_path / "blocks.note.long.txt"),
+        escalation=escalation,
     )
 
 
@@ -855,6 +861,7 @@ def generate_comments(
     no_cache: Optional[bool] = False,
     do_comment: bool = True,
     do_blocks: bool = False,
+    escalation=None,
 ) -> int:
     """
     Generate comments for the provided (already-loaded) source code using a Large Language Model (LLM).
@@ -878,6 +885,8 @@ def generate_comments(
     - `no_cache`: Generate new summary - don't use the cached version.
     - `do_comment`: Run the definition (docstring/header-comment) pass.
     - `do_blocks`: Run the within-function block pass.
+    - `escalation`: Optional `scale_escalate.Escalation`; when supplied, complex routines are deferred to its manifest
+      instead of being commented by the local model (the caller serialises the manifest afterwards).
 
     Returns:
     - 0 if the operation was successful, or an error number.
@@ -895,7 +904,7 @@ def generate_comments(
         messages = prime_llm_for_comments(
             llm, cfg, scale_path, src_path, source_blob, language, no_cache=no_cache, template="comment"
         )
-        new_lines = _def_pass(llm, cfg, messages, source_blob, new_lines, language)
+        new_lines = _def_pass(llm, cfg, messages, source_blob, new_lines, language, escalation=escalation)
 
     if do_blocks:
         try:
@@ -907,7 +916,7 @@ def generate_comments(
         messages = prime_llm_for_comments(
             llm, cfg, scale_path, src_path, source_blob, language, no_cache=no_cache, template="blocks"
         )
-        new_lines = _block_pass(llm, cfg, scale_path, messages, current_blob, new_lines, language)
+        new_lines = _block_pass(llm, cfg, scale_path, messages, current_blob, new_lines, language, escalation=escalation)
 
     # Write the output
     if dst_path:
@@ -972,7 +981,63 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--n-batch", type=int, default=256, help="Number of batches to process")
     p.add_argument("--n-gpu-layers", type=int, default=-1, help="Number of GPU layers to use")
 
+    # Selective escalation to a stronger model (Python only for now).
+    p.add_argument("--emit-manifest", default="", metavar="PATH",
+                   help="Emit phase: write deferred comment requests for complex routines to this manifest "
+                        "(local model still annotates the rest of the file).")
+    p.add_argument("--apply-manifest", default="", metavar="PATH",
+                   help="Apply phase: patch a stronger model's answers from this manifest into the source. No model is "
+                        "loaded; the source should be the emit-phase output.")
+    p.add_argument("--escalate-cognitive", type=int, default=10, metavar="N",
+                   help="Escalate any routine whose cognitive complexity exceeds N to the manifest (default 10).")
+    p.add_argument("--codestats-json", default="", metavar="PATH",
+                   help="Optional precomputed codestats JSON report; its cognitive scores override the native ones "
+                        "when deciding what to escalate.")
+
     return p.parse_args(argv)
+
+
+def _apply_manifest_file(
+    src_path: Path,
+    dst_path: Optional[Path],
+    language: str,
+    source_blob: str,
+    source_lines: List[str],
+    line_ending: str,
+    manifest: dict,
+) -> int:
+    """
+    Patch a stronger model's manifest answers into the source and write the result (the apply phase entry point).
+
+    No model is loaded: the answers are inserted through the same insertion-only patchers as the local passes. Only
+    Python is supported for now (the only language with a block provider and manifest applier).
+
+    Parameters:
+    - `src_path`: The source file (the emit-phase output) being patched.
+    - `dst_path`: Where to write the result, or None to print to stdout.
+    - `language`: The resolved language identifier.
+    - `source_blob`: The source as a single string.
+    - `source_lines`: The source split into individual lines.
+    - `line_ending`: The detected line ending used to re-join the output.
+    - `manifest`: The parsed manifest dictionary with answers filled in.
+
+    Returns:
+    - 0 on success, or an error number.
+    """
+
+    if language != "python":
+        error(f"--apply-manifest currently supports Python only (got '{language}').")
+        return 1
+
+    from scale_python import apply_manifest
+    new_lines = apply_manifest(source_blob, source_lines, manifest)
+
+    if dst_path:
+        dst_path.write_bytes(line_ending.join(new_lines).encode("utf-8", errors="surrogateescape"))
+        echo(f"Applied manifest answers; written to {dst_path}")
+    else:
+        print("\n".join(new_lines))
+    return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -999,6 +1064,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     src_path = Path(args.source)
     dst_path = Path(args.output) if args.output else None
 
+    # ---- Apply phase: model-free. Patch a stronger model's manifest answers into the (emit-phase) source. ----
+    if args.apply_manifest:
+        manifest = scale_escalate.read_manifest(Path(args.apply_manifest))
+        language = args.language.lower() if args.language else manifest.get("language")
+        source_blob, source_lines, line_ending, language = load_source(src_path, language)
+        if language not in SUPPORTED_LANGUAGES:
+            error(f"Unsupported language '{language}'. SCALE supports: {', '.join(SUPPORTED_LANGUAGES)}")
+            return 1
+        return _apply_manifest_file(src_path, dst_path, language, source_blob, source_lines, line_ending, manifest)
+
     if not (args.comment or args.blocks):
         # Nothing to do without --comment or --blocks.
         return 0
@@ -1010,6 +1085,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if language not in SUPPORTED_LANGUAGES:
         error(f"Unsupported language '{language}'. SCALE supports: {', '.join(SUPPORTED_LANGUAGES)}")
         return 1
+
+    # ---- Emit phase: build the selective-escalation policy that defers complex routines to a manifest. ----
+    escalation = None
+    if args.emit_manifest:
+        if language != "python":
+            error("--emit-manifest currently supports Python only.")
+            return 1
+        override = scale_escalate.load_codestats_json(Path(args.codestats_json)) if args.codestats_json else None
+        escalation = scale_escalate.Escalation(threshold=args.escalate_cognitive, override=override)
 
     # Prepare model and config
     echo("Loading the LLM...")
@@ -1032,13 +1116,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     echo("Generating comments...")
-    return generate_comments(
+    rc = generate_comments(
         llm, cfg, scale_path, src_path, dst_path,
         source_blob, source_lines, line_ending, language,
         no_cache=args.no_cache,
         do_comment=args.comment,
         do_blocks=args.blocks,
+        escalation=escalation,
     )
+
+    # Serialise the deferred requests so a stronger model can answer them (then re-run with --apply-manifest).
+    if rc == 0 and escalation is not None:
+        manifest = escalation.to_manifest(str(src_path), language, line_ending)
+        scale_escalate.write_manifest(Path(args.emit_manifest), manifest)
+        echo(f"Wrote {len(escalation.requests)} escalation request(s) to {args.emit_manifest}")
+
+    return rc
 
 
 if __name__ == "__main__":  # pragma: no cover
