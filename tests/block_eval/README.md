@@ -10,6 +10,9 @@ Run them with the project venv. The model defaults to the project's Qwen2.5-Code
 # Make a worst-case "wall of statements" from a real file (strips body comments + blank lines, keeps docstrings):
 python tests/block_eval/make_wall.py scale_text.py temp/wall.py
 
+# Truer wall: also strip docstrings, so the file has NO comments at all bar a shebang (forces fresh docstrings too):
+python tests/block_eval/make_wall.py --strip-docstrings scale_text.py temp/wall.py
+
 # See how the segment pass chunks a file (no patching):
 ../.llm-venv/Scripts/python.exe tests/block_eval/show_segments.py temp/wall.py
 
@@ -23,7 +26,7 @@ git --no-pager diff --no-index temp/wall.py temp/wall.scaled.py
 
 ## Files
 
-- `make_wall.py` — strip a file to a docstring-only "wall" (the hardest input for the block pass).
+- `make_wall.py` — strip a file to a "wall" of statements (the hardest input for the block pass): blanks + `#` comments by default; add `--strip-docstrings` to also remove docstrings (no comments left bar a shebang), which additionally exercises fresh docstring generation/escalation.
 - `show_segments.py` — print the chunk ranges the segment pass picks (is it grouping sensibly?).
 - `show_comments.py` — print the comment per chunk (is it useful, restating, or wrong?).
 - `_harness.py` — shared model/priming setup (resolves the project root + `SCALE_MODEL`).
