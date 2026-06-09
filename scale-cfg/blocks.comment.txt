@@ -1,0 +1,13 @@
+Function `{qualname}` does: {doc}
+
+{length_note}
+
+Comments already written for earlier paragraphs of it:
+{priors}
+
+Here is the NEXT paragraph of its body:
+
+{block}
+
+Give ONE short, useful comment for this paragraph - what this group of lines accomplishes, or the reason / gotcha / subtlety / edge case behind it - the kind of line that helps a reader scan the function. Avoid trivially restating a single obvious line. Reply NONE only if the paragraph is truly trivial.
+Bare sentence, or NONE. No #, no quotes, no list.

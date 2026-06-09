@@ -1,0 +1,1 @@
+This is a longer routine: a brief one-line heading that walks the reader through this paragraph is welcome, even if it lightly echoes the docstring.

@@ -1,0 +1,4 @@
+Body of {kind} `{qualname}`. Each numbered line may begin a chunk; others cannot.
+Group the body into a FEW chunks, each a run of lines doing one thing (~2-15 lines). Give each chunk's line range as `start-end` (start must be a numbered line). Few chunks, not many - group related lines, do not split every line.
+
+{view}

@@ -43,6 +43,7 @@ and aligned with the actual code structure.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from scale_blocks import BlockTarget
 from scale_llm import LocalChatModel, GenerationConfig, Messages, Chunk
 from scale_log import echo
 from scale_text import fit_snippet, MARKER_PYTHON
@@ -764,6 +765,170 @@ def patch_docstrings_textually(source_lines: Chunk, defs: List[DefInfo], doc_map
             out_lines[insert_at:insert_at] = new_doc_lines + [""]
 
     return out_lines
+
+
+# ---------------------------- within-function block targets ----------------------------
+
+
+def _is_docstring_stmt(stmt: ast.AST) -> bool:
+    """
+    Report whether a statement is a docstring (a bare string-constant expression).
+
+    Parameters:
+    - `stmt`: The AST statement to test.
+
+    Returns:
+    - True if the statement is a string-constant expression, as a leading docstring would be.
+    """
+
+    return (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Constant)
+        and isinstance(stmt.value.value, str)
+    )
+
+
+def _sub_statement_lists(stmt: ast.AST) -> List[List[ast.AST]]:
+    """
+    Return the nested statement lists of a compound statement, so boundary collection can recurse into them.
+
+    Covers the bodies and alternatives of every Python compound statement: `body`/`orelse`/`finalbody`, the body of
+    each `except` handler, and the body of each `match` case.
+
+    Parameters:
+    - `stmt`: The AST statement to inspect.
+
+    Returns:
+    - A list of statement lists (empty for simple statements).
+    """
+
+    lists: List[List[ast.AST]] = []
+    for attr in ("body", "orelse", "finalbody"):
+        block = getattr(stmt, attr, None)
+        if block:
+            lists.append(block)
+    for handler in getattr(stmt, "handlers", []) or []:
+        if getattr(handler, "body", None):
+            lists.append(handler.body)
+    for case in getattr(stmt, "cases", []) or []:  # match-case
+        if getattr(case, "body", None):
+            lists.append(case.body)
+    return lists
+
+
+def _body_boundaries(node: ast.AST, source_lines: Chunk) -> Tuple[List[int], Dict[int, str]]:
+    """
+    Compute the lines within a routine body that may legally begin a block, plus their indentation.
+
+    A line qualifies only if it begins exactly one statement at the line's first non-blank column. This naturally drops
+    `a; b` lines (two statement starts), inline-compound lines such as `if x: return` (the inner statement shares the
+    line), and continuation lines (which are not statement starts). Statement starts are collected at every nesting
+    depth, except that a nested function/class is recorded as a single opaque boundary (its decorator-aware header
+    line) and is not descended into - its own body is annotated when it is processed as its own target. A leading
+    docstring is skipped so no comment is ever placed between a definition and its docstring.
+
+    Parameters:
+    - `node`: The function/async-function/class AST node whose body is examined.
+    - `source_lines`: The full source split into lines (for indentation and the first-column check).
+
+    Returns:
+    - A tuple `(boundary_lines, indent_of)`: the sorted legal boundary lines and a map from each to its leading
+      whitespace.
+    """
+
+    line_count: Dict[int, int] = {}   # line -> number of statements starting on it
+    line_col: Dict[int, int] = {}     # line -> column of the (single) statement start
+    nested_lines: set[int] = set()    # boundary lines that are opaque nested definitions
+
+    def record(line: int, col: int, is_nested: bool) -> None:
+        """Note that a statement starts at the given line/column."""
+        line_count[line] = line_count.get(line, 0) + 1
+        line_col[line] = col
+        if is_nested:
+            nested_lines.add(line)
+
+    def collect(stmts: List[ast.AST], is_top: bool) -> None:
+        """Walk a statement list, recording statement starts and recursing into non-definition compound bodies.
+
+        The first statement of an *inner* suite (an `if`/`for`/`while`/`try`/`with`/`else`/`except` body) is never a
+        boundary: a blank line as the first line of a suite reads badly. The first statement of the routine's own body
+        stays eligible (a blank there just follows the signature/docstring, which is normal).
+        """
+        for idx, stmt in enumerate(stmts):
+            skip = (not is_top) and idx == 0  # first line of an inner suite is not a block start
+            if _is_def_node(stmt):
+                # A nested definition is one opaque boundary at its decorator-aware header line; do not descend.
+                if not skip:
+                    record(_header_span(stmt)[0], 0, True)
+                continue
+            if not skip:
+                record(stmt.lineno, getattr(stmt, "col_offset", 0), False)
+            for sub in _sub_statement_lists(stmt):
+                collect(sub, False)
+
+    body = list(getattr(node, "body", []))
+    consider = body[1:] if body and _is_docstring_stmt(body[0]) else body
+    collect(consider, True)
+
+    boundary_lines: List[int] = []
+    indent_of: Dict[int, str] = {}
+    for line, count in line_count.items():
+        if count != 1 or not (1 <= line <= len(source_lines)):
+            continue
+        text = source_lines[line - 1]
+        leading = text[: len(text) - len(text.lstrip())]
+        # For a real statement start the column prefix must be all whitespace (nested-definition lines are trusted to
+        # start their own line and bypass this check, since a decorator's column points past its '@').
+        if line not in nested_lines and text[: line_col[line]].strip() != "":
+            continue
+        boundary_lines.append(line)
+        indent_of[line] = leading
+
+    boundary_lines.sort()
+    return boundary_lines, indent_of
+
+
+def iter_block_targets(source_blob: str, source_lines: Chunk) -> List[BlockTarget]:
+    """
+    Build the within-function block targets for a Python source file.
+
+    Each function, method, and class body becomes one `BlockTarget` carrying its header/body line spans and the set of
+    lines that may legally begin a block (see `_body_boundaries`). This is the Python implementation of the language-
+    agnostic provider interface consumed by `scale_blocks.annotate_blocks`.
+
+    Parameters:
+    - `source_blob`: The complete source text (parsed with the standard library `ast`).
+    - `source_lines`: The same source split into individual lines (for indentation and line text).
+
+    Returns:
+    - A list of `BlockTarget`, one per routine, in source order.
+    """
+
+    tree = ast.parse(source_blob)
+    targets: List[BlockTarget] = []
+
+    for info in iter_defs_with_info(tree):
+        body = list(getattr(info.node, "body", []))
+        if not body:
+            continue
+
+        boundary_lines, indent_of = _body_boundaries(info.node, source_lines)
+        targets.append(
+            BlockTarget(
+                qualname=info.qualname,
+                kind=info.kind,
+                header_start=info.header_start,
+                header_end=info.header_end,
+                body_start=body[0].lineno,
+                body_end=info.end,
+                boundary_lines=tuple(boundary_lines),
+                indent_of=indent_of,
+                depth=info.depth,
+                doc=ast.get_docstring(info.node) or "",
+            )
+        )
+
+    return targets
 
 
 def generate_language_comments(

@@ -1,0 +1,2 @@
+Have another go at that paragraph. Even a short note on what it accomplishes, the reason behind it, a gotcha or an edge case helps a reader. Give ONE short line, or NONE only if it really is trivial.
+Bare sentence, or NONE. No #, no quotes, no list.

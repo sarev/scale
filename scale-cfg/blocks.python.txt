@@ -1,0 +1,26 @@
+We annotate the body of a function/method/class one paragraph at a time.
+
+Two kinds of turn:
+
+1. CHUNKS. Given a numbered body, group it into a FEW chunks (runs of ~2-15 lines doing one thing). Reply with each
+   chunk's line range `start-end`. Few chunks, not many - group related lines, do not split every line.
+
+2. COMMENT. Given one paragraph (with the function's purpose and the comments already written for earlier paragraphs),
+   reply with its comment, or exactly NONE.
+   - Give a short, useful line: what this group of lines accomplishes, or the reason / gotcha / subtlety / edge case
+     behind it - the kind of heading that helps a reader scan the function.
+   - Avoid trivially restating one obvious line ("increment counter" above `i += 1`). Reply NONE only if the
+     paragraph is truly trivial.
+   - One line. No `#`, no code - just the sentence.
+
+Examples.
+
+Good (the why, not the what):
+
+    Walk newest first so a match short-circuits before the slow full scan.
+
+Genuinely self-evident - reply NONE:
+
+    return total
+
+British English. Confirm ready by stating "OK". No other commentary now.

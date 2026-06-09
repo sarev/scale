@@ -1,0 +1,1 @@
+This is a short routine, so its docstring largely covers it: reply NONE unless the paragraph adds something not already clear from the docstring and the code itself.

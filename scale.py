@@ -618,7 +618,8 @@ def prime_llm_for_comments(
     src_path: Path,
     source_blob: str,
     language: str,
-    no_cache: Optional[bool] = False
+    no_cache: Optional[bool] = False,
+    template: str = "comment",
 ) -> Messages:
     """
     Prepare the Large Language Model (LLM) for generating comments by priming it with a system prompt and the source file as context.
@@ -631,6 +632,9 @@ def prime_llm_for_comments(
     - `source_blob`: The source code as a string.
     - `language`: The programming language of the source code.
     - `no_cache`: Generate new summary - don't use the cached version.
+    - `template`: Which per-language style template to load as the final priming turn: `"comment"` loads
+      `comment.<lang>.txt` (the definition/docstring pass) and `"blocks"` loads `blocks.<lang>.txt` (the
+      within-function "blob" pass). Only one is ever loaded so the two passes never share each other's guidance.
 
     Returns:
     - A list of messages exchanged between the system and the LLM, including the priming prompts and the generated responses.
@@ -641,12 +645,19 @@ def prime_llm_for_comments(
 
     echo("Priming LLM...")
 
-    # Load the system prompt for doing comment generation
+    # Load the system prompt for doing comment generation. For the definition pass, append the house-style guidelines
+    # (the doc-comment rules and density guidance it depends on). The block pass deliberately omits them: its own
+    # `blocks.<lang>.txt` template carries the blob guidance, and the small context window is better spent on the
+    # routine snippet than on def-pass doc-comment rules that do not apply.
     comment_path = scale_path / "comment.txt"
     comment_prompt = comment_path.read_text(encoding="utf-8")
+    guidelines_path = scale_path / "guidelines.md"
+    if template == "comment" and guidelines_path.is_file():
+        comment_prompt = f"{comment_prompt}\n\n{guidelines_path.read_text(encoding='utf-8')}"
 
-    # Load the user prompt specifying the comment format template for the language in question
-    template_path = scale_path / f"comment.{language}.txt"
+    # Load the user prompt specifying the style template for the language in question. The pass selects the template:
+    # the definition pass uses "comment", the within-function blob pass uses "blocks".
+    template_path = scale_path / f"{template}.{language}.txt"
     template_prompt = template_path.read_text(encoding="utf-8")
 
     # Prime the LLM with our system prompt
@@ -690,6 +701,147 @@ def prime_llm_for_comments(
     return messages
 
 
+def _def_pass(
+    llm: LocalChatModel,
+    cfg: GenerationConfig,
+    messages: Messages,
+    source_blob: str,
+    source_lines: List[str],
+    language: str,
+) -> List[str]:
+    """
+    Run the definition (docstring/header-comment) pass for the resolved language.
+
+    Parameters:
+    - `llm`: The LocalChatModel instance used for generating comments.
+    - `cfg`: The GenerationConfig instance containing configuration settings.
+    - `messages`: The primed conversation context for this pass.
+    - `source_blob`: The complete source text to annotate (with original line endings).
+    - `source_lines`: The same source text split into individual lines.
+    - `language`: The programming language identifier (already validated).
+
+    Returns:
+    - The annotated source split into individual lines.
+    """
+
+    if language == "python":
+        from scale_python import generate_language_comments
+    elif language == "js":
+        from scale_javascript import generate_language_comments
+    elif language == "c":
+        from scale_c import generate_language_comments
+    else:
+        raise ValueError(f"Unsupported language '{language}'")
+    return generate_language_comments(llm, cfg, messages, source_blob, source_lines)
+
+
+def _block_provider_for(language: str):
+    """
+    Return the per-language block-target provider used by the within-function "blob" pass.
+
+    The provider has the signature `provider(source_blob, source_lines) -> List[BlockTarget]` and identifies, for each
+    function/method/class body, the lines that may legally begin a block (see `scale_blocks`).
+
+    Parameters:
+    - `language`: The programming language identifier (already validated).
+
+    Returns:
+    - The provider callable for `language`.
+
+    Raises:
+    - `NotImplementedError`: If the language has no block provider yet (currently only Python is wired).
+    """
+
+    if language == "python":
+        from scale_python import iter_block_targets
+        return iter_block_targets
+    raise NotImplementedError(
+        f"The --blocks pass does not yet support '{language}' (Python only for now)."
+    )
+
+
+def _block_style_for(language: str):
+    """
+    Return the comment-style descriptor that drives block-comment rendering for `language`.
+
+    Parameters:
+    - `language`: The programming language identifier (already validated).
+
+    Returns:
+    - A `scale_blocks.CommentStyle` describing the language's comment delimiters.
+
+    Raises:
+    - `NotImplementedError`: If the language has no block provider yet (currently only Python is wired).
+    """
+
+    from scale_blocks import PYTHON_STYLE
+    if language == "python":
+        return PYTHON_STYLE
+    raise NotImplementedError(
+        f"The --blocks pass does not yet support '{language}' (Python only for now)."
+    )
+
+
+def _read_optional(path: Path) -> Optional[str]:
+    """
+    Return the text of a config file if it exists, otherwise None.
+
+    Used for the user-editable block-pass prompt overrides, which fall back to the built-in defaults when absent.
+
+    Parameters:
+    - `path`: The file to read.
+
+    Returns:
+    - The file contents, or None if the file does not exist.
+    """
+
+    return path.read_text(encoding="utf-8") if path.is_file() else None
+
+
+def _block_pass(
+    llm: LocalChatModel,
+    cfg: GenerationConfig,
+    scale_path: Path,
+    messages: Messages,
+    source_blob: str,
+    source_lines: List[str],
+    language: str,
+) -> List[str]:
+    """
+    Run the within-function "blob" pass: annotate logical groups of statements inside each routine body.
+
+    The block-pass prompt wording is loaded from `scale-cfg` so users can tune it without touching code (a missing
+    file falls back to the engine's built-in default): `blocks.segment.txt`, `blocks.comment.txt`,
+    `blocks.comment.nudge.txt` (the retry nudge), and `blocks.note.short.txt` / `blocks.note.long.txt` (the short-/
+    long-routine length notes).
+
+    Parameters:
+    - `llm`: The LocalChatModel instance used for generating comments.
+    - `cfg`: The GenerationConfig instance containing configuration settings.
+    - `scale_path`: The path to the SCALE configuration directory.
+    - `messages`: The primed conversation context for this pass.
+    - `source_blob`: The complete source text to annotate (with original line endings).
+    - `source_lines`: The same source text split into individual lines.
+    - `language`: The programming language identifier (already validated).
+
+    Returns:
+    - The annotated source split into individual lines.
+    """
+
+    from scale_blocks import annotate_blocks
+    provider = _block_provider_for(language)
+    style = _block_style_for(language)
+    targets = provider(source_blob, source_lines)
+    return annotate_blocks(
+        llm, cfg, messages, source_lines, targets, style,
+        segment_prompt=_read_optional(scale_path / "blocks.segment.txt"),
+        comment_prompt=_read_optional(scale_path / "blocks.comment.txt"),
+        comment_nudge=_read_optional(scale_path / "blocks.comment.nudge.txt"),
+        note_short=_read_optional(scale_path / "blocks.note.short.txt"),
+        note_long=_read_optional(scale_path / "blocks.note.long.txt"),
+    )
+
+
 def generate_comments(
     llm: LocalChatModel,
     cfg: GenerationConfig,
@@ -700,13 +852,18 @@ def generate_comments(
     source_lines: List[str],
     line_ending: str,
     language: str,
-    no_cache: Optional[bool] = False
+    no_cache: Optional[bool] = False,
+    do_comment: bool = True,
+    do_blocks: bool = False,
 ) -> int:
     """
     Generate comments for the provided (already-loaded) source code using a Large Language Model (LLM).
 
-    This function primes the LLM with a system prompt and a summary of the source file as context, then uses the LLM
-    to generate comments for each routine. The annotated source is written to the destination path (or stdout).
+    Up to two passes run in sequence on the current text. The definition pass (`do_comment`) writes/updates one
+    docstring or header comment per routine; the block pass (`do_blocks`) annotates logical groups of statements
+    inside routine bodies. Each pass primes its own fresh context with the appropriate style template so the two never
+    share each other's guidance, and the block pass re-parses the (possibly already-annotated) output of the first
+    pass so line spans stay valid. The result is written to the destination path (or stdout).
 
     Parameters:
     - `llm`: The LocalChatModel instance used for generating comments.
@@ -719,33 +876,43 @@ def generate_comments(
     - `line_ending`: The detected line ending used to re-join the output.
     - `language`: The programming language of the source code (already resolved and validated).
     - `no_cache`: Generate new summary - don't use the cached version.
+    - `do_comment`: Run the definition (docstring/header-comment) pass.
+    - `do_blocks`: Run the within-function block pass.
 
     Returns:
     - 0 if the operation was successful, or an error number.
 
     Notes:
-    - Supported languages are Python, JavaScript, and C.
+    - Supported languages are Python, JavaScript, and C (the block pass is currently Python only).
     - If the destination path is not provided, the generated comments will be printed to the console.
     """
 
-    messages = prime_llm_for_comments(llm, cfg, scale_path, src_path, source_blob, language, no_cache=no_cache)
-    if language == "python":
-        from scale_python import generate_language_comments
-        new_lines = generate_language_comments(llm, cfg, messages, source_blob, source_lines)
-    elif language == "js":
-        from scale_javascript import generate_language_comments
-        new_lines = generate_language_comments(llm, cfg, messages, source_blob, source_lines)
-    elif language == "c":
-        from scale_c import generate_language_comments
-        new_lines = generate_language_comments(llm, cfg, messages, source_blob, source_lines)
-    else:
-        error(f"Unsupported language '{language}'")
-        return 1
+    # The summary is primed from the original source for both passes, so the content-hash cache stays warm; only the
+    # worker input advances from one pass to the next.
+    new_lines = source_lines
+
+    if do_comment:
+        messages = prime_llm_for_comments(
+            llm, cfg, scale_path, src_path, source_blob, language, no_cache=no_cache, template="comment"
+        )
+        new_lines = _def_pass(llm, cfg, messages, source_blob, new_lines, language)
+
+    if do_blocks:
+        try:
+            _block_provider_for(language)  # fail fast (and cleanly) on an unsupported language
+        except NotImplementedError as exc:
+            error(str(exc))
+            return 1
+        current_blob = line_ending.join(new_lines)
+        messages = prime_llm_for_comments(
+            llm, cfg, scale_path, src_path, source_blob, language, no_cache=no_cache, template="blocks"
+        )
+        new_lines = _block_pass(llm, cfg, scale_path, messages, current_blob, new_lines, language)
 
     # Write the output
     if dst_path:
-        source_blob = line_ending.join(new_lines).encode("utf-8", errors="surrogateescape")
-        dst_path.write_bytes(source_blob)
+        out_bytes = line_ending.join(new_lines).encode("utf-8", errors="surrogateescape")
+        dst_path.write_bytes(out_bytes)
         echo(f"Updated source written to {dst_path}")
     else:
         print("\n".join(new_lines))
@@ -789,7 +956,8 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("source", help="Path to source file")
     p.add_argument("--model", "-m", default="", help="Optional path to GGUF model file")
     p.add_argument("--output", "-o", default="", help="Optional output filename")
-    p.add_argument("--comment", "-c", action="store_true", help="Add and update comments")
+    p.add_argument("--comment", "-c", action="store_true", help="Add and update definition docstrings/header comments")
+    p.add_argument("--blocks", "-b", action="store_true", help="Add and update within-function block comments (Python only for now)")
     p.add_argument("--language", "-l", default=None, help="Source file language. SCALE currently supports: 'python', 'js', 'c'")
     p.add_argument("--verbose", "-v", action="store_true", help="Output progress information to stdout")
     p.add_argument("--very-verbose", "-vv", action="store_true", help="Output LLM debug information to stdout")
@@ -831,8 +999,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     src_path = Path(args.source)
     dst_path = Path(args.output) if args.output else None
 
-    if not args.comment:
-        # Nothing to do without --comment.
+    if not (args.comment or args.blocks):
+        # Nothing to do without --comment or --blocks.
         return 0
 
     # Load the source and resolve the language up front, so an unsupported file fails fast
@@ -868,6 +1036,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         llm, cfg, scale_path, src_path, dst_path,
         source_blob, source_lines, line_ending, language,
         no_cache=args.no_cache,
+        do_comment=args.comment,
+        do_blocks=args.blocks,
     )
 
 
