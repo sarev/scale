@@ -1,3 +1,8 @@
 __cache__
 __pycache__
 temp/*
+
+# Block-pass eval samples are private/ad-hoc by default; only the intentional fixtures are tracked.
+tests/block_eval/samples/*
+!tests/block_eval/samples/charge.py
+!tests/block_eval/samples/seats.py

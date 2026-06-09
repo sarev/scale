@@ -195,6 +195,8 @@ class BlockTarget:
       routine's comments to a stronger model (0 when complexity is not being computed).
     - `sig`: A structural signature of the routine (see `scale_python.node_sig`), used by selective escalation to
       re-bind a deferred routine across the emit/apply phases ("" when not computed).
+    - `segments`: Optional precomputed `(start, end)` chunk ranges from a provider's deterministic segmenter; when
+      present the block pass uses them instead of asking the model to segment (None falls back to the LLM segment pass).
     """
 
     qualname: str
@@ -209,6 +211,7 @@ class BlockTarget:
     doc: str = ""
     cognitive: int = 0
     sig: str = ""
+    segments: Optional[List[Tuple[int, int]]] = None
 
 
 # ---------------------------- comment helpers ----------------------------
@@ -801,7 +804,12 @@ def annotate_blocks(
         if not target.boundary_lines:
             continue
 
-        segments = request_segments(llm, cfg, messages, source_lines, target, segment_prompt)
+        # Prefer a provider's deterministic structural segmentation; fall back to the LLM segment pass for
+        # languages/targets that don't supply one. Structural segmentation is free, reproducible, and needs no model.
+        if target.segments is not None:
+            segments = target.segments
+        else:
+            segments = request_segments(llm, cfg, messages, source_lines, target, segment_prompt)
         if not segments:
             continue
 

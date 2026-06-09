@@ -1245,6 +1245,112 @@ def _body_boundaries(node: ast.AST, source_lines: Chunk) -> Tuple[List[int], Dic
     return boundary_lines, indent_of
 
 
+# Compound statements that open a paragraph-worthy block (nested defs/classes included - a nested definition is its own
+# paragraph). Used by the deterministic structural segmenter below.
+_SEG_COMPOUND = (ast.If, ast.For, ast.While, ast.Try, ast.With, ast.AsyncFor, ast.AsyncWith,
+                 ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+if hasattr(ast, "Match"):
+    _SEG_COMPOUND = _SEG_COMPOUND + (ast.Match,)
+
+# A block must span at least this many source lines to earn a paragraph break before it (or before the statement that
+# resumes after it). Size is a better "is this trivial" gate than cognitive complexity, which is nesting-dominated and
+# wrongly demotes long-but-flat blocks. 3 generalises across codebases (5 overfit this repo's style).
+_SEG_MIN_BLOCK_LINES = 3
+
+
+def _seg_span(node: ast.AST) -> int:
+    """Source-line span of a statement (decorator-aware for defs): its triviality measure for the size gate."""
+    start = _header_span(node)[0] if _is_def_node(node) else node.lineno
+    return getattr(node, "end_lineno", start) - start + 1
+
+
+def _seg_records(node: ast.AST, source_lines: Chunk) -> List[Tuple[int, int, ast.AST, bool, bool]]:
+    """
+    Flatten a routine body into statement-start records `(start_line, indent, node, first_of_suite, first_in_scope)`.
+
+    Mirrors `_body_boundaries`' walk (recurse into compound suites, treat a nested def as one opaque statement, skip a
+    leading docstring) but keeps the node and indentation so the segmenter can reason about statement kind and nesting.
+    """
+    records: List[Tuple[int, int, ast.AST, bool, bool]] = []
+
+    def walk(stmts: List[ast.AST], is_top: bool) -> None:
+        for idx, stmt in enumerate(stmts):
+            start = _header_span(stmt)[0] if _is_def_node(stmt) else stmt.lineno
+            text = source_lines[start - 1] if 1 <= start <= len(source_lines) else ""
+            indent = len(text) - len(text.lstrip())
+            records.append((start, indent, stmt, (not is_top) and idx == 0, is_top and idx == 0))
+            if not _is_def_node(stmt):
+                for sub in _sub_statement_lists(stmt):
+                    walk(sub, False)
+
+    body = list(getattr(node, "body", []))
+    if body and _is_docstring_stmt(body[0]):
+        body = body[1:]
+    walk(body, True)
+    records.sort(key=lambda r: r[0])
+    return records
+
+
+def _seg_closed_block(prev_node: ast.AST, resume_start: int, parents: Dict[int, ast.AST],
+                      target: ast.AST) -> Optional[ast.AST]:
+    """Return the outermost compound that closed between `prev_node` and a dedent resuming at `resume_start`."""
+    best: Optional[ast.AST] = None
+    n = parents.get(id(prev_node))
+    while n is not None and n is not target:
+        if isinstance(n, _SEG_COMPOUND) and getattr(n, "end_lineno", 0) < resume_start:
+            best = n                                 # keep climbing for the outermost closed block
+        n = parents.get(id(n))
+    return best
+
+
+def structural_segments(node: ast.AST, source_lines: Chunk, boundary_lines: List[int],
+                        body_end: int) -> List[Tuple[int, int]]:
+    """
+    Deterministically segment a routine body into paragraph chunks (the structural replacement for LLM segmentation).
+
+    Returns `(start, end)` ranges - the same shape `scale_blocks.request_segments` produces - where each `start` is a
+    legal boundary line that should be prefixed with a paragraph break. The rules (Steve's stated conventions): a blank
+    after the docstring (only when one exists); after a nested def/class (it clearly ends a paragraph - ungated); before
+    a `return` whose preceding statement is at the same indent; before a compound / nested-def block of at least
+    `_SEG_MIN_BLOCK_LINES` lines; and resuming after such a block closes (a dedent). Breaks are only ever placed at
+    `boundary_lines`, so the segmenter can never split mid-statement.
+    """
+    records = _seg_records(node, source_lines)
+    if not records:
+        return []
+
+    parents: Dict[int, ast.AST] = {}
+    for n in ast.walk(node):
+        for c in ast.iter_child_nodes(n):
+            parents[id(c)] = n
+
+    legal = set(boundary_lines)
+    body = list(getattr(node, "body", []))
+    has_doc = bool(body and _is_docstring_stmt(body[0]))
+
+    breaks: set = set()
+    for i, (start, indent, stmt, _first_of_suite, first_in_scope) in enumerate(records):
+        if start not in legal:
+            continue
+        prev = records[i - 1] if i > 0 else None
+        if first_in_scope:
+            if has_doc:
+                breaks.add(start)                    # blank separating docstring from the first statement
+        elif prev is not None and _is_def_node(prev[2]):
+            breaks.add(start)                        # blank after a nested def/method - it clearly ends a paragraph
+        elif isinstance(stmt, ast.Return) and prev is not None and prev[1] == indent:
+            breaks.add(start)                        # paragraph a trailing return off from the body above it
+        elif isinstance(stmt, _SEG_COMPOUND) and _seg_span(stmt) >= _SEG_MIN_BLOCK_LINES:
+            breaks.add(start)                        # a substantial block opens a new paragraph
+        elif prev is not None and prev[1] > indent:
+            blk = _seg_closed_block(prev[2], start, parents, node)
+            if blk is None or _seg_span(blk) >= _SEG_MIN_BLOCK_LINES:
+                breaks.add(start)                    # resuming after a substantial nested block closed
+
+    starts = sorted(breaks)
+    return [(s, (starts[j + 1] - 1) if j + 1 < len(starts) else body_end) for j, s in enumerate(starts)]
+
+
 def iter_block_targets(source_blob: str, source_lines: Chunk) -> List[BlockTarget]:
     """
     Build the within-function block targets for a Python source file.
@@ -1284,6 +1390,7 @@ def iter_block_targets(source_blob: str, source_lines: Chunk) -> List[BlockTarge
                 doc=ast.get_docstring(info.node) or "",
                 cognitive=cognitive_complexity(info.node),
                 sig=node_sig(info.node),
+                segments=structural_segments(info.node, source_lines, boundary_lines, info.end),
             )
         )
 
