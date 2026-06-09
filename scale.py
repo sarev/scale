@@ -26,6 +26,7 @@ from dataclasses import replace
 from pathlib import Path
 from scale_llm import LocalChatModel, GenerationConfig, llm_formatters, Messages, Chunk
 from scale_log import echo, error, set_verbosity
+from scale_text import summarise, LENGTH_PARAGRAPH, LENGTH_PARAGRAPHS
 import scale_escalate
 from typing import Callable, List, Optional, Sequence, Tuple
 import argparse
@@ -50,6 +51,11 @@ SUPPORTED_LANGUAGES = ("python", "js", "c")
 # Reply-length cap (tokens) for summary generation. Summaries are kept short on purpose so the injected overview - and
 # therefore the persistent priming context used for every routine - stays small regardless of source file size.
 SUMMARY_MAX_TOKENS = 1024
+
+
+# Rough token allowance for the fixed wrapper text `summarise` wraps around the content, used only when deciding
+# whether a summary fits in one pass; a small over-estimate just biases marginally towards the (safe) map-reduce path.
+SUMMARY_WRAPPER_TOKENS = 64
 
 
 # ---------------------------- CLI harness ----------------------------
@@ -523,29 +529,21 @@ def _reduce_summaries(
     if len(partials) == 1:
         return partials[0]
 
+    subject = f"summaries of consecutive parts of one {language} source file"
     combined = "\n\n".join(f"Part {i}: {s}" for i, s in enumerate(partials, start=1))
-    reduce_prompt = (
-        f"Below are summaries of consecutive parts of a single {language} source file. "
-        "Combine them into one concise overall summary of what the whole file does. "
-        "Do not add any conversational discussion:\n\n"
-        f"{combined}"
-    )
 
     # If the combined summaries fit, reduce them in a single pass.
-    if base_overhead + llm.estimate_tokens(reduce_prompt) <= limit:
-        return llm.generate(base_messages + [{"role": "user", "content": reduce_prompt}], cfg=summary_cfg)
+    if base_overhead + llm.estimate_tokens(combined) + SUMMARY_WRAPPER_TOKENS <= limit:
+        return summarise(llm, summary_cfg, combined, LENGTH_PARAGRAPHS,
+                         base_messages=base_messages, subject=subject, max_tokens=SUMMARY_MAX_TOKENS)
 
     # Otherwise reduce in groups first, then recurse on the (smaller) set of group summaries.
     groups = _group_by_budget(partials, max(1, limit - base_overhead - 64), llm.estimate_tokens)
     reduced: List[str] = []
     for group in groups:
         sub = "\n\n".join(f"Part {i}: {s}" for i, s in enumerate(group, start=1))
-        prompt = (
-            f"Below are summaries of consecutive parts of a single {language} source file. "
-            "Combine them into one concise summary. Do not add any conversational discussion:\n\n"
-            f"{sub}"
-        )
-        reduced.append(llm.generate(base_messages + [{"role": "user", "content": prompt}], cfg=summary_cfg))
+        reduced.append(summarise(llm, summary_cfg, sub, LENGTH_PARAGRAPHS,
+                                 base_messages=base_messages, subject=subject, max_tokens=SUMMARY_MAX_TOKENS))
     return _reduce_summaries(llm, summary_cfg, base_messages, reduced, language, limit, base_overhead)
 
 
@@ -582,16 +580,10 @@ def _generate_file_summary(
     limit = llm.n_ctx - llm.ctx_margin - SUMMARY_MAX_TOKENS
     base_overhead = llm.count_tokens(base_messages) if base_messages else 0
 
-    one_shot = (
-        "To help you understand the fuller context of each chunk that I supply, here is the original source file as a whole:\n\n"
-        f"{source_blob}\n\n"
-        "Please output a detailed summary of what this program does, along with some highlights of its internal workings.\n"
-        "Do not ask follow-up questions or add any conversational discussion. Just give me the detailed summary."
-    )
-
     # Fast path: the whole file fits in a single summarisation turn.
-    if base_overhead + llm.estimate_tokens(one_shot) <= limit:
-        return llm.generate(base_messages + [{"role": "user", "content": one_shot}], cfg=summary_cfg)
+    if base_overhead + llm.estimate_tokens(source_blob) + SUMMARY_WRAPPER_TOKENS <= limit:
+        return summarise(llm, summary_cfg, source_blob, LENGTH_PARAGRAPHS, base_messages=base_messages,
+                         subject=f"a complete {language} source file", max_tokens=SUMMARY_MAX_TOKENS)
 
     # Map: summarise the file in context-sized chunks (64 tokens of headroom for the wrapper text).
     chunk_budget = max(1, limit - base_overhead - 64)
@@ -600,12 +592,9 @@ def _generate_file_summary(
 
     partials: List[str] = []
     for idx, chunk in enumerate(chunks, start=1):
-        prompt = (
-            f"This is part {idx} of {len(chunks)} of a larger {language} source file. "
-            "Briefly summarise what this part of the code does. Do not add any conversational discussion:\n\n"
-            f"{chunk}"
-        )
-        partials.append(llm.generate(base_messages + [{"role": "user", "content": prompt}], cfg=summary_cfg))
+        partials.append(summarise(llm, summary_cfg, chunk, LENGTH_PARAGRAPH, base_messages=base_messages,
+                                  subject=f"chunk {idx} of {len(chunks)} of a {language} source file",
+                                  max_tokens=SUMMARY_MAX_TOKENS))
         echo(f"Summarised part {idx}/{len(chunks)}")
 
     # Reduce: combine the partial summaries into a single overall summary.

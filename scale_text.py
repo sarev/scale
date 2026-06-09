@@ -22,7 +22,71 @@ replacing it with a short marker noting how many lines were omitted.
 
 from __future__ import annotations
 
-from typing import Callable, List, Tuple
+from dataclasses import replace
+from typing import Callable, List, Optional, Tuple
+
+
+# Length presets for `summarise`. Each names a target shape and carries a reply-token cap sized to it, so a one-line
+# summary cannot ramble into a paragraph and a file overview is not truncated mid-sentence. Callers may override the cap
+# (e.g. the whole-file summary uses its own larger budget).
+LENGTH_LINE = "one line"
+LENGTH_PARAGRAPH = "one paragraph"
+LENGTH_PARAGRAPHS = "a few paragraphs"
+
+_LENGTH_RESERVE = {
+    LENGTH_LINE: 64,
+    LENGTH_PARAGRAPH: 200,
+    LENGTH_PARAGRAPHS: 512,
+}
+
+_LENGTH_INSTRUCTION = {
+    LENGTH_LINE: "Summarise it in a single short line - just the line, no preamble.",
+    LENGTH_PARAGRAPH: "Summarise it briefly in one paragraph.",
+    LENGTH_PARAGRAPHS: "Summarise it in a few short paragraphs, noting any significant internal details.",
+}
+
+
+def summarise(
+    llm,
+    cfg,
+    text: str,
+    length: str = LENGTH_PARAGRAPH,
+    *,
+    base_messages: Optional[List[dict]] = None,
+    subject: str = "the following",
+    max_tokens: Optional[int] = None,
+) -> str:
+    """
+    Ask the model to summarise `text` into a target length, and return the summary.
+
+    This is SCALE's one reusable "compress some text" call. It is used wherever the tool needs the model to distil
+    something - a whole source file, a chunk of one, or a deeply-nested block being elided to fit the context window -
+    so the prompt shape and the reply-length discipline live in a single place. The reply is capped to a size matching
+    `length` (overridable via `max_tokens`) so a one-line ask cannot ramble.
+
+    Parameters:
+    - `llm`: A model exposing `generate`.
+    - `cfg`: The base generation configuration (cloned with a length-appropriate `max_new_tokens`).
+    - `text`: The text to summarise.
+    - `length`: One of `LENGTH_LINE` / `LENGTH_PARAGRAPH` / `LENGTH_PARAGRAPHS`.
+    - `base_messages`: Optional priming context to prepend (e.g. the system prompt + file overview); omit for a cheap,
+      standalone summary that needs no wider context.
+    - `subject`: A short noun phrase describing what `text` is, woven into the prompt (e.g. "a Python source file").
+    - `max_tokens`: Optional reply-token cap overriding the per-length default.
+
+    Returns:
+    - The summary text, stripped.
+    """
+
+    instruction = _LENGTH_INSTRUCTION.get(length, _LENGTH_INSTRUCTION[LENGTH_PARAGRAPH])
+    prompt = (
+        f"Here is {subject}:\n\n{text}\n\n"
+        f"{instruction} Do not ask questions or add any conversational discussion; give only the summary."
+    )
+    cap = max_tokens if max_tokens is not None else _LENGTH_RESERVE.get(length, _LENGTH_RESERVE[LENGTH_PARAGRAPH])
+    turn_cfg = replace(cfg, max_new_tokens=min(cfg.max_new_tokens, cap))
+    messages = (base_messages or []) + [{"role": "user", "content": prompt}]
+    return llm.generate(messages, cfg=turn_cfg).strip()
 
 
 # Per-language markers inserted where a routine body has been elided. Each is a `str.format` template taking `n`

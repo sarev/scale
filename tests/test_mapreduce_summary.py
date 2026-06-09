@@ -32,9 +32,10 @@ class FakeLLM:
     def generate(self, messages, *, cfg=None, stop=None):
         self.calls += 1
         content = messages[-1]["content"]
-        if "Combine them into one concise overall summary" in content:
+        # The summarise() prompt names its subject; map/reduce/one-shot use distinct, unique words for it.
+        if "consecutive parts" in content:
             return "REDUCED_SUMMARY"
-        if "Briefly summarise" in content:
+        if "chunk" in content:
             return f"partial-{self.calls}"
         return "ONESHOT_SUMMARY"
 
