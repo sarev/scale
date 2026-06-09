@@ -33,6 +33,13 @@ LENGTH_LINE = "one line"
 LENGTH_PARAGRAPH = "one paragraph"
 LENGTH_PARAGRAPHS = "a few paragraphs"
 
+
+# Fixed acknowledgement the priming appends after each context turn (instead of asking the model to generate "OK",
+# which conditions a small model to answer the first real request with "OK" too). Lives here, the lowest-level shared
+# module, so both the orchestrator (which emits it) and the Python worker (which must recognise a parroted echo of it as
+# a non-answer) can reference the one string.
+PRIMING_ACK = "Understood - ready for the code."
+
 _LENGTH_RESERVE = {
     LENGTH_LINE: 64,
     LENGTH_PARAGRAPH: 200,

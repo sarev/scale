@@ -26,7 +26,7 @@ from dataclasses import replace
 from pathlib import Path
 from scale_llm import LocalChatModel, GenerationConfig, llm_formatters, Messages, Chunk
 from scale_log import echo, error, set_verbosity
-from scale_text import summarise, LENGTH_PARAGRAPH, LENGTH_PARAGRAPHS
+from scale_text import summarise, LENGTH_PARAGRAPH, LENGTH_PARAGRAPHS, PRIMING_ACK
 import scale_escalate
 from typing import Callable, List, Optional, Sequence, Tuple
 import argparse
@@ -654,13 +654,9 @@ def prime_llm_for_comments(
     messages = []
     messages.append({"role": "system", "content": comment_prompt})
 
-    # The LLM should simply reply with "OK" here
-    reply = llm.generate(messages, cfg=cfg)
-    echo(f"System prompt ingested? {reply}")
-    messages.append({"role": "assistant", "content": reply})
-
     # Now summarise the whole file for context. This automatically switches to a chunked map-reduce
-    # approach when the file is too large to summarise in one pass (see _generate_file_summary).
+    # approach when the file is too large to summarise in one pass (see _generate_file_summary). The summary is
+    # generated against the system prompt alone (the only turn so far).
     if no_cache is False and summary_cache.summary:
         echo("Loaded full source summary from cache...")
     else:
@@ -671,22 +667,16 @@ def prime_llm_for_comments(
     echo(f"Source file summarised? {reply_length} lines of summary created")
     echo(f"\n{summary_cache.summary}\n")
 
-    # Provide the summary (not the whole file) as the working context.
-    prompt = (
+    # Establish the working context with plain turns, each followed by a fixed acknowledgement we supply ourselves
+    # (see PRIMING_ACK) - the model is never asked to generate an "OK", so its first *generated* turn is a real comment.
+    messages.append({"role": "user", "content":
         "To give you context, here is an overview of what the program as a whole does:\n\n"
-        f"{summary_cache.summary}\n\n"
-        "Please confirm you are ready to continue by saying 'OK'.\n"
-    )
-    messages.append({"role": "user", "content": prompt})
-    reply = llm.generate(messages, cfg=cfg)
-    echo(f"Summary ingested? {reply}")
-    messages.append({"role": "assistant", "content": reply})
+        f"{summary_cache.summary}"})
+    messages.append({"role": "assistant", "content": PRIMING_ACK})
 
-    # Now tell the LLM what the preferred comment format is
+    # The preferred comment format / style template.
     messages.append({"role": "user", "content": template_prompt})
-    reply = llm.generate(messages, cfg=cfg)
-    echo(f"Template ingested? {reply}")
-    messages.append({"role": "assistant", "content": reply})
+    messages.append({"role": "assistant", "content": PRIMING_ACK})
 
     return messages
 
@@ -1082,7 +1072,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             error("--emit-manifest currently supports Python only.")
             return 1
         override = scale_escalate.load_codestats_json(Path(args.codestats_json)) if args.codestats_json else None
-        escalation = scale_escalate.Escalation(threshold=args.escalate_cognitive, override=override)
+        # Carry the house style into the manifest so the stronger model writes deferred docstrings to spec: the
+        # per-language template plus the shared guidelines (the same pair the local definition pass is primed with).
+        doc_style = "\n\n".join(
+            t for t in (_read_optional(scale_path / "guidelines.md"),
+                        _read_optional(scale_path / f"comment.{language}.txt")) if t
+        )
+        escalation = scale_escalate.Escalation(
+            threshold=args.escalate_cognitive, override=override, doc_style=doc_style)
 
     # Prepare model and config
     echo("Loading the LLM...")

@@ -71,5 +71,3 @@ Finally, this is an example of a more trivial C function called `toggle_debug()`
 7. If there are no input parameters, the "Parameters:" section may be omitted.
 8. If there are no returned values, the "Returns:" section may be omitted.
 9. You will use British English spellings where possible.
-
-Confirm ready by stating "OK". No other commentary required now.

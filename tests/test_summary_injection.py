@@ -46,10 +46,10 @@ class FakeLLM:
 
     def generate(self, messages, *, cfg=None, stop=None):
         self.calls += 1
-        if self.calls == 1:
-            return "OK"          # system-prompt acknowledgement
-        if self.calls == 2:
-            return SENTINEL      # the generated whole-file summary (one-pass path)
+        # Priming no longer asks the model to acknowledge turns (it supplies a canned ack itself), so the only
+        # generation during priming is the whole-file summary; recognise it by its prompt rather than call order.
+        if "Summarise it" in messages[-1]["content"]:
+            return SENTINEL      # the generated whole-file summary
         return "OK"
 
 

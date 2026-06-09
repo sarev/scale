@@ -49,12 +49,16 @@ place and report; you are done.
 
 ## Step 2 — Answer the manifest (you are the stronger model)
 
-Read `MANIFEST`. It is JSON with a `requests` array. For each request, fill its `answer` slot(s). First read the house
-style so your output matches the rest of the file:
-- `scale-cfg/guidelines.md` and `scale-cfg/comment.python.txt` — docstring house style (definition pass).
-- For block comments, keep it terse: **one** short, useful line per chunk — what the block accomplishes, or the
-  reason / gotcha / subtlety behind it — the kind of line that helps a reader scan a long routine. Use `"NONE"`
-  (the string) for a chunk that is genuinely self-evident. Do not restate a single obvious line.
+Read `MANIFEST`. It is JSON with a `requests` array (a routine appears here either because it exceeded the complexity
+cutoff *or* because the local model couldn't produce a usable docstring for it — you answer both the same way). The
+manifest's top-level **`doc_style`** field carries the house-style docstring template + guidelines; follow it for every
+`def` answer (it's the same style as the rest of the file, so you needn't re-read the config files).
+
+For each request, fill its `answer` slot(s):
+- Docstrings (`pass: "def"`): follow `doc_style`.
+- Block comments: keep it terse — **one** short, useful line per chunk (what the block accomplishes, or the reason /
+  gotcha / subtlety behind it). Use `"NONE"` (the string) for a chunk that is genuinely self-evident. Do not restate a
+  single obvious line.
 
 Request shapes:
 - `"pass": "def"` — write the **docstring body only** (no `"""`, no code fences) into the request's top-level

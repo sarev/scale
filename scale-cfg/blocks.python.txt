@@ -23,4 +23,4 @@ Genuinely self-evident - reply NONE:
 
     return total
 
-British English. Confirm ready by stating "OK". No other commentary now.
+British English.

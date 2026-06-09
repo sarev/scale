@@ -109,11 +109,14 @@ class Escalation:
     - `threshold`: The cognitive-complexity cutoff; a routine is escalated when its score is strictly greater.
     - `override`: Optional qualname to cognitive-complexity map (from `--codestats-json`) that overrides the native
       score for any routine it names; `None` means always use the native score supplied by the caller.
+    - `doc_style`: The house-style docstring template (e.g. `comment.<lang>.txt` + `guidelines.md`), carried into the
+      manifest so the stronger model is told the required style when it writes deferred docstrings.
     - `requests`: The collected escalation requests, in the order they were recorded.
     """
 
     threshold: int
     override: Optional[Dict[str, int]] = None
+    doc_style: str = ""
     requests: List[dict] = field(default_factory=list)
 
     def score_for(self, qualname: str, native_score: int) -> int:
@@ -232,6 +235,7 @@ class Escalation:
             "language": language,
             "line_ending": {"\n": "lf", "\r\n": "crlf", "\r": "cr"}.get(line_ending, "lf"),
             "escalate_cognitive": self.threshold,
+            "doc_style": self.doc_style,
             "requests": self.requests,
         }
 

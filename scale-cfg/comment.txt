@@ -8,5 +8,3 @@ Use correct comment syntax for language; follow user's preferred comment templat
 Each comment concise + incisive, detail scaled to code complexity: simple functions don't normally
 need complex comments. Tone neutral + precise. If comment uses esoteric terminology, may briefly
 explain term(s), unless already explained earlier in file.
-
-Confirm ready by stating "OK". No other commentary required now.

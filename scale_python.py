@@ -46,7 +46,7 @@ from dataclasses import dataclass, field, replace
 from scale_blocks import BlockTarget
 from scale_llm import LocalChatModel, GenerationConfig, Messages, Chunk
 from scale_log import echo
-from scale_text import fit_snippet, summarise, LENGTH_LINE, MARKER_PYTHON
+from scale_text import fit_snippet, summarise, LENGTH_LINE, MARKER_PYTHON, PRIMING_ACK
 from typing import Dict, List, Optional, Tuple
 import ast
 import copy
@@ -573,19 +573,18 @@ def describe_imports_from_tree(
     visitor.visit(tree)
     imports = visitor.results()
 
-    # If we found anything, pass the list to the LLM to provide more context
+    # If we found anything, pass the list to the LLM as extra context. We append a fixed acknowledgement ourselves
+    # rather than asking the model to reply "OK" - parroting "OK" during priming conditions it to answer the first real
+    # request with "OK" too (see PRIMING_ACK in scale.py).
     if imports:
         imports = "\n".join(imports)
         echo(f"\n[Python] Imports...\n{imports}")
         prompt = (
             "For additional context, here is a list of imports within this program:\n\n"
-            f"{imports}\n\n"
-            "Please respond by saying 'OK'. No other commentary is required at this time."
+            f"{imports}"
         )
         messages.append({"role": "user", "content": prompt})
-        reply = llm.generate(messages, cfg=cfg)
-        echo(f"\n[Python] LLM output:\n\n{reply}")
-        messages.append({"role": "assistant", "content": reply})
+        messages.append({"role": "assistant", "content": PRIMING_ACK})
 
 
 def deepest_first(defs: List[DefInfo]) -> List[DefInfo]:
@@ -734,6 +733,46 @@ def elide_structurally(
         text, cropped = fit_snippet(llm, cfg, messages, text, header_line_count, marker)
         omitted += cropped
     return text, omitted
+
+
+# Sharper re-ask used when the model's first reply is not a usable docstring (e.g. a bare "OK"). One nudge, then we
+# either promote the routine to the stronger model (if a manifest is active) or fall back to a placeholder.
+DOCSTRING_NUDGE = (
+    "That was not a docstring. Output ONLY the docstring itself, triple-quoted, following the format you were shown - "
+    "documenting every parameter and any return value. Do not reply 'OK' and do not add any text outside the docstring."
+)
+
+
+_ACK_EXACT = {
+    "ok", "okay", "understood", "ready", "sure", "yes", "done", "got it", "acknowledged",
+    PRIMING_ACK.strip().rstrip(".").lower(),   # the priming ack itself, parroted back verbatim
+}
+
+
+def _looks_like_ack(text: str) -> bool:
+    """
+    Report whether a reply is a bare acknowledgement rather than real content.
+
+    Catches a literal "OK"/"Understood"/… and, crucially, an echo of the priming acknowledgement (the small model
+    sometimes parrots the last priming turn instead of writing a docstring): an exact match, or a short, single-line
+    reply that opens like an acknowledgement. Real docstrings do not open with "understood"/"acknowledged"/"OK".
+    """
+
+    s = (text or "").strip().rstrip(".!").lower()
+    if not s:
+        return False
+    if s in _ACK_EXACT:
+        return True
+    return (
+        "\n" not in (text or "")
+        and len(s) < 60
+        and s.startswith(("understood", "acknowledged", "okay", "ok,", "ok ", "got it"))
+    )
+
+
+def _is_unusable_docstring(reply: str, docstring: str) -> bool:
+    """Report whether a docstring reply must be retried/escalated: empty, or just an acknowledgement."""
+    return (not docstring) or _looks_like_ack(docstring) or _looks_like_ack(reply)
 
 
 def generate_docstrings(
@@ -939,53 +978,75 @@ def generate_docstrings(
 
     defs_deepest_first: List[DefInfo] = sorted(defs, key=lambda d: (d.depth, d.start, -d.end), reverse=True)
 
+    def record_escalation(info: DefInfo, score: int, snippet: str) -> None:
+        """Record a deferred docstring request for `info` on the active manifest."""
+        escalation.record_def(
+            qualname=info.qualname, kind=info.kind, sig_hash=node_sig(info.node),
+            cognitive=escalation.score_for(info.qualname, score), snippet=snippet,
+        )
+
     for info in defs_deepest_first:
         node_id = id(info.node)
-        snippet = assemble_snippet_for(node_id)
+        full_snippet = assemble_snippet_for(node_id)
+        score = cognitive_complexity(info.node) if escalation is not None else 0
 
-        # Selective escalation: defer a complex routine's docstring to a stronger model. Record the assembled snippet
-        # as a manifest request and leave the routine out of the doc map, so the patcher leaves it untouched here.
-        if escalation is not None:
-            score = cognitive_complexity(info.node)
-            if escalation.should_escalate(info.qualname, score):
-                escalation.record_def(
-                    qualname=info.qualname, kind=info.kind, sig_hash=node_sig(info.node),
-                    cognitive=escalation.score_for(info.qualname, score), snippet=snippet,
-                )
-                echo(f"[Python] Escalated docstring for '{info.qualname}' (cognitive {score}); deferred")
-                continue
+        # Complexity-driven escalation: defer a complex routine's docstring to the stronger model. Record the assembled
+        # snippet and leave the routine out of the doc map, so the patcher leaves it untouched here.
+        if escalation is not None and escalation.should_escalate(info.qualname, score):
+            record_escalation(info, score, full_snippet)
+            echo(f"[Python] Escalated docstring for '{info.qualname}' (cognitive {score}); deferred")
+            continue
 
         # Elide the body if this routine is too large for the context window (the patch is unaffected). The structural
         # eliding summarises the deepest blocks into one-liners (keeping the routine's shape), falling back to a crude
-        # head/tail crop only if that cannot get it under budget.
+        # head/tail crop only if that cannot get it under budget. Only the local model's view is reduced; an escalation
+        # would carry the full snippet.
         header_lines = max(1, info.header_end - info.header_start + 1)
-        snippet, omitted = elide_structurally(llm, cfg, messages, snippet, header_lines, MARKER_PYTHON)
+        local_snippet, omitted = elide_structurally(llm, cfg, messages, full_snippet, header_lines, MARKER_PYTHON)
         if omitted:
             echo(f"[Python] Elided {omitted} body line(s) from '{info.qualname}' to fit the context window")
 
         echo("\n[Python] Snippet...\n")
-        echo(snippet)
+        echo(local_snippet)
 
         if info.kind == "class":
             prompt = (
                 "Write exactly the docstring for this class, reformatting and updating any existing comment\n"
                 "as required. Use the nested method docstrings to help but remember that they are nested so\n"
-                f"the class is abstracting over all of them:\n\n{snippet}\n"
+                f"the class is abstracting over all of them:\n\n{local_snippet}\n"
             )
         else:
             prompt = (
                 "Write exactly the docstring for this program chunk, reformatting and updating any existing\n"
-                f"comment as required:\n\n{snippet}\n"
+                f"comment as required:\n\n{local_snippet}\n"
             )
-        messages.append({"role": "user", "content": prompt})
 
+        # Ask, and nudge once if the reply is not a usable docstring (the small model sometimes parrots "OK").
+        appended = 0
+        messages.append({"role": "user", "content": prompt})
+        appended += 1
         reply = llm.generate(messages, cfg=cfg)
         echo(f"\n[Python] LLM output:\n\n{reply}")
-
-        messages.pop()
-
         docstring = extract_first_docstring(reply)
-        if not docstring:
+
+        if _is_unusable_docstring(reply, docstring):
+            messages.append({"role": "assistant", "content": reply})
+            messages.append({"role": "user", "content": DOCSTRING_NUDGE})
+            appended += 2
+            reply = llm.generate(messages, cfg=cfg)
+            echo(f"\n[Python] LLM output (after nudge):\n\n{reply}")
+            docstring = extract_first_docstring(reply)
+
+        for _ in range(appended):
+            messages.pop()
+
+        # Failure-driven escalation: if the local model still could not produce a docstring, promote the routine to the
+        # stronger model (when a manifest is active) rather than writing a useless placeholder.
+        if _is_unusable_docstring(reply, docstring):
+            if escalation is not None:
+                record_escalation(info, score, full_snippet)
+                echo(f"[Python] Promoted '{info.qualname}' to the stronger model (local docstring was unusable)")
+                continue
             docstring = f"{info.kind} `{info.qualname}` - comment generation failed."
 
         docs_by_node_id[node_id] = docstring
