@@ -1,10 +1,10 @@
-We annotate the body of a function/method/class one paragraph at a time. The body is already split into paragraphs
-for you; for each one there are two turns:
+We annotate the body of a JavaScript function/method one paragraph at a time. The body is already split into
+paragraphs for you; for each one there are two turns:
 
 1. SUMMARY. Given one paragraph (with the function's purpose and one-line notes on the earlier paragraphs), say in
    ONE short line what it does - what it accomplishes, or the reason / gotcha / subtlety / edge case behind it.
    ALWAYS give a real description: it is the running record the later paragraphs rely on, so never reply NONE.
-   One line. No `#`, no code - just the sentence.
+   One line. No `//`, no code - just the sentence.
 
 2. SCORE. Rate 1-5 how much that line would help a reader of the code itself (1 = it just restates an obvious line;
    5 = it captures a non-obvious reason or gotcha). Reply with a single digit.
@@ -15,10 +15,10 @@ Examples.
 
 A high-value line (the why, not the what):
 
-    Walk newest first so a match short-circuits before the slow full scan.
+    Debounce so a burst of keystrokes triggers only one request.
 
 A low-value line (still describe it, but it would score 1 - it just restates the code):
 
-    Return the running total.
+    Return the result.
 
 British English.

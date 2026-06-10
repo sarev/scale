@@ -738,30 +738,40 @@ def _block_provider_for(language: str):
     if language == "python":
         from scale_python import iter_block_targets
         return iter_block_targets
+    if language == "c":
+        from scale_c import iter_block_targets_c
+        return iter_block_targets_c
+    if language == "js":
+        from scale_javascript import iter_block_targets_js
+        return iter_block_targets_js
     raise NotImplementedError(
-        f"The --blocks pass does not yet support '{language}' (Python only for now)."
+        f"The --blocks pass does not yet support '{language}'."
     )
 
 
-def _block_style_for(language: str):
+def _block_style_for(language: str, comment_style: str = "line"):
     """
     Return the comment-style descriptor that drives block-comment rendering for `language`.
 
     Parameters:
     - `language`: The programming language identifier (already validated).
+    - `comment_style`: `"line"` or `"block"` - the `--block-comment-style` choice. Ignored for Python (which has
+      no block-comment syntax); for C/JS it selects `//` line comments or `/* ... */` block comments.
 
     Returns:
     - A `scale_blocks.CommentStyle` describing the language's comment delimiters.
 
     Raises:
-    - `NotImplementedError`: If the language has no block provider yet (currently only Python is wired).
+    - `NotImplementedError`: If the language has no block provider yet.
     """
 
-    from scale_blocks import PYTHON_STYLE
+    from scale_blocks import PYTHON_STYLE, SLASH_LINE_STYLE, SLASH_BLOCK_STYLE
     if language == "python":
         return PYTHON_STYLE
+    if language in ("c", "js", "javascript"):
+        return SLASH_BLOCK_STYLE if comment_style == "block" else SLASH_LINE_STYLE
     raise NotImplementedError(
-        f"The --blocks pass does not yet support '{language}' (Python only for now)."
+        f"The --blocks pass does not yet support '{language}'."
     )
 
 
@@ -789,6 +799,8 @@ def _block_pass(
     source_blob: str,
     source_lines: List[str],
     language: str,
+    comment_style: str = "line",
+    comment_value: Optional[int] = None,
     escalation=None,
 ) -> List[str]:
     """
@@ -796,8 +808,8 @@ def _block_pass(
 
     The block-pass prompt wording is loaded from `scale-cfg` so users can tune it without touching code (a missing
     file falls back to the engine's built-in default): `blocks.segment.txt`, `blocks.comment.txt`,
-    `blocks.comment.nudge.txt` (the retry nudge), and `blocks.note.short.txt` / `blocks.note.long.txt` (the short-/
-    long-routine length notes).
+    `blocks.comment.nudge.txt` (the retry nudge), `blocks.note.short.txt` / `blocks.note.long.txt` (the short-/
+    long-routine notes), and `blocks.score.txt` (the value-score turn).
 
     Parameters:
     - `llm`: The LocalChatModel instance used for generating comments.
@@ -814,7 +826,7 @@ def _block_pass(
 
     from scale_blocks import annotate_blocks
     provider = _block_provider_for(language)
-    style = _block_style_for(language)
+    style = _block_style_for(language, comment_style)
     targets = provider(source_blob, source_lines)
     return annotate_blocks(
         llm, cfg, messages, source_lines, targets, style,
@@ -823,6 +835,8 @@ def _block_pass(
         comment_nudge=_read_optional(scale_path / "blocks.comment.nudge.txt"),
         note_short=_read_optional(scale_path / "blocks.note.short.txt"),
         note_long=_read_optional(scale_path / "blocks.note.long.txt"),
+        score_prompt=_read_optional(scale_path / "blocks.score.txt"),
+        value_threshold=comment_value,
         escalation=escalation,
     )
 
@@ -840,6 +854,8 @@ def generate_comments(
     no_cache: Optional[bool] = False,
     do_comment: bool = True,
     do_blocks: bool = False,
+    block_comment_style: str = "line",
+    comment_value: Optional[int] = None,
     escalation=None,
 ) -> int:
     """
@@ -871,7 +887,7 @@ def generate_comments(
     - 0 if the operation was successful, or an error number.
 
     Notes:
-    - Supported languages are Python, JavaScript, and C (the block pass is currently Python only).
+    - Supported languages are Python, JavaScript, and C (the block pass supports all three).
     - If the destination path is not provided, the generated comments will be printed to the console.
     """
 
@@ -895,7 +911,8 @@ def generate_comments(
         messages = prime_llm_for_comments(
             llm, cfg, scale_path, src_path, source_blob, language, no_cache=no_cache, template="blocks"
         )
-        new_lines = _block_pass(llm, cfg, scale_path, messages, current_blob, new_lines, language, escalation=escalation)
+        new_lines = _block_pass(llm, cfg, scale_path, messages, current_blob, new_lines, language,
+                                comment_style=block_comment_style, comment_value=comment_value, escalation=escalation)
 
     # Write the output
     if dst_path:
@@ -945,7 +962,13 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--model", "-m", default="", help="Optional path to GGUF model file")
     p.add_argument("--output", "-o", default="", help="Optional output filename")
     p.add_argument("--comment", "-c", action="store_true", help="Add and update definition docstrings/header comments")
-    p.add_argument("--blocks", "-b", action="store_true", help="Add and update within-function block comments (Python only for now)")
+    p.add_argument("--blocks", "-b", action="store_true", help="Add and update within-function block comments (Python, C, JS)")
+    p.add_argument("--block-comment-style", default="line", choices=("line", "block"),
+                   help="Delimiter for block-pass comments in C/JS: 'line' (//) or 'block' (/* */). Ignored for Python.")
+    p.add_argument("--comment-value", type=int, default=None, metavar="N",
+                   help="Block pass: only write a paragraph comment whose model-rated value is >= N (1-5; default 3). "
+                        "Higher is stricter (6 keeps none in code; 1 keeps all). Lower-value notes still inform later "
+                        "paragraphs' context.")
     p.add_argument("--language", "-l", default=None, help="Source file language. SCALE currently supports: 'python', 'js', 'c'")
     p.add_argument("--verbose", "-v", action="store_true", help="Output progress information to stdout")
     p.add_argument("--very-verbose", "-vv", action="store_true", help="Output LLM debug information to stdout")
@@ -1108,6 +1131,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         no_cache=args.no_cache,
         do_comment=args.comment,
         do_blocks=args.blocks,
+        block_comment_style=args.block_comment_style,
+        comment_value=args.comment_value,
         escalation=escalation,
     )
 

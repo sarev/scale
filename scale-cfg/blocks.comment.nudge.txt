@@ -1,2 +1,2 @@
-Have another go at that paragraph. Even a short note on what it accomplishes, the reason behind it, a gotcha or an edge case helps a reader. Give ONE short line, or NONE only if it really is trivial.
-Bare sentence, or NONE. No #, no quotes, no list.
+Describe what that paragraph does in ONE short line - even if it is simple, say plainly what it accomplishes. Do not reply 'NONE' and do not leave it blank.
+Bare sentence. No #, no quotes, no list.

@@ -6,3 +6,6 @@ temp/*
 tests/block_eval/samples/*
 !tests/block_eval/samples/charge.py
 !tests/block_eval/samples/seats.py
+
+# C block-pass sample corpus is proprietary product source - never commit it.
+tests/c_samples/

@@ -21,6 +21,7 @@ function declarations in the source code.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from scale_blocks import BlockTarget, SegStatement, structural_breaks, SEG_MIN_LEADING_DECLS
 from scale_llm import LocalChatModel, GenerationConfig, Messages, Chunk
 from scale_log import echo
 from scale_text import fit_snippet, MARKER_C
@@ -124,6 +125,23 @@ def _row_of(point) -> int:
         return point.row  # object with .row
     except AttributeError:
         return point[0]   # tuple (row, col)
+
+
+def _col_of(point) -> int:
+    """
+    Return the 0-based column of a tree-sitter point, tolerating both the object (`.column`) and tuple (`[1]`) forms.
+
+    Parameters:
+    - `point`: The tree-sitter point to extract the column from.
+
+    Returns:
+    - The 0-based column of the point as an integer.
+    """
+
+    try:
+        return point.column  # object with .column
+    except AttributeError:
+        return point[1]      # tuple (row, col)
 
 
 def _line_span_from_node(n) -> Tuple[int, int]:
@@ -535,6 +553,305 @@ def iter_defs_with_info_c(tree, source_bytes: bytes) -> List[DefInfoC]:
     walk(root)
     # Multiple definitions due to #ifdef blocks are kept; caller may disambiguate by span.
     return sorted(results, key=lambda d: (d.start, d.end))
+
+
+# ---------------- Within-function block targets (the `-b` block pass)
+
+
+# Statements that open a brace block whose source-line span gates a paragraph break before/after it. C has no
+# nested functions, so there is no "after a def" rule and no opaque-definition handling; a bare `{ ... }` scope
+# block is treated as a block too.
+_C_BLOCK_OPENERS = {"if_statement", "for_statement", "while_statement", "do_statement", "switch_statement",
+                    "compound_statement"}
+
+
+def _named_children(n) -> List:
+    """Return the named children of a tree-sitter node as a list."""
+    return [n.named_child(i) for i in range(n.named_child_count)]
+
+
+def _is_c_statement(n) -> bool:
+    """Report whether a node is a C statement (a `declaration` or any `*_statement`), filtering out comments etc."""
+    return n.type == "declaration" or n.type.endswith("_statement")
+
+
+def _c_suite(node) -> Optional[List]:
+    """
+    Return the statement list held by a body/branch node, or None.
+
+    Unwraps an `else_clause` to the branch inside it; expands a `compound_statement` to its statement children; and
+    treats a single unbraced statement (e.g. the body of `for (...) x++;`) as a one-element suite - the analogue of
+    Python's `_sub_statement_lists` entries.
+
+    Parameters:
+    - `node`: A body/branch node (or None).
+
+    Returns:
+    - The statement list, or None if the node holds no statements.
+    """
+
+    if node is None:
+        return None
+    if node.type == "else_clause":
+        kids = _named_children(node)
+        return _c_suite(kids[0]) if kids else None
+    if node.type == "compound_statement":
+        stmts = [c for c in _named_children(node) if _is_c_statement(c)]
+        return stmts or None
+    if _is_c_statement(node):
+        return [node]
+    return None
+
+
+def _c_statement_lists(stmt) -> List[List]:
+    """
+    Return the statement lists nested directly inside a C compound statement (the analogue of Python suites).
+
+    Covers the consequence/alternative of an `if`, the body of a `for`/`while`/`do`, each `case` body of a `switch`,
+    and the contents of a bare `{ ... }` block. Used to recurse into a routine body one nesting level at a time.
+
+    Parameters:
+    - `stmt`: The statement to inspect.
+
+    Returns:
+    - A list of statement lists (empty for a simple statement).
+    """
+
+    t = stmt.type
+    lists: List[List] = []
+    if t == "if_statement":
+        for fld in ("consequence", "alternative"):
+            sl = _c_suite(stmt.child_by_field_name(fld))
+            if sl:
+                lists.append(sl)
+    elif t in ("for_statement", "while_statement", "do_statement"):
+        sl = _c_suite(stmt.child_by_field_name("body"))
+        if sl:
+            lists.append(sl)
+    elif t == "switch_statement":
+        body = stmt.child_by_field_name("body")
+        if body is not None:
+            for case in _named_children(body):
+                if case.type == "case_statement":
+                    cl = [c for c in _named_children(case) if _is_c_statement(c)]
+                    if cl:
+                        lists.append(cl)
+    elif t == "compound_statement":
+        cl = [c for c in _named_children(stmt) if _is_c_statement(c)]
+        if cl:
+            lists.append(cl)
+    return lists
+
+
+def _c_span(node) -> int:
+    """Source-line span of a node (its triviality measure for the block-size gate)."""
+    return _row_of(node.end_point) - _row_of(node.start_point) + 1
+
+
+def _c_closed_block(prev_node, resume_start: int, body_node) -> Optional[object]:
+    """
+    Return the outermost brace block that closed between `prev_node` and a dedent resuming at `resume_start`.
+
+    Climbs the parent chain from the previous statement (stopping at the routine body), keeping the outermost block
+    opener that ended before the resuming line - the tree-sitter analogue of `scale_python._seg_closed_block`.
+
+    Parameters:
+    - `prev_node`: The statement immediately before the dedent.
+    - `resume_start`: The 1-based line the dedent resumes on.
+    - `body_node`: The routine's body block (the climb stops here).
+
+    Returns:
+    - The outermost closed block node, or None if none closed.
+    """
+
+    best = None
+    n = prev_node.parent
+    while n is not None and n is not body_node:
+        if n.type in _C_BLOCK_OPENERS and _to_1based(_row_of(n.end_point)) < resume_start:
+            best = n
+        n = n.parent
+    return best
+
+
+def _collect_body_c(body_node, source_lines: Chunk) -> Tuple[List[int], Dict[int, str], List[SegStatement]]:
+    """
+    Walk a C function body, returning its legal block boundaries, their indentation, and the segmenter records.
+
+    Mirrors `scale_python._body_boundaries` + `_seg_records`: every statement is recorded at every nesting depth
+    (recursing into nested brace blocks), the first statement of an inner suite is excluded from the boundaries, and
+    a line is a boundary only if it begins exactly one (non-suite-leading) statement at its first non-blank column -
+    which naturally drops `a; b;` lines, continuation lines, and inline inner statements. The full statement list
+    (including suite-leading statements) is returned for the segmenter, which needs the body's complete shape to
+    reason about returns and dedents.
+
+    Parameters:
+    - `body_node`: The function's `compound_statement` body node.
+    - `source_lines`: The full source split into lines.
+
+    Returns:
+    - A tuple `(boundary_lines, indent_of, seg_statements)`.
+    """
+
+    line_count: Dict[int, int] = {}
+    line_col: Dict[int, int] = {}
+    recorded: List[Tuple[int, int, object, bool]] = []  # (start, depth, node, first_in_scope)
+    merge_map: Dict[int, int] = {}                       # return line -> anchor (preceding statement) line
+    force_break_lines: set = set()                       # first real statement after a leading declaration run
+
+    def walk(stmts: List, is_top: bool, depth: int) -> None:
+        """Record each statement and recurse into its nested suites, tracking depth and suite position."""
+        # A suite that is exactly `[simple_stmt, return]` is one paragraph: anchor it at the leading statement so the
+        # comment pass sees both lines (a return alone gives it nothing to describe).
+        if (len(stmts) == 2 and stmts[1].type == "return_statement"
+                and stmts[0].type not in _C_BLOCK_OPENERS):
+            a = _to_1based(_row_of(stmts[0].start_point))
+            r = _to_1based(_row_of(stmts[1].start_point))
+            if a != r:
+                merge_map[r] = a
+        # Leading-declaration heuristic: a scope opening with a run of declarations gets its first real statement
+        # paragraphed off, so the declarations read as their own block (a `return` first statement is left to the
+        # merge / trailing-return rules).
+        ndecl = 0
+        while ndecl < len(stmts) and stmts[ndecl].type == "declaration":
+            ndecl += 1
+        if ndecl >= SEG_MIN_LEADING_DECLS and ndecl < len(stmts) and stmts[ndecl].type != "return_statement":
+            force_break_lines.add(_to_1based(_row_of(stmts[ndecl].start_point)))
+        for idx, stmt in enumerate(stmts):
+            skip = (not is_top) and idx == 0  # the first line of an inner suite is never a block start
+            start = _to_1based(_row_of(stmt.start_point))
+            if not skip:
+                line_count[start] = line_count.get(start, 0) + 1
+                line_col[start] = _col_of(stmt.start_point)
+            recorded.append((start, depth, stmt, is_top and idx == 0))
+            for sub in _c_statement_lists(stmt):
+                walk(sub, False, depth + 1)
+
+    top_stmts = [c for c in _named_children(body_node) if _is_c_statement(c)]
+    walk(top_stmts, True, 0)
+
+    # Boundary lines: exactly one statement start, at the line's first non-blank column.
+    boundary_lines: List[int] = []
+    indent_of: Dict[int, str] = {}
+    for line, count in line_count.items():
+        if count != 1 or not (1 <= line <= len(source_lines)):
+            continue
+        text = source_lines[line - 1]
+        if text[: line_col[line]].strip() != "":
+            continue
+        indent_of[line] = text[: len(text) - len(text.lstrip())]
+        boundary_lines.append(line)
+
+    # A `[stmt; return]` anchor is the first statement of its suite (normally excluded); make it an addressable
+    # boundary so the merged paragraph can be commented there.
+    for anchor in set(merge_map.values()):
+        if 1 <= anchor <= len(source_lines) and anchor not in indent_of:
+            text = source_lines[anchor - 1]
+            indent_of[anchor] = text[: len(text) - len(text.lstrip())]
+            boundary_lines.append(anchor)
+    boundary_lines.sort()
+
+    # Segmenter records, in source order, with depth/return/block-span/dedent annotations.
+    recorded.sort(key=lambda r: r[0])
+    seg_statements: List[SegStatement] = []
+    for i, (start, depth, node, first_in_scope) in enumerate(recorded):
+        end = _to_1based(_row_of(node.end_point))
+        opens = _c_span(node) if node.type in _C_BLOCK_OPENERS else 0
+        closed = 0
+        if i > 0 and recorded[i - 1][1] > depth:
+            blk = _c_closed_block(recorded[i - 1][2], start, body_node)
+            closed = _c_span(blk) if blk is not None else 0
+        seg_statements.append(SegStatement(
+            start=start, end=end, depth=depth,
+            is_return=node.type == "return_statement", is_def=False,
+            opens_block=opens, first_in_scope=first_in_scope, closed_block=closed,
+            merge_anchor=merge_map.get(start) if node.type == "return_statement" else None,
+            force_break=start in force_break_lines,
+        ))
+
+    return boundary_lines, indent_of, seg_statements
+
+
+def _doc_above_header(source_lines: Chunk, header_start: int) -> str:
+    """
+    Return the documentation text of the comment block immediately above a function header (or "" if there is none).
+
+    This is the C analogue of Python's `ast.get_docstring`: the block provider parses the (possibly def-pass-
+    annotated) source, so the `/* ... */` or `//` doc block the definition pass wrote above the function is read
+    back here and fed to the block-comment pass as the routine's purpose - giving C the same per-routine context
+    Python gets from a docstring.
+
+    Parameters:
+    - `source_lines`: The source split into lines (the same text the provider parses).
+    - `header_start`: The 1-based line of the function header.
+
+    Returns:
+    - The doc text with comment delimiters/gutters stripped, or "" when no comment block sits above the header.
+    """
+
+    rng = _scan_existing_comment_block_above(source_lines, header_start)
+    if rng is None:
+        return ""
+    s, e = rng
+    block = "\n".join(source_lines[s - 1:e])
+    if "/*" in block:
+        return _extract_first_c_comment_block(block)
+    # A `//` run: strip the leading slashes from each line.
+    return "\n".join(ln.strip()[2:].strip() if ln.strip().startswith("//") else ln.strip()
+                     for ln in block.split("\n")).strip()
+
+
+def iter_block_targets_c(source_blob: str, source_lines: Chunk) -> List[BlockTarget]:
+    """
+    Build the within-function block targets for a C source file.
+
+    Each function body becomes one `BlockTarget` carrying its header/body line spans, the lines that may legally
+    begin a block, and the deterministic structural segmentation (so the block pass needs no model to segment). This
+    is the C implementation of the language-agnostic provider interface consumed by `scale_blocks.annotate_blocks`.
+    C has no nested functions, so the after-def / first-in-scope (post-docstring) rules are disabled.
+
+    Parameters:
+    - `source_blob`: The complete source text (parsed with Tree-sitter C).
+    - `source_lines`: The same source split into individual lines.
+
+    Returns:
+    - A list of `BlockTarget`, one per function, in source order.
+    """
+
+    tree, source_bytes = _parse_c(source_blob)
+    targets: List[BlockTarget] = []
+
+    for info in iter_defs_with_info_c(tree, source_bytes):
+        body_node = info.node.child_by_field_name("body")
+        if body_node is None or body_node.type != "compound_statement":
+            continue
+
+        boundary_lines, indent_of, seg_statements = _collect_body_c(body_node, source_lines)
+        top_stmts = [c for c in _named_children(body_node) if _is_c_statement(c)]
+        if not top_stmts:
+            continue
+        body_start = _to_1based(_row_of(top_stmts[0].start_point))
+
+        segments = structural_breaks(
+            seg_statements, has_doc=False, boundary_lines=tuple(boundary_lines), body_end=info.end,
+            allow_after_def=False, allow_first_in_scope=False,
+        )
+        targets.append(
+            BlockTarget(
+                qualname=info.qualname,
+                kind="function",
+                header_start=info.header_start,
+                header_end=info.header_end,
+                body_start=body_start,
+                body_end=info.end,
+                boundary_lines=tuple(boundary_lines),
+                indent_of=indent_of,
+                depth=0,
+                doc=_doc_above_header(source_lines, info.header_start),
+                segments=segments,
+            )
+        )
+
+    return targets
 
 
 # ---------------- Snippet assembly

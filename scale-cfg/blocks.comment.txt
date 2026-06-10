@@ -1,13 +1,11 @@
 Function `{qualname}` does: {doc}
 
-{length_note}
-
-Comments already written for earlier paragraphs of it:
+One-line notes on the earlier paragraphs of its body (your running context):
 {priors}
 
 Here is the NEXT paragraph of its body:
 
 {block}
 
-Give ONE short, useful comment for this paragraph - what this group of lines accomplishes, or the reason / gotcha / subtlety / edge case behind it - the kind of line that helps a reader scan the function. Avoid trivially restating a single obvious line. Reply NONE only if the paragraph is truly trivial.
-Bare sentence, or NONE. No #, no quotes, no list.
+In ONE short line, say what this paragraph does - what it accomplishes, or the reason / gotcha / subtlety / edge case behind it. Always give a real description (later paragraphs rely on it); never reply 'NONE' or leave it blank.
+Bare sentence. No #, no quotes, no list.

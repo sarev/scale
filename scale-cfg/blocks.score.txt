@@ -1,0 +1,9 @@
+{length_note}
+
+How much would that one-line note help a reader of the code, placed as a comment above this paragraph?
+  1 - noise (it just restates one obvious line)
+  2 - marginal
+  3 - useful section heading
+  4 - valuable (a non-obvious reason, or what a block achieves)
+  5 - essential (a gotcha or subtlety a reader would otherwise miss)
+Reply with a single digit 1-5 and nothing else.

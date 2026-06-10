@@ -43,7 +43,7 @@ and aligned with the actual code structure.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from scale_blocks import BlockTarget
+from scale_blocks import BlockTarget, SegStatement, structural_breaks
 from scale_llm import LocalChatModel, GenerationConfig, Messages, Chunk
 from scale_log import echo
 from scale_text import fit_snippet, summarise, LENGTH_LINE, MARKER_PYTHON, PRIMING_ACK
@@ -1303,17 +1303,58 @@ def _seg_closed_block(prev_node: ast.AST, resume_start: int, parents: Dict[int, 
     return best
 
 
+def _seg_merge_anchors(node: ast.AST) -> Dict[int, int]:
+    """
+    Map each trailing-return line to its anchor line for every `[simple_stmt, return]` suite in a routine body.
+
+    A suite that is exactly two statements ending in `return`, whose first statement is simple (not a compound or a
+    nested def), is a single paragraph anchored at that first statement - so the comment pass sees the statement the
+    return depends on, not a bare `return`. Recurses into nested suites (but not into nested defs), skipping a
+    leading docstring, mirroring the boundary/record walks.
+
+    Parameters:
+    - `node`: The function/async-function/class definition node whose body is scanned.
+
+    Returns:
+    - A dict mapping each such return's line to its preceding statement's (anchor) line.
+    """
+
+    anchors: Dict[int, int] = {}
+
+    def visit(stmts: List[ast.AST]) -> None:
+        """Record a merge anchor for a two-statement `[simple, return]` suite, then recurse into nested suites."""
+        if (len(stmts) == 2 and isinstance(stmts[1], ast.Return)
+                and not isinstance(stmts[0], _SEG_COMPOUND)):
+            a, r = stmts[0].lineno, stmts[1].lineno
+            if a != r:
+                anchors[r] = a
+        for stmt in stmts:
+            if _is_def_node(stmt):
+                continue
+            for sub in _sub_statement_lists(stmt):
+                visit(sub)
+
+    body = list(getattr(node, "body", []))
+    if body and _is_docstring_stmt(body[0]):
+        body = body[1:]
+    visit(body)
+    return anchors
+
+
 def structural_segments(node: ast.AST, source_lines: Chunk, boundary_lines: List[int],
                         body_end: int) -> List[Tuple[int, int]]:
     """
-    Deterministically segment a routine body into paragraph chunks (the structural replacement for LLM segmentation).
+    Deterministically segment a Python routine body into paragraph chunks (the structural replacement for LLM
+    segmentation).
 
-    Returns `(start, end)` ranges - the same shape `scale_blocks.request_segments` produces - where each `start` is a
-    legal boundary line that should be prefixed with a paragraph break. The rules (Steve's stated conventions): a blank
-    after the docstring (only when one exists); after a nested def/class (it clearly ends a paragraph - ungated); before
-    a `return` whose preceding statement is at the same indent; before a compound / nested-def block of at least
-    `_SEG_MIN_BLOCK_LINES` lines; and resuming after such a block closes (a dedent). Breaks are only ever placed at
-    `boundary_lines`, so the segmenter can never split mid-statement.
+    This is the Python adapter for the shared, language-agnostic rule engine `scale_blocks.structural_breaks`: it
+    flattens the body into `SegStatement` records (using CPython `ast`) and hands them to that engine, which places
+    the paragraph breaks. Keeping the rules in `structural_breaks` means C/JS share the exact same logic. The depth
+    field is the source column (an order-preserving nesting proxy), so the engine's depth comparisons reproduce the
+    original indent-based behaviour. Python enables both `allow_*` rules (it has in-body docstrings and nested defs).
+
+    Returns `(start, end)` ranges - the same shape `scale_blocks.request_segments` produces - each starting at a
+    legal boundary line, so the segmenter can never split mid-statement.
     """
     records = _seg_records(node, source_lines)
     if not records:
@@ -1324,31 +1365,30 @@ def structural_segments(node: ast.AST, source_lines: Chunk, boundary_lines: List
         for c in ast.iter_child_nodes(n):
             parents[id(c)] = n
 
-    legal = set(boundary_lines)
     body = list(getattr(node, "body", []))
     has_doc = bool(body and _is_docstring_stmt(body[0]))
+    merge = _seg_merge_anchors(node)
 
-    breaks: set = set()
+    stmts: List[SegStatement] = []
     for i, (start, indent, stmt, _first_of_suite, first_in_scope) in enumerate(records):
-        if start not in legal:
-            continue
+        end = getattr(stmt, "end_lineno", start) or start
+        opens = _seg_span(stmt) if isinstance(stmt, _SEG_COMPOUND) else 0
         prev = records[i - 1] if i > 0 else None
-        if first_in_scope:
-            if has_doc:
-                breaks.add(start)                    # blank separating docstring from the first statement
-        elif prev is not None and _is_def_node(prev[2]):
-            breaks.add(start)                        # blank after a nested def/method - it clearly ends a paragraph
-        elif isinstance(stmt, ast.Return) and prev is not None and prev[1] == indent:
-            breaks.add(start)                        # paragraph a trailing return off from the body above it
-        elif isinstance(stmt, _SEG_COMPOUND) and _seg_span(stmt) >= _SEG_MIN_BLOCK_LINES:
-            breaks.add(start)                        # a substantial block opens a new paragraph
-        elif prev is not None and prev[1] > indent:
+        closed = 0
+        if prev is not None and prev[1] > indent:
             blk = _seg_closed_block(prev[2], start, parents, node)
-            if blk is None or _seg_span(blk) >= _SEG_MIN_BLOCK_LINES:
-                breaks.add(start)                    # resuming after a substantial nested block closed
+            closed = _seg_span(blk) if blk is not None else 0
+        stmts.append(SegStatement(
+            start=start, end=end, depth=indent,
+            is_return=isinstance(stmt, ast.Return), is_def=_is_def_node(stmt),
+            opens_block=opens, first_in_scope=first_in_scope, closed_block=closed,
+            merge_anchor=merge.get(start) if isinstance(stmt, ast.Return) else None,
+        ))
 
-    starts = sorted(breaks)
-    return [(s, (starts[j + 1] - 1) if j + 1 < len(starts) else body_end) for j, s in enumerate(starts)]
+    return structural_breaks(
+        stmts, has_doc=has_doc, boundary_lines=tuple(boundary_lines), body_end=body_end,
+        min_block_lines=_SEG_MIN_BLOCK_LINES, allow_after_def=True, allow_first_in_scope=True,
+    )
 
 
 def iter_block_targets(source_blob: str, source_lines: Chunk) -> List[BlockTarget]:
@@ -1376,6 +1416,16 @@ def iter_block_targets(source_blob: str, source_lines: Chunk) -> List[BlockTarge
             continue
 
         boundary_lines, indent_of = _body_boundaries(info.node, source_lines)
+
+        # A `[stmt; return]` anchor is the first statement of its suite (normally excluded as a suite's first line);
+        # make it an addressable boundary so the merged paragraph can be commented there.
+        for anchor in set(_seg_merge_anchors(info.node).values()):
+            if 1 <= anchor <= len(source_lines) and anchor not in indent_of:
+                text = source_lines[anchor - 1]
+                indent_of[anchor] = text[: len(text) - len(text.lstrip())]
+                boundary_lines.append(anchor)
+        boundary_lines = sorted(boundary_lines)
+
         targets.append(
             BlockTarget(
                 qualname=info.qualname,

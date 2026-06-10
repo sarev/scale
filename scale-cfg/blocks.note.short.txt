@@ -1,1 +1,1 @@
-This is a short routine, so its docstring largely covers it: reply NONE unless the paragraph adds something not already clear from the docstring and the code itself.
+This is a short routine - its docstring and code already make it clear, so score strictly: reserve 3+ for a note that genuinely adds something not obvious from the code itself.

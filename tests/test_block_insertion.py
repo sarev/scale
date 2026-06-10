@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import scale_blocks  # noqa: E402
-from scale_blocks import BlockTarget, PYTHON_STYLE, apply_blocks, code_preserved  # noqa: E402
+from scale_blocks import BlockTarget, PYTHON_STYLE, SLASH_LINE_STYLE, apply_blocks, code_preserved  # noqa: E402
 
 
 def _target(boundary_lines, body_end):
@@ -77,6 +77,17 @@ def main():
     out4 = apply_blocks(src, target, [(2, "first"), (4, "third")], PYTHON_STYLE)
     assert "    # first" in out4 and "    # third" in out4, "all chosen boundaries get comments"
     assert _code(out4) == _code(src), "code lines must be unchanged across multiple edits"
+
+    # ---- 5b. Line-comment language (C/JS `//`): the generic patcher renders and preserves correctly ----
+    csrc = ["void f() {", "    int a = 1;", "    int b = 2;", "}"]
+    ctarget = _target([2, 3], body_end=4)
+    cout = apply_blocks(csrc, ctarget, [(3, "second step")], SLASH_LINE_STYLE)
+    assert "    // second step" in cout, "a `//` comment should be inserted at the boundary indent"
+    cci = cout.index("    // second step")
+    assert cout[cci - 1] == "" and cout[cci + 1] == "    int b = 2;", "blank above, comment directly over its line"
+    ccode = [ln for ln in cout if ln.strip() and not ln.lstrip().startswith("//")]
+    assert ccode == [ln for ln in csrc if ln.strip()], "C code lines must be unchanged"
+    assert code_preserved(csrc, cout, SLASH_LINE_STYLE), "the guard must pass for the `//` edit"
 
     # ---- 5. Safety guard: code-altering edit is rejected, original kept ----
     assert code_preserved(src, out, PYTHON_STYLE), "valid edit must pass the guard"

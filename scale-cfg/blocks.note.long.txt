@@ -1,1 +1,1 @@
-This is a longer routine: a brief one-line heading that walks the reader through this paragraph is welcome, even if it lightly echoes the docstring.
+This is a longer routine - a good section heading earns its place, so score generously when the note helps a reader navigate the body, even if it lightly echoes the docstring.

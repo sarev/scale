@@ -39,6 +39,7 @@ insert or replace existing comment blocks above headers, resulting in an updated
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from scale_blocks import BlockTarget, SegStatement, structural_breaks, SEG_MIN_LEADING_DECLS
 from scale_llm import LocalChatModel, GenerationConfig, Messages, Chunk
 from scale_log import echo
 from scale_text import fit_snippet, MARKER_JS
@@ -285,6 +286,22 @@ def _row_of(point) -> int:
         return point.row            # object with .row
     except AttributeError:
         return point[0]             # tuple (row, column)
+
+
+def _col_of(point) -> int:
+    """
+    Return the 0-based column from a tree-sitter point, tolerating both the object (`.column`) and tuple (`[1]`) forms.
+
+    Parameters:
+    - `point`: The tree-sitter point from which to extract the column.
+
+    Returns:
+    - The 0-based column of the point as an integer.
+    """
+    try:
+        return point.column         # object with .column
+    except AttributeError:
+        return point[1]             # tuple (row, column)
 
 
 # ---- Import discovery (ESM + CommonJS) -------------------------------------
@@ -793,6 +810,353 @@ def iter_defs_with_info_js(tree, source_bytes: bytes) -> List[DefInfoJS]:
         completed.append(replace(info, children_ids=kids))
 
     return sorted(completed, key=lambda d: d.start)
+
+
+# ---- Within-function block targets (the `-b` block pass) --------------------
+
+
+# Statements that open a brace block whose source-line span gates a paragraph break before/after it. Nested
+# definitions also open a block (a substantial nested def earns a break before it, and one after it - see the
+# after-def rule), but they are opaque: the walk records them as a single boundary and does not descend.
+_JS_BLOCK_OPENERS = {"if_statement", "for_statement", "for_in_statement", "while_statement", "do_statement",
+                     "try_statement", "switch_statement", "statement_block"}
+_JS_FUNCTION_VALUES = {"arrow_function", "function", "function_expression", "generator_function"}
+
+
+def _named_children(n) -> List:
+    """Return the named children of a tree-sitter node as a list."""
+    return [n.named_child(i) for i in range(n.named_child_count)]
+
+
+def _is_js_statement(n) -> bool:
+    """Report whether a node is a JS statement (`*_statement`, `*_declaration`, or a bare `{ }` block)."""
+    t = n.type
+    return t.endswith("_statement") or t.endswith("_declaration") or t == "statement_block"
+
+
+def _js_is_def_stmt(node) -> bool:
+    """
+    Report whether a body statement introduces a nested definition (so it is opaque to the parent's block pass).
+
+    Covers `function`/`class` declarations and a `const`/`let`/`var` whose initialiser is a function or arrow - the
+    same constructs `iter_defs_with_info_js` treats as their own routines. Such a statement is one boundary and is
+    not descended into; its body is annotated when it is processed as its own target.
+
+    Parameters:
+    - `node`: The statement node to test.
+
+    Returns:
+    - True if the statement is or introduces a nested definition.
+    """
+
+    if node.type in ("function_declaration", "generator_function_declaration", "class_declaration"):
+        return True
+    if node.type in ("lexical_declaration", "variable_declaration"):
+        for d in _named_children(node):
+            if d.type == "variable_declarator":
+                val = _node_field(d, "value")
+                if val is not None and val.type in _JS_FUNCTION_VALUES:
+                    return True
+    return False
+
+
+def _js_suite(node) -> Optional[List]:
+    """
+    Return the statement list held by a body/branch node, or None.
+
+    Unwraps an `else_clause` to the branch inside it; expands a `statement_block` to its statement children; and
+    treats a single unbraced statement (e.g. `if (x) return;`) as a one-element suite.
+
+    Parameters:
+    - `node`: A body/branch node (or None).
+
+    Returns:
+    - The statement list, or None if the node holds no statements.
+    """
+
+    if node is None:
+        return None
+    if node.type == "else_clause":
+        kids = _named_children(node)
+        return _js_suite(kids[0]) if kids else None
+    if node.type == "statement_block":
+        stmts = [c for c in _named_children(node) if _is_js_statement(c)]
+        return stmts or None
+    if _is_js_statement(node):
+        return [node]
+    return None
+
+
+def _js_statement_lists(stmt) -> List[List]:
+    """
+    Return the statement lists nested directly inside a JS compound statement (the analogue of Python suites).
+
+    Covers an `if`'s consequence/alternative, a loop body, a `try`'s block / catch / finally, each `case`/`default`
+    of a `switch`, and the contents of a bare `{ }` block. Nested definitions are handled by the caller (opaque), so
+    they are not expanded here.
+
+    Parameters:
+    - `stmt`: The statement to inspect.
+
+    Returns:
+    - A list of statement lists (empty for a simple statement).
+    """
+
+    t = stmt.type
+    lists: List[List] = []
+    if t == "if_statement":
+        for fld in ("consequence", "alternative"):
+            sl = _js_suite(_node_field(stmt, fld))
+            if sl:
+                lists.append(sl)
+    elif t in ("for_statement", "for_in_statement", "while_statement", "do_statement"):
+        sl = _js_suite(_node_field(stmt, "body"))
+        if sl:
+            lists.append(sl)
+    elif t == "try_statement":
+        for fld in ("body", "handler", "finalizer"):
+            node = _node_field(stmt, fld)
+            if node is None:
+                continue
+            if node.type in ("catch_clause", "finally_clause"):
+                node = _node_field(node, "body")
+            sl = _js_suite(node)
+            if sl:
+                lists.append(sl)
+    elif t == "switch_statement":
+        body = _node_field(stmt, "body")
+        if body is not None:
+            for case in _named_children(body):
+                if case.type in ("switch_case", "switch_default"):
+                    cl = [c for c in _named_children(case) if _is_js_statement(c)]
+                    if cl:
+                        lists.append(cl)
+    elif t == "statement_block":
+        cl = [c for c in _named_children(stmt) if _is_js_statement(c)]
+        if cl:
+            lists.append(cl)
+    return lists
+
+
+def _is_js_decl(node) -> bool:
+    """Report whether a node is a plain variable declaration (a `let`/`const`/`var` that is not a function binding)."""
+    return node.type in ("lexical_declaration", "variable_declaration") and not _js_is_def_stmt(node)
+
+
+def _js_span(node) -> int:
+    """Source-line span of a node (its triviality measure for the block-size gate)."""
+    return _row_of(node.end_point) - _row_of(node.start_point) + 1
+
+
+def _js_opens_block(node) -> int:
+    """Return the block span this statement opens (control block or nested def), or 0 if it opens none."""
+    if node.type in _JS_BLOCK_OPENERS or _js_is_def_stmt(node):
+        return _js_span(node)
+    return 0
+
+
+def _js_closed_block(prev_node, resume_start: int, body_node) -> Optional[object]:
+    """Return the outermost brace block that closed between `prev_node` and a dedent resuming at `resume_start`."""
+    best = None
+    n = prev_node.parent
+    while n is not None and n is not body_node:
+        if (n.type in _JS_BLOCK_OPENERS or _js_is_def_stmt(n)) and _to_1based(_row_of(n.end_point)) < resume_start:
+            best = n
+        n = n.parent
+    return best
+
+
+def _js_body_block(node):
+    """Return the `statement_block` body of a function-like def node (or None for an expression-bodied arrow)."""
+    b = _node_field(node, "body")
+    if b is not None and b.type == "statement_block":
+        return b
+    val = _node_field(node, "value")
+    if val is not None:
+        b = _node_field(val, "body")
+        if b is not None and b.type == "statement_block":
+            return b
+    return None
+
+
+def _collect_body_js(body_node, source_lines: Chunk) -> Tuple[List[int], Dict[int, str], List[SegStatement]]:
+    """
+    Walk a JS function body, returning its legal block boundaries, their indentation, and the segmenter records.
+
+    Mirrors `scale_python._body_boundaries` + `_seg_records`: every statement is recorded at every nesting depth
+    (recursing into nested brace blocks but treating a nested definition as one opaque boundary), the first
+    statement of an inner suite is excluded from the boundaries, and a line is a boundary only if it begins exactly
+    one (non-suite-leading) statement at its first non-blank column - which drops `a; b;`, continuation lines, and
+    inline inner statements.
+
+    Parameters:
+    - `body_node`: The function's `statement_block` body node.
+    - `source_lines`: The full source split into lines.
+
+    Returns:
+    - A tuple `(boundary_lines, indent_of, seg_statements)`.
+    """
+
+    line_count: Dict[int, int] = {}
+    line_col: Dict[int, int] = {}
+    recorded: List[Tuple[int, int, object, bool]] = []  # (start, depth, node, first_in_scope)
+    merge_map: Dict[int, int] = {}                       # return line -> anchor (preceding statement) line
+    force_break_lines: set = set()                       # first real statement after a leading declaration run
+
+    def walk(stmts: List, is_top: bool, depth: int) -> None:
+        """Record each statement and recurse into its nested suites; nested definitions are opaque (not descended)."""
+        # A suite that is exactly `[simple_stmt, return]` is one paragraph: anchor it at the leading statement so the
+        # comment pass sees both lines (a return alone gives it nothing to describe).
+        if (len(stmts) == 2 and stmts[1].type == "return_statement"
+                and stmts[0].type not in _JS_BLOCK_OPENERS and not _js_is_def_stmt(stmts[0])):
+            a = _to_1based(_row_of(stmts[0].start_point))
+            r = _to_1based(_row_of(stmts[1].start_point))
+            if a != r:
+                merge_map[r] = a
+        # Leading-declaration heuristic: a scope opening with a run of `let`/`const`/`var` declarations gets its first
+        # real statement paragraphed off, so the declarations read as their own block.
+        ndecl = 0
+        while ndecl < len(stmts) and _is_js_decl(stmts[ndecl]):
+            ndecl += 1
+        if ndecl >= SEG_MIN_LEADING_DECLS and ndecl < len(stmts) and stmts[ndecl].type != "return_statement":
+            force_break_lines.add(_to_1based(_row_of(stmts[ndecl].start_point)))
+        for idx, stmt in enumerate(stmts):
+            skip = (not is_top) and idx == 0  # the first line of an inner suite is never a block start
+            start = _to_1based(_row_of(stmt.start_point))
+            if not skip:
+                line_count[start] = line_count.get(start, 0) + 1
+                line_col[start] = _col_of(stmt.start_point)
+            recorded.append((start, depth, stmt, is_top and idx == 0))
+            if _js_is_def_stmt(stmt):
+                continue
+            for sub in _js_statement_lists(stmt):
+                walk(sub, False, depth + 1)
+
+    top_stmts = [c for c in _named_children(body_node) if _is_js_statement(c)]
+    walk(top_stmts, True, 0)
+
+    boundary_lines: List[int] = []
+    indent_of: Dict[int, str] = {}
+    for line, count in line_count.items():
+        if count != 1 or not (1 <= line <= len(source_lines)):
+            continue
+        text = source_lines[line - 1]
+        if text[: line_col[line]].strip() != "":
+            continue
+        indent_of[line] = text[: len(text) - len(text.lstrip())]
+        boundary_lines.append(line)
+
+    # A `[stmt; return]` anchor is the first statement of its suite (normally excluded); make it an addressable
+    # boundary so the merged paragraph can be commented there.
+    for anchor in set(merge_map.values()):
+        if 1 <= anchor <= len(source_lines) and anchor not in indent_of:
+            text = source_lines[anchor - 1]
+            indent_of[anchor] = text[: len(text) - len(text.lstrip())]
+            boundary_lines.append(anchor)
+    boundary_lines.sort()
+
+    recorded.sort(key=lambda r: r[0])
+    seg_statements: List[SegStatement] = []
+    for i, (start, depth, node, first_in_scope) in enumerate(recorded):
+        end = _to_1based(_row_of(node.end_point))
+        closed = 0
+        if i > 0 and recorded[i - 1][1] > depth:
+            blk = _js_closed_block(recorded[i - 1][2], start, body_node)
+            closed = _js_span(blk) if blk is not None else 0
+        seg_statements.append(SegStatement(
+            start=start, end=end, depth=depth,
+            is_return=node.type == "return_statement", is_def=_js_is_def_stmt(node),
+            opens_block=_js_opens_block(node), first_in_scope=first_in_scope, closed_block=closed,
+            merge_anchor=merge_map.get(start) if node.type == "return_statement" else None,
+            force_break=start in force_break_lines,
+        ))
+
+    return boundary_lines, indent_of, seg_statements
+
+
+def _doc_above_header_js(source_lines: Chunk, header_start: int) -> str:
+    """
+    Return the documentation text of the comment block immediately above a definition header (or "" if none).
+
+    The JS analogue of Python's `ast.get_docstring`: the block provider parses the (possibly def-pass-annotated)
+    source, so the JSDoc / `//` block the definition pass wrote above the routine is read back here and fed to the
+    block-comment pass as the routine's purpose - giving JS the same per-routine context Python gets from a docstring.
+
+    Parameters:
+    - `source_lines`: The source split into lines (the same text the provider parses).
+    - `header_start`: The 1-based line of the definition header.
+
+    Returns:
+    - The doc text with comment delimiters/gutters stripped, or "" when no comment block sits above the header.
+    """
+
+    rng = _scan_existing_comment_block_above(source_lines, header_start)
+    if rng is None:
+        return ""
+    s, e = rng
+    block = "\n".join(source_lines[s - 1:e])
+    if "/*" in block:
+        return _extract_first_comment_block(block)
+    # A `//` run: strip the leading slashes from each line.
+    return "\n".join(ln.strip()[2:].strip() if ln.strip().startswith("//") else ln.strip()
+                     for ln in block.split("\n")).strip()
+
+
+def iter_block_targets_js(source_blob: str, source_lines: Chunk) -> List[BlockTarget]:
+    """
+    Build the within-function block targets for a JavaScript source file.
+
+    Each function, method, and function/arrow-valued binding with a brace body becomes one `BlockTarget` carrying
+    its header/body line spans, the lines that may legally begin a block, and the deterministic structural
+    segmentation. Class bodies (which hold member definitions, not statements) are skipped - their methods are
+    targeted individually. Nested definitions are opaque within a parent and annotated as their own targets, so JS
+    keeps the after-def paragraph rule (unlike C). This is the JS implementation of the provider interface consumed
+    by `scale_blocks.annotate_blocks`.
+
+    Parameters:
+    - `source_blob`: The complete source text (parsed with Tree-sitter JavaScript).
+    - `source_lines`: The same source split into individual lines.
+
+    Returns:
+    - A list of `BlockTarget`, one per routine body, in source order.
+    """
+
+    tree, source_bytes = _parse_js(source_blob)
+    targets: List[BlockTarget] = []
+
+    for info in iter_defs_with_info_js(tree, source_bytes):
+        body_node = _js_body_block(info.node)
+        if body_node is None:
+            continue
+
+        boundary_lines, indent_of, seg_statements = _collect_body_js(body_node, source_lines)
+        top_stmts = [c for c in _named_children(body_node) if _is_js_statement(c)]
+        if not top_stmts:
+            continue
+        body_start = _to_1based(_row_of(top_stmts[0].start_point))
+        body_end = _to_1based(_row_of(body_node.end_point))
+
+        segments = structural_breaks(
+            seg_statements, has_doc=False, boundary_lines=tuple(boundary_lines), body_end=body_end,
+            allow_after_def=True, allow_first_in_scope=False,
+        )
+        targets.append(
+            BlockTarget(
+                qualname=info.qualname,
+                kind=info.kind,
+                header_start=info.header_start,
+                header_end=info.header_end,
+                body_start=body_start,
+                body_end=body_end,
+                boundary_lines=tuple(boundary_lines),
+                indent_of=indent_of,
+                depth=info.depth,
+                doc=_doc_above_header_js(source_lines, info.header_start),
+                segments=segments,
+            )
+        )
+
+    return targets
 
 
 # ---- Depth order -------------------------------------------------------------

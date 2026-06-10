@@ -53,22 +53,23 @@ ELISION_BAND = "« {n} lines elided »"
 # warnings) and discourages the model from rambling into a multi-line "what the code does" list.
 SEGMENT_REPLY_TOKENS = 256
 COMMENT_REPLY_TOKENS = 200
+SCORE_REPLY_TOKENS = 8        # the value turn replies with a single digit
 
 
-# Sampling for the two block-pass turns, overriding the run-wide config (the global default suits the definition pass).
-# Segmenting the body is a structural decision, so it is fully deterministic; comment prose uses a low temperature -
-# enough to read naturally, low enough to stay precise and avoid the all-NONE / restatement drift seen at higher
-# temperatures during tuning.
+# Sampling for the block-pass turns, overriding the run-wide config (the global default suits the definition pass).
+# Segmenting the body and scoring a comment's value are decisions, so they are fully deterministic; comment prose uses
+# a low temperature - enough to read naturally, low enough to stay precise and avoid restatement drift.
 SEGMENT_TEMPERATURE = 0.0
 COMMENT_TEMPERATURE = 0.1
+SCORE_TEMPERATURE = 0.0
 
 
 # Per-turn prompt defaults, kept terse on purpose (the local model has a small context window). These are the built-in
-# fallbacks; the CLI normally overrides them with the user-editable `scale-cfg/blocks.segment.txt` and
-# `blocks.comment.txt`. Placeholders are filled by simple substitution (`_fill`), so a prompt may use any of:
-# `{kind}`, `{qualname}` (both); `{view}` (segment - the numbered body); `{doc}` (function summary), `{priors}` (the
-# comments already written for earlier paragraphs of this routine), `{block}` (comment - the paragraph's own lines).
-# Other braces in the text are left untouched.
+# fallbacks; the CLI normally overrides them with the user-editable `scale-cfg/blocks.segment.txt`,
+# `blocks.comment.txt` and `blocks.score.txt`. Placeholders are filled by simple substitution (`_fill`), so a prompt
+# may use any of: `{kind}`, `{qualname}` (any turn); `{view}` (segment - the numbered body); `{doc}` (function
+# summary), `{priors}` (one-line notes on earlier paragraphs), `{block}` (comment - the paragraph's own lines);
+# `{length_note}` (score - the short/long strictness hint). Other braces in the text are left untouched.
 #
 # The segment prompt asks for line RANGES, not split points: framing the task as "group related lines into chunks"
 # stops the weak model hyper-focusing on breaking up individual lines (which over-segments). Each chunk's start is
@@ -80,45 +81,63 @@ SEGMENT_PROMPT = (
     "every line.\n\n"
     "{view}\n"
 )
-# The comment prompt sees ONE paragraph at a time with only light context - the function's purpose and the comments
-# already written for earlier paragraphs (the file overview is already in the primed conversation). This keeps the
-# model focused on the paragraph rather than re-judging the whole function, and the running comments give a narrative
-# thread (and stop it repeating itself). The bias is to comment: NONE only for the genuinely self-evident.
+# Two model turns annotate each paragraph. TURN 1 (the comment/summary) sees ONE paragraph with only light context -
+# the function's purpose and one-line notes on the earlier paragraphs (the file overview is already primed). It must
+# ALWAYS describe what the paragraph does in one line - never an opt-out. That line plays two roles: a candidate code
+# comment, and the running record (`priors`) every later paragraph depends on, so the model is never left guessing
+# what an earlier (uncommented) paragraph did - the gap that used to drive hallucinations.
 COMMENT_PROMPT = (
     "Function `{qualname}` does: {doc}\n\n"
-    "{length_note}\n\n"
-    "Comments already written for earlier paragraphs of it:\n{priors}\n\n"
+    "One-line notes on the earlier paragraphs of its body (your running context):\n{priors}\n\n"
     "Here is the NEXT paragraph of its body:\n\n{block}\n\n"
-    "Give ONE short, useful comment for this paragraph - what this group of lines accomplishes, or the reason / "
-    "gotcha / subtlety / edge case behind it - the kind of line that helps a reader scan the function. Avoid "
-    "trivially restating a single obvious line. Reply NONE only if the paragraph is truly trivial.\n"
-    "Bare sentence, or NONE. No #, no quotes, no list."
+    "In ONE short line, say what this paragraph does - what it accomplishes, or the reason / gotcha / subtlety / edge "
+    "case behind it. Always give a real description (later paragraphs rely on it); never reply 'NONE' or leave it "
+    "blank.\n"
+    "Bare sentence. No #, no quotes, no list."
 )
+# TURN 2 (the value score) judges whether that one-line note earns a place in the code: 1 (noise) .. 5 (essential).
+# The {length_note} biases strictness by routine size. EVERY note is kept as running context, but only notes scoring
+# >= COMMENT_VALUE_THRESHOLD are inserted into the code; a low-scoring note is tagged with VALUE_FLAG - a magic,
+# otherwise-meaningless marker - so it still flows into later turns' context (which ignore it) yet is recognised and
+# skipped at the output stage. Keeping the carrier on the comment string (rather than a second return value) keeps the
+# blast radius tiny.
+SCORE_PROMPT = (
+    "{length_note}\n\n"
+    "How much would that one-line note help a reader of the code, placed as a comment above this paragraph?\n"
+    "  1 - noise (it just restates one obvious line)\n"
+    "  2 - marginal\n"
+    "  3 - useful section heading\n"
+    "  4 - valuable (a non-obvious reason, or what a block achieves)\n"
+    "  5 - essential (a gotcha or subtlety a reader would otherwise miss)\n"
+    "Reply with a single digit 1-5 and nothing else."
+)
+VALUE_FLAG = "{@X@}"        # magic marker tagging a low-value note: kept for context, skipped at output
+COMMENT_VALUE_THRESHOLD = 3  # minimum 1-5 value score for a note to be written into the code
+
 # A routine with at most this many chunks is "short": its docstring plus the visible code already walk a reader
-# through it, so block comments that merely echo the docstring are noise. Longer routines benefit from a per-block
-# walkthrough even if it lightly duplicates the docstring. The matching note is injected into the comment prompt as
-# {length_note}, nudging the model conservative on short routines and permissive on long ones. (The threshold is a
-# tuning knob, not prompt wording, so it lives here; the note *text* is overridable from scale-cfg - see below.)
+# through it, so its notes are scored strictly. Longer routines invite a per-block walkthrough. The matching note is
+# injected into the SCORE prompt as {length_note}, biasing the model strict on short routines and generous on long
+# ones. (The threshold itself is the hard knob above; the note *text* is overridable from scale-cfg - see below.)
 SHORT_FUNCTION_CHUNKS = 3
 
-# Defaults for the remaining block-pass prompt wording. Like SEGMENT_PROMPT/COMMENT_PROMPT these are built-in
-# fallbacks; the CLI overrides them with user-editable scale-cfg files:
+# Defaults for the remaining block-pass prompt wording. Like SEGMENT_PROMPT/COMMENT_PROMPT/SCORE_PROMPT these are
+# built-in fallbacks; the CLI overrides them with user-editable scale-cfg files:
 #   COMMENT_NOTE_SHORT -> blocks.note.short.txt      COMMENT_NOTE_LONG -> blocks.note.long.txt
-#   COMMENT_NUDGE      -> blocks.comment.nudge.txt
-# COMMENT_NUDGE is a follow-up used ONLY when the first reply is neither a clear comment nor a clear NONE - a gentle
-# push to try once more before giving up (no placeholders; the paragraph is still in the conversation).
+#   COMMENT_NUDGE      -> blocks.comment.nudge.txt   SCORE_PROMPT       -> blocks.score.txt
+# COMMENT_NUDGE is a follow-up used ONLY when the first reply is not a usable description - a push to give one rather
+# than punt (no placeholders; the paragraph is still in the conversation).
 COMMENT_NOTE_SHORT = (
-    "This is a short routine, so its docstring largely covers it: reply NONE unless the paragraph adds something "
-    "not already clear from the docstring and the code itself."
+    "This is a short routine - its docstring and code already make it clear, so score strictly: reserve 3+ for a note "
+    "that genuinely adds something not obvious from the code itself."
 )
 COMMENT_NOTE_LONG = (
-    "This is a longer routine: a brief one-line heading that walks the reader through this paragraph is welcome, "
-    "even if it lightly echoes the docstring."
+    "This is a longer routine - a good section heading earns its place, so score generously when the note helps a "
+    "reader navigate the body, even if it lightly echoes the docstring."
 )
 COMMENT_NUDGE = (
-    "Have another go at that paragraph. Even a short note on what it accomplishes, the reason behind it, a gotcha "
-    "or an edge case helps a reader. Give ONE short line, or NONE only if it really is trivial.\n"
-    "Bare sentence, or NONE. No #, no quotes, no list."
+    "Describe what that paragraph does in ONE short line - even if it is simple, say plainly what it accomplishes. "
+    "Do not reply 'NONE' and do not leave it blank.\n"
+    "Bare sentence. No #, no quotes, no list."
 )
 
 
@@ -169,6 +188,13 @@ class CommentStyle:
 # Python has no block-comment syntax: every comment line uses "# ".
 PYTHON_STYLE = CommentStyle(line_prefix="# ")
 
+# C and JavaScript share `//` line comments and `/* ... */` block comments. The block pass defaults to the line
+# form (a one-line `//` section header reads cleanly, mirroring Python's `#`); `--block-comment-style block`
+# selects the block form, which only differs for the rare multi-line block comment (a single-line header always
+# renders as `// ...` regardless). C99+ is required for `//` in C.
+SLASH_LINE_STYLE = CommentStyle(line_prefix="// ")
+SLASH_BLOCK_STYLE = CommentStyle(line_prefix="// ", block_open="/*", block_cont=" * ", block_close=" */")
+
 
 @dataclass(frozen=True)
 class BlockTarget:
@@ -212,6 +238,130 @@ class BlockTarget:
     cognitive: int = 0
     sig: str = ""
     segments: Optional[List[Tuple[int, int]]] = None
+
+
+# ---------------------------- structural segmentation (deterministic paragraph rules) ----------------------------
+
+
+# A block (compound statement or nested definition) must span at least this many source lines to earn a paragraph
+# break before it, or before the statement that resumes after it. Size is a better "is this trivial" gate than
+# cognitive complexity, which is nesting-dominated and wrongly demotes long-but-flat blocks. 3 generalises across
+# codebases (5 overfit one repo's style).
+SEG_MIN_BLOCK_LINES = 3
+
+# A scope that opens with at least this many local variable declarations has its first real (non-declaration)
+# statement paragraphed off from them - so the declarations read as their own block and the body does not run
+# straight into them. 2 ("a bunch") avoids over-fragmenting a single leading declaration. C/JS only (Python has no
+# declaration statements); set by the providers via `SegStatement.force_break`.
+SEG_MIN_LEADING_DECLS = 2
+
+
+@dataclass(frozen=True)
+class SegStatement:
+    """
+    One body statement, normalised for the language-agnostic structural segmenter (`structural_breaks`).
+
+    A per-language provider flattens a routine body into these records (skipping a leading docstring, treating a
+    nested definition as one opaque statement, recursing into compound suites). The segmenter then reads only this
+    normalised view, so the paragraph rules live in exactly one place regardless of the source language or parser.
+
+    Attributes:
+    - `start`: The statement's 1-based start line (a paragraph break, if placed, goes above this line).
+    - `end`: The statement's 1-based inclusive end line.
+    - `depth`: A monotonic nesting measure within the body (deeper statements compare greater). Any per-language
+      proxy works as long as it is order-preserving - the engine only ever compares depths for equality/ordering
+      (Python passes the source column; the tree-sitter workers pass the parent-chain depth).
+    - `is_return`: Whether this statement is a `return` (drives the "paragraph off a trailing return" rule).
+    - `is_def`: Whether this statement is an opaque nested definition (drives the "blank after a nested def" rule).
+    - `opens_block`: The source-line span of the compound/def block this statement opens, or 0 if it opens none.
+    - `first_in_scope`: Whether this is the routine's own first body statement (never gets a break above it; a
+      blank after a docstring, when present, is the only break the first position can carry).
+    - `closed_block`: The span of the outermost block that closed immediately before this statement (0 if none),
+      used only when this statement dedents back out of a nested block.
+    - `merge_anchor`: For a `return` that is the second of a two-statement `[simple_stmt, return]` suite, the line of
+      that preceding statement. The trailing-return rule then anchors the paragraph there (and the two statements
+      share one paragraph) instead of breaking before the return - so a tiny `[stmt; return]` block reads as a single
+      unit, commented at its start. None for any other statement.
+    - `force_break`: Whether the provider requires a paragraph break above this statement regardless of the other
+      rules (used by the leading-declaration heuristic: the first real statement after a scope's opening run of
+      variable declarations breaks off from them, so the declarations sit as their own paragraph).
+    """
+
+    start: int
+    end: int
+    depth: int
+    is_return: bool
+    is_def: bool
+    opens_block: int
+    first_in_scope: bool
+    closed_block: int
+    merge_anchor: Optional[int] = None
+    force_break: bool = False
+
+
+def structural_breaks(
+    stmts: List[SegStatement],
+    *,
+    has_doc: bool,
+    boundary_lines: Tuple[int, ...],
+    body_end: int,
+    min_block_lines: int = SEG_MIN_BLOCK_LINES,
+    allow_after_def: bool = True,
+    allow_first_in_scope: bool = True,
+) -> List[Tuple[int, int]]:
+    """
+    Deterministically segment a routine body into paragraph chunks from its normalised statement records.
+
+    This is the shared core of SCALE's structural paragraph segmenter: every language worker builds
+    `SegStatement` records and calls this one function, so the rules (Steve's stated conventions) are defined
+    once. A break is placed - only ever at a legal `boundary_lines` line, so the body is never split mid-statement
+    - for: the first statement after a docstring (when the body has one); the statement after a nested def/class (a
+    def clearly ends a paragraph); a `return` whose preceding statement is at the same depth; a compound/def block
+    of at least `min_block_lines` source lines; the statement resuming after such a block closes (a dedent); and any
+    statement the provider marked `force_break` (the leading-declaration heuristic: the first real statement after a
+    scope's opening run of variable declarations breaks off, leaving the declarations as their own paragraph).
+
+    The `allow_*` flags capture the only real cross-language differences: brace languages have no in-body docstring
+    (`allow_first_in_scope=False`, and `has_doc` is then irrelevant) and C has no nested functions
+    (`allow_after_def=False`).
+
+    Parameters:
+    - `stmts`: The body's statements in source order, as normalised records.
+    - `has_doc`: Whether the routine body opens with a docstring (only meaningful when `allow_first_in_scope`).
+    - `boundary_lines`: The legal block-start lines; a break is only placed at one of these.
+    - `body_end`: The last line of the routine body, clamping the final chunk's end.
+    - `min_block_lines`: The size gate for the before-compound and dedent rules.
+    - `allow_after_def`: Whether the "blank after a nested def" rule applies (off for C).
+    - `allow_first_in_scope`: Whether the "blank after a docstring" rule applies (off for brace languages).
+
+    Returns:
+    - A list of `(start, end)` chunk ranges, sorted by start, non-overlapping, each starting at a legal boundary.
+    """
+
+    legal = set(boundary_lines)
+    breaks: set = set()
+    for i, s in enumerate(stmts):
+        if s.start not in legal:
+            continue
+        prev = stmts[i - 1] if i > 0 else None
+        if s.force_break:
+            breaks.add(s.start)                      # provider-forced break (e.g. off a leading declaration block)
+        if s.first_in_scope:
+            if has_doc and allow_first_in_scope:
+                breaks.add(s.start)                  # blank separating a docstring from the first statement
+        elif prev is not None and prev.is_def and allow_after_def:
+            breaks.add(s.start)                      # blank after a nested def/method - it clearly ends a paragraph
+        elif s.is_return and s.merge_anchor is not None:
+            breaks.add(s.merge_anchor)               # a [stmt; return] suite is one paragraph, anchored at the stmt
+        elif s.is_return and prev is not None and prev.depth == s.depth:
+            breaks.add(s.start)                      # paragraph a trailing return off from the body above it
+        elif s.opens_block >= min_block_lines:
+            breaks.add(s.start)                      # a substantial block opens a new paragraph
+        elif prev is not None and prev.depth > s.depth and (s.closed_block == 0 or s.closed_block >= min_block_lines):
+            breaks.add(s.start)                      # resuming after a substantial nested block closed
+
+    starts = sorted(breaks)
+    return [(st, (starts[j + 1] - 1) if j + 1 < len(starts) else body_end) for j, st in enumerate(starts)]
 
 
 # ---------------------------- comment helpers ----------------------------
@@ -528,6 +678,51 @@ def _doc_summary(doc: str) -> str:
     return "(no description)"
 
 
+def _parse_summary(reply: str, style: CommentStyle) -> str:
+    """
+    Extract a routine paragraph's one-line summary from a model reply, best-effort.
+
+    Takes the first non-empty line, strips any echoed comment delimiters / surrounding quotes and a stray
+    `VALUE_FLAG` (in case the model copied a flagged prior note), and treats a bare refusal as no summary.
+
+    Parameters:
+    - `reply`: The raw model reply.
+    - `style`: The comment-style descriptor for the language.
+
+    Returns:
+    - The cleaned one-line summary, or "" when the reply carries no usable description.
+    """
+
+    text = (reply or "").strip()
+    fence = re.match(r"^```[^\n]*\n(.*)\n```$", text, flags=re.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+    first = next((ln.strip() for ln in text.split("\n") if ln.strip()), "")
+    if not first:
+        return ""
+    for d in (style.line_prefix.strip(), style.block_open, style.block_close):
+        if d and first.startswith(d):
+            first = first[len(d):].strip()
+            break
+    first = first.replace(VALUE_FLAG, "").strip("`\"'* ").strip()
+    if first.upper() in ("", "NONE", "SKIP", "N/A", "TRIVIAL"):
+        return ""
+    return first
+
+
+def _parse_score(reply: str, default: int = COMMENT_VALUE_THRESHOLD) -> int:
+    """Extract the 1-5 value score from a model reply, falling back to `default` if none is present."""
+    m = re.search(r"[1-5]", reply or "")
+    return int(m.group()) if m else default
+
+
+def _comment_to_insert(comment: Optional[str]) -> Optional[str]:
+    """Return the comment to write into the code: None when it carries the low-value `VALUE_FLAG`, else unchanged."""
+    if comment and comment.rstrip().endswith(VALUE_FLAG):
+        return None
+    return comment
+
+
 def request_block_comment(
     llm: LocalChatModel,
     cfg: GenerationConfig,
@@ -541,15 +736,21 @@ def request_block_comment(
     length_note: str = "",
     prompt_template: Optional[str] = None,
     nudge_template: Optional[str] = None,
+    score_template: Optional[str] = None,
+    value_threshold: int = COMMENT_VALUE_THRESHOLD,
 ) -> Optional[str]:
     """
-    Ask the model for a comment for one paragraph of a routine, or None when it is genuinely self-evident.
+    Summarise one paragraph of a routine and score how much that summary is worth as a code comment.
 
-    The paragraph is shown on its own with only light context - the routine's purpose (its docstring summary) and the
-    comments already written for earlier paragraphs of the same routine; the file overview is already in the primed
-    conversation. This keeps the model focused on the paragraph rather than re-judging the whole function, and the
-    running comments give a narrative thread (and discourage repetition). The bias is to comment: NONE is for the
-    genuinely obvious only.
+    Two turns. **Turn 1** always asks for a one-line description of the paragraph - there is no opt-out, because the
+    summary is the running record (`priors`) that later paragraphs depend on (a paragraph left undescribed used to
+    starve its successors of context and drive hallucinations). The paragraph is shown with only light context - the
+    routine's purpose and the notes on earlier paragraphs; the file overview is already primed. **Turn 2** asks for a
+    1-5 value score for that summary as a code comment.
+
+    The summary is always returned (for the caller to keep as context). When its score falls below
+    `value_threshold`, the magic `VALUE_FLAG` is appended so the caller can recognise it as low-value - keeping it as
+    context but skipping it at output (`_comment_to_insert`).
 
     Parameters:
     - `llm`: The LocalChatModel instance.
@@ -560,13 +761,16 @@ def request_block_comment(
     - `blob_start`: The first line of the paragraph (a chosen chunk start).
     - `blob_end`: The last line of the paragraph, inclusive.
     - `style`: The comment-style descriptor for the language.
-    - `prior_comments`: Comments already written for earlier paragraphs of this routine (narrative context).
-    - `length_note`: A short note (short- vs long-routine) injected as `{length_note}` to tune the comment bias.
-    - `prompt_template`: Optional override for the comment prompt (defaults to `COMMENT_PROMPT`).
-    - `nudge_template`: Optional override for the retry nudge (defaults to `COMMENT_NUDGE`).
+    - `prior_comments`: One-line notes on earlier paragraphs of this routine (narrative context).
+    - `length_note`: A short- vs long-routine note injected into the score turn as `{length_note}`.
+    - `prompt_template`: Optional override for the summary prompt (defaults to `COMMENT_PROMPT`).
+    - `nudge_template`: Optional override for the summary retry nudge (defaults to `COMMENT_NUDGE`).
+    - `score_template`: Optional override for the value-score prompt (defaults to `SCORE_PROMPT`).
+    - `value_threshold`: The minimum 1-5 score for the summary to be left unflagged (insertable); below it the
+      summary is tagged with `VALUE_FLAG` (defaults to `COMMENT_VALUE_THRESHOLD`).
 
     Returns:
-    - The comment text, or None if no comment should be written for this paragraph.
+    - The one-line summary (suffixed with `VALUE_FLAG` when low-value), or None if the model gave nothing usable.
     """
 
     block_text = "\n".join(source_lines[blob_start - 1:blob_end])
@@ -575,28 +779,38 @@ def request_block_comment(
     prompt = _fill(
         prompt_template or COMMENT_PROMPT,
         kind=target.kind, qualname=target.qualname, doc=_doc_summary(target.doc),
-        length_note=length_note, priors=priors, block=block_text,
+        priors=priors, block=block_text,
     )
     turn_cfg = replace(cfg, temperature=COMMENT_TEMPERATURE, max_new_tokens=min(cfg.max_new_tokens, COMMENT_REPLY_TOKENS))
 
+    # Turn 1: a one-line description, always. Nudge once if the first reply is unusable.
     appended = 0
     messages.append({"role": "user", "content": prompt})
     appended += 1
-    reply = llm.generate(messages, cfg=turn_cfg)
-    parsed = _parse_comment_reply(reply, style)
-
-    # If the model neither gave a usable comment nor a clear NONE, push it once to try harder before giving up.
-    if parsed is None and not _is_explicit_none(reply):
-        messages.append({"role": "assistant", "content": reply})
+    summary = _parse_summary(llm.generate(messages, cfg=turn_cfg), style)
+    if not summary:
+        messages.append({"role": "assistant", "content": "(no answer)"})
         messages.append({"role": "user", "content": nudge_template or COMMENT_NUDGE})
         appended += 2
-        reply = llm.generate(messages, cfg=turn_cfg)
-        parsed = _parse_comment_reply(reply, style)
+        summary = _parse_summary(llm.generate(messages, cfg=turn_cfg), style)
+    if not summary:
+        for _ in range(appended):
+            messages.pop()
+        return None
+
+    # Turn 2: score the summary's value as a code comment (1-5).
+    messages.append({"role": "assistant", "content": summary})
+    score_prompt = _fill(score_template or SCORE_PROMPT, kind=target.kind, qualname=target.qualname,
+                         length_note=length_note, block=block_text)
+    messages.append({"role": "user", "content": score_prompt})
+    appended += 2
+    score_cfg = replace(cfg, temperature=SCORE_TEMPERATURE, max_new_tokens=min(cfg.max_new_tokens, SCORE_REPLY_TOKENS))
+    score = _parse_score(llm.generate(messages, cfg=score_cfg))
 
     for _ in range(appended):
         messages.pop()
 
-    return parsed
+    return summary if score >= value_threshold else f"{summary} {VALUE_FLAG}"
 
 
 # ---------------------------- insertion patcher ----------------------------
@@ -712,8 +926,12 @@ def _apply_edits(
             body = []
             start = stmt_idx
 
-        # Ensure a blank line above the chunk, unless one is already there or it is the file start.
-        need_blank = start - 1 >= 0 and out[start - 1].strip() != ""
+        # Ensure a blank line above the chunk, unless one is already there, it is the file start, or the chunk sits at
+        # the start of a just-opened block (the line above ends with `{` or `:`) - a blank as the first line inside a
+        # brace/suite reads badly, so a [stmt; return] paragraph anchored there is commented without a leading blank.
+        prev_line = out[start - 1] if start - 1 >= 0 else ""
+        opens_suite = prev_line.rstrip().endswith(("{", ":"))
+        need_blank = start - 1 >= 0 and prev_line.strip() != "" and not opens_suite
         out[start:stmt_idx] = ([""] if need_blank else []) + body
 
     return out
@@ -765,6 +983,8 @@ def annotate_blocks(
     comment_nudge: Optional[str] = None,
     note_short: Optional[str] = None,
     note_long: Optional[str] = None,
+    score_prompt: Optional[str] = None,
+    value_threshold: Optional[int] = None,
     escalation=None,
 ) -> Chunk:
     """
@@ -788,7 +1008,10 @@ def annotate_blocks(
     - `comment_prompt`: Optional override for the comment-pass prompt template (defaults to `COMMENT_PROMPT`).
     - `comment_nudge`: Optional override for the comment retry nudge (defaults to `COMMENT_NUDGE`).
     - `note_short`/`note_long`: Optional overrides for the short-/long-routine length notes (defaults
-      `COMMENT_NOTE_SHORT`/`COMMENT_NOTE_LONG`).
+      `COMMENT_NOTE_SHORT`/`COMMENT_NOTE_LONG`); injected into the value-score turn.
+    - `score_prompt`: Optional override for the value-score prompt template (defaults to `SCORE_PROMPT`).
+    - `value_threshold`: Minimum 1-5 value score for a comment to be written into the code (`--comment-value`); when
+      None, `COMMENT_VALUE_THRESHOLD` is used. Higher is stricter (6 keeps none in code; 1 keeps all).
     - `escalation`: Optional `scale_escalate.Escalation`. When supplied, a routine whose complexity exceeds the cutoff
       has its (still-local) segmentation recorded as a manifest request and its comment turns deferred to a stronger
       model - it is left untouched here and annotated later by the apply phase.
@@ -798,6 +1021,7 @@ def annotate_blocks(
     """
 
     ordered = sorted(targets, key=lambda t: (t.depth, t.body_start, -t.body_end), reverse=True)
+    threshold = value_threshold if value_threshold is not None else COMMENT_VALUE_THRESHOLD
 
     all_edits: List[Tuple[int, Optional[str], str]] = []
     for target in ordered:
@@ -842,11 +1066,12 @@ def annotate_blocks(
             comment = request_block_comment(
                 llm, cfg, messages, source_lines, target, blob_start, blob_end, style,
                 prior_comments=prior_comments, length_note=length_note,
-                prompt_template=comment_prompt, nudge_template=comment_nudge,
+                prompt_template=comment_prompt, nudge_template=comment_nudge, score_template=score_prompt,
+                value_threshold=threshold,
             )
             if comment:
-                prior_comments.append(comment)
-            edits.append((blob_start, comment, target.indent_of.get(blob_start, "")))
+                prior_comments.append(comment)   # keep every summary (incl. low-value, VALUE_FLAG and all) as context
+            edits.append((blob_start, _comment_to_insert(comment), target.indent_of.get(blob_start, "")))
 
         # Per-routine guard: simulate this routine's edits on the pristine source and keep them only if code is intact.
         trial = _apply_edits(source_lines, edits, style)
