@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tier 0 of project-aware SCALE: locate a project-overview document and distil it into a short, cached "project blurb"
+Project-aware SCALE: locate a project-overview document and distil it into a short, cached "project blurb"
 that is injected into every file's priming context.
 
 Model-free (a fake LLM that returns a canned blurb). Guards:
@@ -122,7 +122,7 @@ def test_blurb_injected_before_summary():
         SummaryCache._CACHE_INDEX = Path(tmp) / "index.pkl"
         msgs = prime_llm_for_comments(
             _FakeLLM(reply="file summary"), GenerationConfig(), SCALE_CFG, Path("virtual.c"),
-            source_blob="int main(void){return 0;}", language="c", no_cache=True, project_blurb=BLURB,
+            source_blob="int main(void){return 0;}", language="c", no_cache=True, project_context=BLURB,
         )
 
     blurb_idx = next((i for i, m in enumerate(msgs) if BLURB in m["content"]), None)

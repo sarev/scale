@@ -805,7 +805,7 @@ def prime_llm_for_comments(
     language: str,
     no_cache: Optional[bool] = False,
     template: str = "comment",
-    project_blurb: str = "",
+    project_context: str = "",
 ) -> Messages:
     """
     Prepare the Large Language Model (LLM) for generating comments by priming it with a system prompt and the source file as context.
@@ -818,8 +818,9 @@ def prime_llm_for_comments(
     - `source_blob`: The source code as a string.
     - `language`: The programming language of the source code.
     - `no_cache`: Generate new summary - don't use the cached version.
-    - `project_blurb`: Optional short project-overview blurb (see `scale_project`); injected before the file summary so
-      both the summary and the per-routine turns understand the file's place in the wider project.
+    - `project_context`: Optional project background (the project blurb plus any related-file one-liners; see
+      `scale_project`); injected before the file summary so both the summary and the per-routine turns understand the
+      file's place in the wider project.
     - `template`: Which per-language style template to load as the final priming turn: `"comment"` loads
       `comment.<lang>.txt` (the definition/docstring pass) and `"blocks"` loads `blocks.<lang>.txt` (the
       within-function "blob" pass). Only one is ever loaded so the two passes never share each other's guidance.
@@ -849,11 +850,11 @@ def prime_llm_for_comments(
     messages = []
     messages.append({"role": "system", "content": comment_prompt})
 
-    # Inject the project blurb (if any) before the file summary, so the broader-project context informs both the
+    # Inject the project context (if any) before the file summary, so the broader-project background informs both the
     # generated summary and every routine turn that follows (see scale_project).
-    if project_blurb:
+    if project_context:
         messages.append({"role": "user", "content":
-            "Here is some background on the wider project this file belongs to:\n\n" + project_blurb})
+            "Here is some background on the wider project this file belongs to:\n\n" + project_context})
         messages.append({"role": "assistant", "content": PRIMING_ACK})
 
     # Now summarise the whole file for context (chunked map-reduce kicks in automatically for large files; see
@@ -1081,7 +1082,7 @@ def _file_doc_pass(
     source_lines: List[str],
     language: str,
     no_cache: Optional[bool] = False,
-    project_blurb: str = "",
+    project_context: str = "",
 ) -> List[str]:
     """
     Run the file-level header doccomment pass: add or update the top-of-file description, preserving everything else.
@@ -1122,10 +1123,10 @@ def _file_doc_pass(
     # (and cached) via the provider below, seeded with whatever existing description the classify turn finds.
     comment_prompt = (scale_path / "comment.txt").read_text(encoding="utf-8")
     base: Messages = [{"role": "system", "content": comment_prompt}]
-    if project_blurb:
+    if project_context:
         base = base + [
             {"role": "user", "content":
-                "Here is some background on the wider project this file belongs to:\n\n" + project_blurb},
+                "Here is some background on the wider project this file belongs to:\n\n" + project_context},
             {"role": "assistant", "content": PRIMING_ACK},
         ]
 
@@ -1156,7 +1157,7 @@ def generate_comments(
     block_comment_style: str = "line",
     comment_value: Optional[int] = None,
     escalation=None,
-    project_blurb: str = "",
+    project_context: str = "",
 ) -> int:
     """
     Generate comments for the provided (already-loaded) source code using a Large Language Model (LLM).
@@ -1200,13 +1201,13 @@ def generate_comments(
     if do_file_doc:
         new_lines = _file_doc_pass(
             llm, cfg, scale_path, src_path, source_blob, new_lines, language, no_cache=no_cache,
-            project_blurb=project_blurb,
+            project_context=project_context,
         )
 
     if do_comment:
         messages = prime_llm_for_comments(
             llm, cfg, scale_path, src_path, source_blob, language, no_cache=no_cache, template="comment",
-            project_blurb=project_blurb,
+            project_context=project_context,
         )
         current_blob = line_ending.join(new_lines)
         new_lines = _def_pass(llm, cfg, messages, current_blob, new_lines, language, escalation=escalation)
@@ -1220,7 +1221,7 @@ def generate_comments(
         current_blob = line_ending.join(new_lines)
         messages = prime_llm_for_comments(
             llm, cfg, scale_path, src_path, source_blob, language, no_cache=no_cache, template="blocks",
-            project_blurb=project_blurb,
+            project_context=project_context,
         )
         new_lines = _block_pass(llm, cfg, scale_path, messages, current_blob, new_lines, language,
                                 comment_style=block_comment_style, comment_value=comment_value, escalation=escalation)
@@ -1269,7 +1270,9 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     formatters = sorted(llm_formatters()) + ['auto']
 
     p = argparse.ArgumentParser(description="SCALE: Source Code Annotation with LLM Engine")
-    p.add_argument("source", help="Path to source file")
+    p.add_argument("source", nargs="+",
+                   help="Source file(s) to annotate - paths, directories (expanded to source files), or globs "
+                        "(e.g. \"src/**/*.c\"). Multiple targets are written in place; -o is only valid for one.")
     p.add_argument("--model", "-m", default="", help="Optional path to GGUF model file")
     p.add_argument("--output", "-o", default="", help="Optional output filename")
     p.add_argument("--comment", "-c", action="store_true", help="Add and update definition docstrings/header comments")
@@ -1287,6 +1290,9 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--project-doc", default="", metavar="PATH",
                    help="Project overview to distil into background context for every file (e.g. CLAUDE.md/README). "
                         "Default: auto-detect near the source. 'none' disables it; or pass an explicit path.")
+    p.add_argument("--reference", action="append", default=[], metavar="PATH",
+                   help="Read-only file(s)/dir(s)/glob(s) for SCALE to consult for context but never edit (e.g. the "
+                        "project's headers). Repeatable. Their one-line summaries are shared with every target.")
     p.add_argument("--verbose", "-v", action="store_true", help="Output progress information to stdout")
     p.add_argument("--very-verbose", "-vv", action="store_true", help="Output LLM debug information to stdout")
     p.add_argument("--no-cache", "-nc", action="store_true", help="Don't load the summary text for this file from cache")
@@ -1314,6 +1320,58 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "when deciding what to escalate.")
 
     return p.parse_args(argv)
+
+
+def _reference_oneliners(
+    llm: LocalChatModel,
+    cfg: GenerationConfig,
+    scale_path: Path,
+    references: List[Path],
+    project_blurb: str,
+    no_cache: bool,
+) -> List[Tuple[str, str]]:
+    """
+    Produce a one-line summary for each read-only reference file, as shared context for the run.
+
+    Each reference file gets the same squashed one-liner the definition pass uses (`_get_short_summary`, cached), so a
+    target being annotated can be told, briefly, what the project's other files (e.g. its headers) are for. The list is
+    capped (`scale_project.MAX_REFERENCE_FILES`) so the injected context stays small; the overflow is logged, not
+    silently dropped.
+
+    Parameters:
+    - `llm`/`cfg`: The model and config.
+    - `scale_path`: The SCALE configuration directory.
+    - `references`: The read-only reference files (already expanded).
+    - `project_blurb`: The project blurb, used as context when summarising each reference.
+    - `no_cache`: Forwarded to the summary cache.
+
+    Returns:
+    - `(filename, one_line_summary)` pairs, capped.
+    """
+
+    if not references:
+        return []
+
+    base: Messages = [{"role": "system", "content": (scale_path / "comment.txt").read_text(encoding="utf-8")}]
+    if project_blurb:
+        base = base + [
+            {"role": "user", "content":
+                "Here is some background on the wider project this file belongs to:\n\n" + project_blurb},
+            {"role": "assistant", "content": PRIMING_ACK},
+        ]
+
+    cap = scale_project.MAX_REFERENCE_FILES
+    if len(references) > cap:
+        echo(f"Summarising {cap} of {len(references)} reference files for context (the rest are omitted)...")
+
+    out: List[Tuple[str, str]] = []
+    for ref in references[:cap]:
+        blob, _lines, _le, lang = load_source(ref, None)
+        if not blob.strip():
+            continue
+        oneliner = _get_short_summary(llm, cfg, scale_path, ref, blob, lang, base, no_cache=no_cache)
+        out.append((ref.name, oneliner))
+    return out
 
 
 def _apply_manifest_file(
@@ -1380,11 +1438,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     root = Path(__file__).resolve().parent
     scale_path = root / "scale-cfg"
     model = Path(args.model) if args.model else root / DEFAULT_MODEL
-    src_path = Path(args.source)
     dst_path = Path(args.output) if args.output else None
 
-    # ---- Apply phase: model-free. Patch a stronger model's manifest answers into the (emit-phase) source. ----
+    # Expand the target patterns (files / directories / globs) into a concrete, deduplicated, ordered file list.
+    targets = scale_project.gather_files(args.source)
+    if not targets:
+        error(f"No source files matched: {' '.join(args.source)}")
+        return 1
+
+    # ---- Apply phase: model-free, single target. Patch a stronger model's manifest answers into the emit output. ----
     if args.apply_manifest:
+        if len(targets) != 1:
+            error("--apply-manifest operates on a single source file.")
+            return 1
+        src_path = targets[0]
         manifest = scale_escalate.read_manifest(Path(args.apply_manifest))
         language = args.language.lower() if args.language else manifest.get("language")
         source_blob, source_lines, line_ending, language = load_source(src_path, language)
@@ -1397,31 +1464,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Nothing to do without --comment, --blocks, or --file-doc.
         return 0
 
-    # Load the source and resolve the language up front, so an unsupported file fails fast
-    # before the (slow) model load.
-    language = args.language.lower() if args.language else None
-    source_blob, source_lines, line_ending, language = load_source(src_path, language)
-    if language not in SUPPORTED_LANGUAGES:
-        error(f"Unsupported language '{language}'. SCALE supports: {', '.join(SUPPORTED_LANGUAGES)}")
+    if dst_path is not None and len(targets) > 1:
+        error("-o/--output cannot be used with multiple targets; multiple targets are annotated in place.")
+        return 1
+    if args.emit_manifest and len(targets) != 1:
+        error("--emit-manifest operates on a single source file.")
         return 1
 
-    # ---- Emit phase: build the selective-escalation policy that defers complex routines to a manifest. ----
-    escalation = None
-    if args.emit_manifest:
-        if language != "python":
-            error("--emit-manifest currently supports Python only.")
-            return 1
-        override = scale_escalate.load_codestats_json(Path(args.codestats_json)) if args.codestats_json else None
-        # Carry the house style into the manifest so the stronger model writes deferred docstrings to spec: the
-        # per-language template plus the shared guidelines (the same pair the local definition pass is primed with).
-        doc_style = "\n\n".join(
-            t for t in (_read_optional(scale_path / "guidelines.md"),
-                        _read_optional(scale_path / f"comment.{language}.txt")) if t
-        )
-        escalation = scale_escalate.Escalation(
-            threshold=args.escalate_cognitive, override=override, doc_style=doc_style)
+    # Read-only reference files (consulted for context, never edited); a file that is also a target is not a reference.
+    references = scale_project.gather_files(args.reference) if args.reference else []
+    target_keys = {p.resolve() for p in targets}
+    references = [r for r in references if r.resolve() not in target_keys]
 
-    # Prepare model and config
+    # Prepare model and config (loaded once for the whole run).
     echo("Loading the LLM...")
     llm = LocalChatModel(
         str(model),
@@ -1441,33 +1496,61 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         repeat_penalty=args.repeat_penalty,
     )
 
-    # Resolve and distil the project overview (CLAUDE.md/README/...) into a short blurb shared by every pass, giving
-    # the per-file annotation a sense of the wider project. Auto-detected near the source unless --project-doc says
-    # otherwise ('none' disables).
+    # Build the shared project context once for the whole run: the project blurb (auto-detected near the targets unless
+    # --project-doc says otherwise; 'none' disables) plus one-line summaries of the read-only reference files.
     project_blurb = ""
-    project_doc = scale_project.resolve_project_doc(args.project_doc, src_path)
+    project_doc = scale_project.resolve_project_doc(args.project_doc, targets[0])
     if project_doc is not None:
         project_blurb = scale_project.project_blurb(llm, cfg, scale_path, project_doc, no_cache=args.no_cache)
+    related = _reference_oneliners(llm, cfg, scale_path, references, project_blurb, args.no_cache)
+    project_context = scale_project.compose_project_context(project_blurb, related)
 
-    echo("Generating comments...")
-    rc = generate_comments(
-        llm, cfg, scale_path, src_path, dst_path,
-        source_blob, source_lines, line_ending, language,
-        no_cache=args.no_cache,
-        do_comment=args.comment,
-        do_blocks=args.blocks,
-        do_file_doc=args.file_doc,
-        block_comment_style=args.block_comment_style,
-        comment_value=args.comment_value,
-        escalation=escalation,
-        project_blurb=project_blurb,
-    )
+    # Annotate each target in turn (single target -> -o or stdout; multiple targets -> in place).
+    rc = 0
+    for target in targets:
+        language = args.language.lower() if args.language else None
+        source_blob, source_lines, line_ending, language = load_source(target, language)
+        if language not in SUPPORTED_LANGUAGES:
+            error(f"Skipping {target}: unsupported language '{language}' (SCALE supports: "
+                  f"{', '.join(SUPPORTED_LANGUAGES)}).")
+            continue
 
-    # Serialise the deferred requests so a stronger model can answer them (then re-run with --apply-manifest).
-    if rc == 0 and escalation is not None:
-        manifest = escalation.to_manifest(str(src_path), language, line_ending)
-        scale_escalate.write_manifest(Path(args.emit_manifest), manifest)
-        echo(f"Wrote {len(escalation.requests)} escalation request(s) to {args.emit_manifest}")
+        # ---- Emit phase: a per-target selective-escalation policy (single target only, guarded above). ----
+        escalation = None
+        if args.emit_manifest:
+            if language != "python":
+                error("--emit-manifest currently supports Python only.")
+                return 1
+            override = scale_escalate.load_codestats_json(Path(args.codestats_json)) if args.codestats_json else None
+            doc_style = "\n\n".join(
+                t for t in (_read_optional(scale_path / "guidelines.md"),
+                            _read_optional(scale_path / f"comment.{language}.txt")) if t
+            )
+            escalation = scale_escalate.Escalation(
+                threshold=args.escalate_cognitive, override=override, doc_style=doc_style)
+
+        out = dst_path if len(targets) == 1 else target
+        echo(f"Annotating {target}...")
+        frc = generate_comments(
+            llm, cfg, scale_path, target, out,
+            source_blob, source_lines, line_ending, language,
+            no_cache=args.no_cache,
+            do_comment=args.comment,
+            do_blocks=args.blocks,
+            do_file_doc=args.file_doc,
+            block_comment_style=args.block_comment_style,
+            comment_value=args.comment_value,
+            escalation=escalation,
+            project_context=project_context,
+        )
+        if frc != 0:
+            rc = frc
+
+        # Serialise the deferred requests so a stronger model can answer them (then re-run with --apply-manifest).
+        if frc == 0 and escalation is not None:
+            manifest = escalation.to_manifest(str(target), language, line_ending)
+            scale_escalate.write_manifest(Path(args.emit_manifest), manifest)
+            echo(f"Wrote {len(escalation.requests)} escalation request(s) to {args.emit_manifest}")
 
     return rc
 

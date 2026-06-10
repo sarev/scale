@@ -19,19 +19,28 @@ the per-file pipeline a *broader view* - but only as small, distilled facts, bec
 is tight. The byte-for-byte code guarantee is unaffected: nothing here patches source, it only produces context strings
 that are fed into the existing priming.
 
-Tier 0 (this file's current scope): locate a project overview document (`CLAUDE.md` / `README.*`) near the files being
-annotated and distil it once into a short, cached "project blurb" that is injected into every file's priming context.
-Later tiers add a cross-file symbol/call index on top of this same module.
+It locates a project overview document (`CLAUDE.md` / `README.*`) near the files being annotated and distils it once
+into a short, cached "project blurb" that is injected into every file's priming context.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
+import glob
 import hashlib
 
 from scale_text import summarise, LENGTH_PARAGRAPH
 from scale_log import echo
+
+
+# Source extensions used when a target/reference path is a directory (so a directory expands to just its source files,
+# not every file). Explicitly named files and glob matches are taken as-is regardless of extension.
+SOURCE_EXTS = (".py", ".c", ".h", ".js", ".mjs", ".cjs")
+
+# Cap on how many read-only reference files are summarised into the shared context, so the injected one-liners stay
+# small regardless of how large the --reference set is (the overflow is logged, not silently dropped).
+MAX_REFERENCE_FILES = 16
 
 
 # Reply-length cap for the project blurb. It is background context shown above many files, so it is kept to a couple of
@@ -208,6 +217,64 @@ def project_blurb(llm, cfg, scale_path: Path, doc_path: Path, no_cache: bool = F
                       max_tokens=PROJECT_BLURB_MAX_TOKENS, instruction=instruction)
     _write_cache(cache_path, blurb)
     return blurb
+
+
+def gather_files(patterns: List[str], exts: Tuple[str, ...] = SOURCE_EXTS) -> List[Path]:
+    """
+    Expand a list of path patterns into a deduplicated, ordered list of existing files.
+
+    Each pattern is resolved as: a glob (when it contains `*`/`?`/`[`, with `**` recursion); a directory (expanded
+    recursively to files whose extension is in `exts`); or a single named file (taken as-is, any extension). Order is
+    deterministic (sorted by path) and duplicates (by resolved path) are removed, so overlapping patterns are safe.
+
+    Parameters:
+    - `patterns`: The raw path/glob/dir strings (e.g. from the CLI).
+    - `exts`: The source extensions a directory expands to.
+
+    Returns:
+    - The matching existing files, sorted, without duplicates.
+    """
+
+    out: List[Path] = []
+    seen = set()
+    for pattern in patterns:
+        p = Path(pattern)
+        if any(ch in pattern for ch in "*?["):
+            candidates = [Path(m) for m in glob.glob(pattern, recursive=True)]
+        elif p.is_dir():
+            candidates = [c for c in sorted(p.rglob("*")) if c.suffix.lower() in exts]
+        else:
+            candidates = [p]
+        for c in candidates:
+            if not c.is_file():
+                continue
+            key = c.resolve()
+            if key not in seen:
+                seen.add(key)
+                out.append(c)
+    return sorted(out, key=lambda x: str(x))
+
+
+def compose_project_context(blurb: str, related: List[Tuple[str, str]]) -> str:
+    """
+    Format the project blurb and a list of related-file one-liners into a single context string for priming.
+
+    Parameters:
+    - `blurb`: The project overview blurb (may be "").
+    - `related`: `(filename, one_line_summary)` pairs for read-only reference files the run should be aware of.
+
+    Returns:
+    - A combined context string (possibly ""), suitable for injecting as a priming turn.
+    """
+
+    parts: List[str] = []
+    if blurb.strip():
+        parts.append(blurb.strip())
+    related = [(name, summary.strip()) for name, summary in related if summary.strip()]
+    if related:
+        lines = "\n".join(f"- {name}: {summary}" for name, summary in related)
+        parts.append("Related files in this project (read-only, for reference):\n" + lines)
+    return "\n\n".join(parts)
 
 
 def resolve_project_doc(project_doc_arg: str, start: Path) -> Optional[Path]:
