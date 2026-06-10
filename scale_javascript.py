@@ -39,7 +39,8 @@ insert or replace existing comment blocks above headers, resulting in an updated
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from scale_blocks import BlockTarget, SegStatement, structural_breaks, SEG_MIN_LEADING_DECLS
+from scale_blocks import BlockTarget, SegStatement, structural_breaks, SEG_MIN_LEADING_DECLS, SLASH_BLOCK_STYLE
+from scale_filedoc import FileDocTarget, scan_brace_leading_zone
 from scale_llm import LocalChatModel, GenerationConfig, Messages, Chunk
 from scale_log import echo
 from scale_text import fit_snippet, MARKER_JS
@@ -1100,6 +1101,25 @@ def _doc_above_header_js(source_lines: Chunk, header_start: int) -> str:
     # A `//` run: strip the leading slashes from each line.
     return "\n".join(ln.strip()[2:].strip() if ln.strip().startswith("//") else ln.strip()
                      for ln in block.split("\n")).strip()
+
+
+def file_doc_target_js(source_blob: str, source_lines: Chunk) -> Optional[FileDocTarget]:
+    """
+    Build the file-level header doccomment target for a JavaScript source file.
+
+    JS file headers are the same shape as C's - a leading run of `/* ... */` and/or `//` comment blocks (after an
+    optional `#!/usr/bin/env node` shebang) before the first code - so this delegates to the shared brace-language
+    scanner. The description is rendered/updated as a `/* ... */` block.
+
+    Parameters:
+    - `source_blob`: The complete source text (unused; accepted for provider-signature symmetry).
+    - `source_lines`: The source split into individual lines.
+
+    Returns:
+    - A `FileDocTarget`, or None if the file is empty.
+    """
+
+    return scan_brace_leading_zone(source_lines, SLASH_BLOCK_STYLE)
 
 
 def iter_block_targets_js(source_blob: str, source_lines: Chunk) -> List[BlockTarget]:

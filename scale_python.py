@@ -44,6 +44,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from scale_blocks import BlockTarget, SegStatement, structural_breaks
+from scale_filedoc import FileDocTarget, PYTHON_DOC_STYLE
 from scale_llm import LocalChatModel, GenerationConfig, Messages, Chunk
 from scale_log import echo
 from scale_text import fit_snippet, summarise, LENGTH_LINE, MARKER_PYTHON, PRIMING_ACK
@@ -432,6 +433,123 @@ def iter_defs_with_info(tree: ast.AST) -> List[DefInfo]:
         completed.append(replace(info, children_ids=child_ids))
 
     return sorted(completed, key=lambda d: d.start)
+
+
+def _is_module_docstring_expr(node: ast.AST) -> bool:
+    """Report whether an AST node is a string-literal expression statement (a docstring)."""
+    return (isinstance(node, ast.Expr)
+            and isinstance(getattr(node, "value", None), ast.Constant)
+            and isinstance(node.value.value, str))
+
+
+def _module_code_signature(tree: ast.AST) -> str:
+    """
+    Return an `ast.dump` of a module with any leading module docstring removed.
+
+    Line numbers and comments are not part of the dump, so two modules with identical code but a different (or
+    inserted/removed) module docstring compare equal. Used by the Python file-doc guard to confirm only the module
+    docstring changed.
+    """
+
+    body = list(getattr(tree, "body", []))
+    if body and _is_module_docstring_expr(body[0]):
+        body = body[1:]
+    return ast.dump(ast.Module(body=body, type_ignores=list(getattr(tree, "type_ignores", []))))
+
+
+def _py_doc_preserved(old_lines: Chunk, new_lines: Chunk, start: int, removed: int, added: int) -> bool:
+    """
+    Parse-based file-doc preservation guard for Python: only the module docstring may change.
+
+    Confirms the lines outside the spliced region are byte-for-byte identical (so any shebang, coding cookie, or
+    leading `#` comments - including a `#`-comment licence - are untouched), that the result still parses, and that
+    the module's code (its AST with any leading module docstring removed) is unchanged. This catches a splice that
+    strayed into code, or a description that broke the docstring (e.g. an embedded triple-quote).
+
+    Parameters:
+    - `old_lines`/`new_lines`: The source before and after the splice.
+    - `start`: 0-based start index of the spliced region.
+    - `removed`/`added`: Line counts removed/inserted at `start`.
+
+    Returns:
+    - True if only the module docstring changed and the result still parses.
+    """
+
+    if old_lines[:start] != new_lines[:start]:
+        return False
+    if old_lines[start + removed:] != new_lines[start + added:]:
+        return False
+    try:
+        old_tree = ast.parse("\n".join(old_lines))
+        new_tree = ast.parse("\n".join(new_lines))
+    except SyntaxError:
+        return False
+    return _module_code_signature(old_tree) == _module_code_signature(new_tree)
+
+
+def file_doc_target_py(source_blob: str, source_lines: Chunk) -> Optional[FileDocTarget]:
+    """
+    Build the file-level doccomment target for a Python file: the MODULE DOCSTRING.
+
+    A Python file's top-of-file description is its module docstring (a string literal), not a `#` comment. When one
+    exists, its pure-content lines are description-eligible (the triple-quote delimiter lines and blank lines are
+    preserved), so the classify+veto+replace flow updates the description while leaving any licence text inside the
+    docstring intact. When there is none, a fresh triple-quoted docstring is inserted before the first statement (after
+    any shebang / coding cookie / leading comments), making it the module docstring. The Python-specific parse-based
+    guard `_py_doc_preserved` replaces the line-comment guard.
+
+    Parameters:
+    - `source_blob`: The complete source text.
+    - `source_lines`: The source split into individual lines.
+
+    Returns:
+    - A `FileDocTarget`, or None if the file is empty or does not parse.
+    """
+
+    if not source_lines or not any(ln.strip() for ln in source_lines):
+        return None
+    try:
+        tree = ast.parse(source_blob)
+    except SyntaxError:
+        return None
+
+    body = tree.body
+    doc_node = body[0] if (body and _is_module_docstring_expr(body[0])) else None
+
+    if doc_node is not None:
+        start_1b = doc_node.lineno
+        end_1b = getattr(doc_node, "end_lineno", start_1b)
+        eligible: List[Tuple[int, str, str]] = []
+        append_prefix = ""
+        for ln_no in range(start_1b, end_1b + 1):
+            raw = source_lines[ln_no - 1]
+            s = raw.strip()
+            if not s:
+                continue                                  # blank line - preserve
+            if s in ('"""', "'''"):
+                continue                                  # delimiter-only line - preserve
+            if s.startswith(('"""', "'''")) or s.endswith(('"""', "'''")):
+                continue                                  # opener/closer carrying content - preserve
+            leading_ws = raw[: len(raw) - len(raw.lstrip())]
+            eligible.append((ln_no, leading_ws, s))
+            append_prefix = leading_ws
+        return FileDocTarget(
+            eligible=eligible,
+            insert_index=end_1b - 1,                      # append before the closing delimiter line
+            insert_prefix=append_prefix,
+            insert_fresh=False,
+            style=PYTHON_DOC_STYLE,
+            indent="",
+            has_zone=True,
+            preserved=_py_doc_preserved,
+        )
+
+    # No module docstring: insert a fresh one before the first statement (after any shebang/cookie/leading comments).
+    insert_index = (body[0].lineno - 1) if body else len(source_lines)
+    return FileDocTarget(
+        eligible=[], insert_index=insert_index, insert_fresh=True,
+        style=PYTHON_DOC_STYLE, indent="", has_zone=False, preserved=_py_doc_preserved,
+    )
 
 
 def _format_from_source(module: Optional[str], level: int) -> str:

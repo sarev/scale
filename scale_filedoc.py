@@ -116,9 +116,13 @@ class FileDocTarget:
       `insert_fresh` is set).
     - `insert_fresh`: When True, render a brand-new comment block (delimiters and all) via `style` at `insert_index`;
       when False, append plain `insert_prefix`-decorated lines into an existing block.
-    - `style`: The language `CommentStyle` used to render a fresh block.
+    - `style`: The language `CommentStyle` used to render a fresh block. For Python this is `PYTHON_DOC_STYLE`, which
+      renders a triple-quoted module docstring rather than a comment.
     - `indent`: Leading whitespace for a freshly inserted block (usually empty at file scope).
     - `has_zone`: Whether the file already has a leading-comment zone at all.
+    - `preserved`: Optional language-specific preservation guard `(old, new, start, removed, added) -> bool`. When set,
+      the engine uses it instead of the default line-comment `file_doc_preserved` (Python supplies a parse-based guard,
+      since a module docstring's content lines are not recognisable as comments line-by-line).
     """
 
     eligible: List[Tuple[int, str, str]] = field(default_factory=list)
@@ -128,6 +132,13 @@ class FileDocTarget:
     style: Optional[CommentStyle] = None
     indent: str = ""
     has_zone: bool = False
+    preserved: Optional[Callable[[Chunk, Chunk, int, int, int], bool]] = None
+
+
+# Python's "file header" is the module docstring (a string literal), not a comment block. Rendering it as a block-style
+# comment with `"""` delimiters and no continuation prefix produces a standard triple-quoted module docstring. Its empty
+# `line_prefix` is never fed to `_is_comment_line` because the Python adapter supplies its own (parse-based) guard.
+PYTHON_DOC_STYLE = CommentStyle(line_prefix="", block_open='"""', block_cont="", block_close='"""')
 
 
 def _parse_classify_range(reply: str, n: int) -> Optional[Tuple[int, int]]:
@@ -334,7 +345,13 @@ def annotate_file_doc(
 
     out_lines = source_lines[:start] + new_block + source_lines[start + removed:]
 
-    if not file_doc_preserved(source_lines, out_lines, start, removed, len(new_block), style):
+    # The guard is pluggable: brace languages use the line-comment `file_doc_preserved`; Python supplies a parse-based
+    # guard (its docstring content lines are not line-recognisable as comments).
+    if target.preserved is not None:
+        ok = target.preserved(source_lines, out_lines, start, removed, len(new_block))
+    else:
+        ok = file_doc_preserved(source_lines, out_lines, start, removed, len(new_block), style)
+    if not ok:
         echo("file-doc: the edit would have altered code or preserved text; abandoning it.")
         return source_lines
 
@@ -374,3 +391,109 @@ def _sanitise_description(text: str) -> str:
         s = re.sub(r"^(\*|//|#)\s?", "", s)
         cleaned.append(s)
     return "\n".join(cleaned).strip()
+
+
+def scan_brace_leading_zone(source_lines: Chunk, style: CommentStyle) -> Optional[FileDocTarget]:
+    """
+    Build a `FileDocTarget` for a brace-language file (C, JS) by scanning its leading-comment zone.
+
+    Gathers the entire run of leading comments at the top of the file - which may span several contiguous blocks
+    (mixed `/* ... */` and `//`, separated by blank lines but with no intervening code) - into one target. The scan
+    starts after an optional shebang, collects every comment line until the first real code/preprocessor line, and
+    marks the pure-content comment lines (block continuations and `//` lines) as description-eligible while leaving
+    delimiters, single-line `/* ... */` comments, and blank continuations to be preserved.
+
+    Parameters:
+    - `source_lines`: The source split into individual lines.
+    - `style`: The comment style used to render a fresh block when the file has no leading comments.
+
+    Returns:
+    - A `FileDocTarget`, or None if the file is empty.
+    """
+
+    if not source_lines or not any(ln.strip() for ln in source_lines):
+        return None
+
+    n = len(source_lines)
+    i = 0
+    if source_lines[0].lstrip().startswith("#!"):     # preserve a shebang (e.g. `#!/usr/bin/env node`) if present
+        i = 1
+    fresh_index = i
+
+    eligible: List[Tuple[int, str, str]] = []
+    first_comment = None                 # 0-based index of the first comment line
+    last_comment = None                  # 0-based index of the last comment line
+    append_index = None                  # 0-based insertion point for an appended description
+    append_prefix = ""
+    in_block = False
+
+    idx = i
+    while idx < n:
+        line = source_lines[idx]
+        stripped = line.strip()
+        leading_ws = line[: len(line) - len(line.lstrip())]
+
+        if in_block:
+            first_comment = idx if first_comment is None else first_comment
+            last_comment = idx
+            closes = "*/" in stripped
+            if not closes:
+                body = stripped
+                if body.startswith("*"):
+                    inner = body.lstrip("*").strip()
+                    prefix = leading_ws + "* "
+                else:
+                    inner = body
+                    prefix = leading_ws
+                if inner:
+                    eligible.append((idx + 1, prefix, inner))
+            else:
+                in_block = False
+                append_index = idx          # append before this closing delimiter
+                append_prefix = leading_ws + "* "
+            idx += 1
+            continue
+
+        if stripped.startswith("/*"):
+            first_comment = idx if first_comment is None else first_comment
+            last_comment = idx
+            if "*/" in stripped[2:]:          # single-line /* ... */ - preserve whole, not eligible
+                append_index = idx + 1
+                append_prefix = "// "
+            else:
+                in_block = True
+            idx += 1
+            continue
+
+        if stripped.startswith("//"):
+            first_comment = idx if first_comment is None else first_comment
+            last_comment = idx
+            inner = stripped.lstrip("/").strip()
+            prefix = leading_ws + "// "
+            if inner:
+                eligible.append((idx + 1, prefix, inner))
+            append_index = idx + 1            # append after this line-comment
+            append_prefix = prefix
+            idx += 1
+            continue
+
+        if stripped == "":
+            idx += 1                          # blank: a leading blank, or a gap between blocks; keep scanning
+            continue
+
+        break                                 # first real code / preprocessor line ends the zone
+
+    has_zone = first_comment is not None
+    if not has_zone:
+        return FileDocTarget(eligible=[], insert_index=fresh_index, insert_fresh=True,
+                             style=style, indent="", has_zone=False)
+
+    return FileDocTarget(
+        eligible=eligible,
+        insert_index=append_index if append_index is not None else last_comment + 1,
+        insert_prefix=append_prefix or "// ",
+        insert_fresh=False,
+        style=style,
+        indent="",
+        has_zone=True,
+    )

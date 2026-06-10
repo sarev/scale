@@ -1046,12 +1046,18 @@ def _file_doc_target_for(language: str):
     - The provider callable for `language`.
 
     Raises:
-    - `NotImplementedError`: If the language has no file-doc provider yet (currently only C is wired).
+    - `NotImplementedError`: If the language has no file-doc provider yet.
     """
 
     if language == "c":
         from scale_c import file_doc_target_c
         return file_doc_target_c
+    if language == "js":
+        from scale_javascript import file_doc_target_js
+        return file_doc_target_js
+    if language == "python":
+        from scale_python import file_doc_target_py
+        return file_doc_target_py
     raise NotImplementedError(f"The --file-doc pass does not yet support '{language}'.")
 
 
@@ -1246,8 +1252,8 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--comment", "-c", action="store_true", help="Add and update definition docstrings/header comments")
     p.add_argument("--blocks", "-b", action="store_true", help="Add and update within-function block comments (Python, C, JS)")
     p.add_argument("--file-doc", action="store_true",
-                   help="Add or update a file-level header doccomment, preserving shebang/copyright/license/"
-                        "boilerplate byte-for-byte (C only for now).")
+                   help="Add or update a file-level header doccomment (Python module docstring, or C/JS header "
+                        "comment), preserving shebang/copyright/license/boilerplate byte-for-byte.")
     p.add_argument("--block-comment-style", default="line", choices=("line", "block"),
                    help="Delimiter for block-pass comments in C/JS: 'line' (//) or 'block' (/* */). Ignored for Python.")
     p.add_argument("--comment-value", type=int, default=None, metavar="N",

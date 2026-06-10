@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from scale_blocks import BlockTarget, SegStatement, structural_breaks, SEG_MIN_LEADING_DECLS, SLASH_BLOCK_STYLE
-from scale_filedoc import FileDocTarget
+from scale_filedoc import FileDocTarget, scan_brace_leading_zone
 from scale_llm import LocalChatModel, GenerationConfig, Messages, Chunk
 from scale_log import echo
 from scale_text import fit_snippet, MARKER_C
@@ -282,94 +282,7 @@ def file_doc_target_c(source_blob: str, source_lines: Chunk) -> Optional[FileDoc
     - A `FileDocTarget`, or None if the file is empty.
     """
 
-    if not source_lines or not any(ln.strip() for ln in source_lines):
-        return None
-
-    n = len(source_lines)
-    i = 0
-    if source_lines[0].lstrip().startswith("#!"):     # rare in C, but preserve a shebang if present
-        i = 1
-    fresh_index = i
-
-    eligible: List[Tuple[int, str, str]] = []
-    first_comment = None                 # 0-based index of the first comment line
-    last_comment = None                  # 0-based index of the last comment line
-    append_index = None                  # 0-based insertion point for an appended description
-    append_prefix = ""
-    in_block = False
-
-    idx = i
-    while idx < n:
-        line = source_lines[idx]
-        stripped = line.strip()
-        leading_ws = line[: len(line) - len(line.lstrip())]
-
-        if in_block:
-            first_comment = idx if first_comment is None else first_comment
-            last_comment = idx
-            closes = "*/" in stripped
-            if not closes:
-                body = stripped
-                if body.startswith("*"):
-                    inner = body.lstrip("*").strip()
-                    prefix = leading_ws + "* "
-                else:
-                    inner = body
-                    prefix = leading_ws
-                if inner:
-                    eligible.append((idx + 1, prefix, inner))
-            else:
-                in_block = False
-                append_index = idx          # append before this closing delimiter
-                append_prefix = leading_ws + "* "
-            idx += 1
-            continue
-
-        if stripped.startswith("/*"):
-            first_comment = idx if first_comment is None else first_comment
-            last_comment = idx
-            if "*/" in stripped[2:]:          # single-line /* ... */ - preserve whole, not eligible
-                append_index = idx + 1
-                append_prefix = "// "
-            else:
-                in_block = True
-            idx += 1
-            continue
-
-        if stripped.startswith("//"):
-            first_comment = idx if first_comment is None else first_comment
-            last_comment = idx
-            inner = stripped.lstrip("/").strip()
-            prefix = leading_ws + "// "
-            if inner:
-                eligible.append((idx + 1, prefix, inner))
-            append_index = idx + 1            # append after this line-comment
-            append_prefix = prefix
-            idx += 1
-            continue
-
-        if stripped == "":
-            idx += 1                          # blank: a leading blank, or a gap between blocks; keep scanning
-            continue
-
-        break                                 # first real code / preprocessor line ends the zone
-
-    has_zone = first_comment is not None
-    if not has_zone:
-        return FileDocTarget(
-            eligible=[], insert_index=fresh_index, insert_fresh=True,
-            style=SLASH_BLOCK_STYLE, indent="", has_zone=False,
-        )
-
-    return FileDocTarget(
-        eligible=eligible,
-        insert_index=append_index if append_index is not None else last_comment + 1,
-        insert_prefix=append_prefix or "// ",
-        insert_fresh=False,
-        style=SLASH_BLOCK_STYLE,
-        indent="",
-        has_zone=True,
-    )
+    return scan_brace_leading_zone(source_lines, SLASH_BLOCK_STYLE)
 
 
 # ---------------- C DefInfo

@@ -57,8 +57,8 @@ REPLACE = (
     " * Licensed under the MIT license.\n"
     " */\n"
     "\n"
-    "// Old description line one.\n"
-    "// Old description line two.\n"
+    "// Parses incoming requests and routes them to the registered handlers.\n"
+    "// Owns the per-connection state used while a request is in flight.\n"
     "\n"
     "#include <stdio.h>\n"
     "int main(void) { return 0; }\n"
@@ -71,9 +71,10 @@ def test_replace_preserves_license_and_seeds_provider():
     assert " * Copyright 2025 Acme." in out, "copyright line preserved verbatim"
     assert " * Licensed under the MIT license." in out, "license line preserved verbatim"
     assert "Refined summary of what this file does." in text, "new description inserted"
-    assert "Old description line one." not in text and "Old description line two." not in text, \
+    assert "Parses incoming requests" not in text and "per-connection state" not in text, \
         "the old description lines were replaced"
-    assert seed == "Old description line one. Old description line two.", \
+    assert seed == ("Parses incoming requests and routes them to the registered handlers. "
+                    "Owns the per-connection state used while a request is in flight."), \
         f"the existing description must be handed to the summary provider as a seed, got {seed!r}"
 
 
