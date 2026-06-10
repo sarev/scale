@@ -29,7 +29,7 @@ from scale_project import Symbol, apply_doc_order
 from scale_text import fit_snippet, MARKER_C
 from tree_sitter import Parser, Language  # type: ignore
 from tree_sitter_c import language as c_language
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import re
 import textwrap
 
@@ -579,6 +579,99 @@ def iter_defs_with_info_c(tree, source_bytes: bytes) -> List[DefInfoC]:
     return sorted(results, key=lambda d: (d.start, d.end))
 
 
+def _decl_function_declarator(decl_node):
+    """
+    Return the `function_declarator` of a C `declaration` node iff it is a plain function prototype, else None.
+
+    The declarator chain is descended only through `pointer_declarator` wrappers (a pointer-returning prototype such
+    as `char *foo(int)`); any other wrapper (a `parenthesized_declarator`, as in a function-pointer variable
+    `int (*fp)(int)`) means this is not a prototype, so None is returned.
+
+    Parameters:
+    - `decl_node`: A tree-sitter `declaration` node.
+
+    Returns:
+    - The `function_declarator` node, or None.
+    """
+
+    n = decl_node.child_by_field_name("declarator")
+    while n is not None:
+        if n.type == "function_declarator":
+            return n
+        if n.type == "pointer_declarator":
+            n = n.child_by_field_name("declarator")
+            continue
+        return None
+    return None
+
+
+def _prototype_name(decl_node, source_bytes: bytes) -> Optional[str]:
+    """
+    Return the function name of a C prototype `declaration`, or None if the node is not a plain function prototype.
+
+    Confident-only: a function pointer, an abstract declarator, or any unexpected shape yields None (so it is ignored
+    rather than mis-documented). Pointer-return wrappers around the name are unwound.
+
+    Parameters:
+    - `decl_node`: A tree-sitter `declaration` node.
+    - `source_bytes`: The source bytes the tree was parsed from.
+
+    Returns:
+    - The function name, or None.
+    """
+
+    fd = _decl_function_declarator(decl_node)
+    if fd is None:
+        return None
+    inner = fd.child_by_field_name("declarator")
+    while inner is not None and inner.type == "pointer_declarator":
+        inner = inner.child_by_field_name("declarator")
+    if inner is None or inner.type != "identifier":
+        return None   # function pointer / abstract / unexpected -> not a prototype we redirect to
+    return _node_text(source_bytes, inner)
+
+
+def iter_decls_with_info_c(tree, source_bytes: bytes) -> List[DefInfoC]:
+    """
+    Collect function *prototypes* (forward declarations) from a C file.
+
+    Walks for `declaration` nodes that are plain function prototypes (a `function_declarator` reached only through
+    pointer wrappers), including prototypes nested inside `#ifdef`/`#if` preprocessor blocks. Local variable
+    declarations (inside a function body) are skipped, as are variable/typedef/struct declarations and function-pointer
+    variables (no qualifying `function_declarator`). Each prototype's `header_start`/`header_end`/`start`/`end` all span
+    the prototype itself (which may be multi-line); `kind` is `"declaration"`.
+
+    Parameters:
+    - `tree`: The parsed Tree-sitter tree for the source.
+    - `source_bytes`: The (normalised) source bytes the tree was parsed from.
+
+    Returns:
+    - A list of `DefInfoC` records (kind `"declaration"`), sorted by line span.
+    """
+
+    results: List[DefInfoC] = []
+
+    def walk(n) -> None:
+        """Collect prototypes, not descending into function bodies (local declarations) or other declarations."""
+        if n.type in ("function_definition", "compound_statement"):
+            return  # do not descend into bodies: their local variable declarations are not prototypes
+        if n.type == "declaration":
+            name = _prototype_name(n, source_bytes)
+            if name:
+                s, e = _line_span_from_node(n)
+                results.append(DefInfoC(
+                    qualname=name, node=n, kind="declaration",
+                    start=s, end=e, header_start=s, header_end=e,
+                    depth=0, parent_id=None, children_ids=tuple(),
+                ))
+            return  # a declaration has no nested prototypes
+        for i in range(n.named_child_count):
+            walk(n.named_child(i))
+
+    walk(tree.root_node)
+    return sorted(results, key=lambda d: (d.start, d.end))
+
+
 def _collect_calls_c(node, source_bytes: bytes) -> List[Tuple[str, str]]:
     """
     Collect a C function's call sites for the call-graph resolver: every `f(...)` with a bare-identifier callee.
@@ -614,14 +707,17 @@ def iter_symbols(source_blob: str, source_lines: Chunk) -> List[Symbol]:
 
     Reuses `iter_defs_with_info_c` for the definition records, then attaches each function's header signature, the
     existing doc comment above it (the seed contract, via `_doc_above_header`) and its bare-identifier call sites.
-    Every C function is at file scope (no nesting, no parent). Returns `[]` if the file cannot be parsed.
+    Function *prototypes* (`iter_decls_with_info_c`) are also emitted as `"declaration"` symbols so a header's existing
+    doc can seed a contract for callers; a declaration has no call sites and `build_project_graph` keeps it out of the
+    free-function uniqueness index (so a decl/def pair never makes a name ambiguous). Every C symbol is at file scope
+    (no nesting, no parent). Returns `[]` if the file cannot be parsed.
 
     Parameters:
     - `source_blob`: The complete source text.
     - `source_lines`: The same source split into lines.
 
     Returns:
-    - One `Symbol` per function definition (the `file` field is left blank for `build_project_graph` to stamp).
+    - One `Symbol` per function definition and prototype (the `file` field is left blank for `build_project_graph`).
     """
 
     try:
@@ -630,12 +726,23 @@ def iter_symbols(source_blob: str, source_lines: Chunk) -> List[Symbol]:
         return []
 
     symbols: List[Symbol] = []
+    seen_defs: set = set()
     for d in iter_defs_with_info_c(tree, source_bytes):
         signature = "\n".join(source_lines[d.header_start - 1:d.header_end]) if d.header_end >= d.header_start else ""
+        seen_defs.add(d.qualname)
         symbols.append(Symbol(
             qualname=d.qualname, kind=d.kind, signature=signature, start=d.start, depth=d.depth,
             parent_qualname=None, existing_doc=_doc_above_header(source_lines, d.header_start),
             calls=_collect_calls_c(d.node, source_bytes),
+        ))
+    for d in iter_decls_with_info_c(tree, source_bytes):
+        if d.qualname in seen_defs:
+            continue   # a definition in the same file already carries the symbol/contract for this name
+        signature = "\n".join(source_lines[d.header_start - 1:d.header_end]) if d.header_end >= d.header_start else ""
+        symbols.append(Symbol(
+            qualname=d.qualname, kind="declaration", signature=signature, start=d.start, depth=d.depth,
+            parent_qualname=None, existing_doc=_doc_above_header(source_lines, d.header_start),
+            calls=[],
         ))
     return symbols
 
@@ -885,7 +992,11 @@ def _doc_above_header(source_lines: Chunk, header_start: int) -> str:
                      for ln in block.split("\n")).strip()
 
 
-def iter_block_targets_c(source_blob: str, source_lines: Chunk) -> List[BlockTarget]:
+def iter_block_targets_c(
+    source_blob: str,
+    source_lines: Chunk,
+    doc_override: Optional[Callable[[str], Optional[str]]] = None,
+) -> List[BlockTarget]:
     """
     Build the within-function block targets for a C source file.
 
@@ -897,6 +1008,9 @@ def iter_block_targets_c(source_blob: str, source_lines: Chunk) -> List[BlockTar
     Parameters:
     - `source_blob`: The complete source text (parsed with Tree-sitter C).
     - `source_lines`: The same source split into individual lines.
+    - `doc_override`: Optional `name -> Optional[str]` lookup (the `--doc-site` header doc). When it returns a doc for
+      a function, that becomes the routine's `BlockTarget.doc` instead of the comment above the header - so an
+      implementation whose docstring was redirected to its header still has its contract in the block-comment context.
 
     Returns:
     - A list of `BlockTarget`, one per function, in source order.
@@ -920,6 +1034,9 @@ def iter_block_targets_c(source_blob: str, source_lines: Chunk) -> List[BlockTar
             seg_statements, has_doc=False, boundary_lines=tuple(boundary_lines), body_end=info.end,
             allow_after_def=False, allow_first_in_scope=False,
         )
+        doc = doc_override(info.qualname) if doc_override is not None else None
+        if not doc:
+            doc = _doc_above_header(source_lines, info.header_start)
         targets.append(
             BlockTarget(
                 qualname=info.qualname,
@@ -931,7 +1048,7 @@ def iter_block_targets_c(source_blob: str, source_lines: Chunk) -> List[BlockTar
                 boundary_lines=tuple(boundary_lines),
                 indent_of=indent_of,
                 depth=0,
-                doc=_doc_above_header(source_lines, info.header_start),
+                doc=doc,
                 segments=segments,
             )
         )
@@ -965,6 +1082,159 @@ def assemble_snippet_for_c(source_lines: Chunk, info: DefInfoC) -> str:
     return "".join(parts)
 
 
+# ---------------- Header/implementation documentation site (the `--doc-site` plan)
+#
+# C's convention is to document an extern function where it is *declared* (the `.h` prototype), not where it is
+# *defined* (the `.c` body). SCALE documents the definition, so when a project's headers and sources are annotated
+# together the contract lands in the wrong place. This model-free planner decides, per function and across the whole
+# run, where its doc should live: the prose is still generated from the definition's body (the model needs the body),
+# but it can be *placed* above the prototype and the impl's own docstring *skipped*. The impl's block pass still runs,
+# informed by the header doc (see `iter_block_targets_c`'s `doc_override`). Confident-only, mirroring the call graph:
+# a name is only redirected when it has exactly one definition in the run (so `static` dupes across `.c`s are never
+# touched). Only a *target* header is ever written; a read-only `--reference` file can still supply the body for prose.
+
+
+@dataclass
+class CFileDocPlan:
+    """
+    The per-file slice of a `CDocPlan` handed to the C worker for one source file.
+
+    Attributes:
+    - `skip`: Definition names in this file whose docstring should be skipped (redirected to a header).
+    - `header_names`: Prototype names in this file to document (the header documentation site).
+    - `_plan`: The owning `CDocPlan` (for the cross-file impl-snippet and header-doc recording).
+    """
+
+    skip: Set[str]
+    header_names: Set[str]
+    _plan: "CDocPlan"
+
+    def impl_snippet(self, name: str) -> Optional[str]:
+        """The implementation-body snippet to generate a header prototype's prose from, or None (use the prototype)."""
+        return self._plan.impl_snippet(name)
+
+    def record_header_doc(self, name: str, doc: str) -> None:
+        """Record the full doc generated for a header prototype (so the paired impl's block pass can reuse it)."""
+        self._plan.record_header_doc(name, doc)
+
+
+@dataclass
+class CDocPlan:
+    """
+    The run-wide header/implementation documentation plan (model-free), produced by `plan_doc_sites_c`.
+
+    Attributes:
+    - `skip`: file key -> definition names to leave undocumented (their docs go to a header instead).
+    - `header_names`: file key -> prototype names to document at that file's declarations.
+    - `impl_body`: function name -> `(impl source_lines, def info)` used to generate a header's prose from the body.
+    - `impl_file`: function name -> the impl file key (used to propagate the generated contract to the def's symbol).
+    - `pairs`: `(header_file_key, impl_file_key)` ordering constraints (a header is documented before its impl's
+      block pass runs); only present when both sides are targets.
+    - `header_docs`: function name -> the full doc generated for its prototype (the block-pass `doc_override` source).
+    """
+
+    skip: Dict[str, Set[str]]
+    header_names: Dict[str, Set[str]]
+    impl_body: Dict[str, Tuple[Chunk, DefInfoC]]
+    impl_file: Dict[str, str]
+    pairs: List[Tuple[str, str]]
+    header_docs: Dict[str, str] = field(default_factory=dict)
+
+    def for_file(self, file_key: str) -> CFileDocPlan:
+        """Return the per-file slice (empty sets for a file with no redirected defs or documentable prototypes)."""
+        return CFileDocPlan(
+            skip=self.skip.get(file_key, set()),
+            header_names=self.header_names.get(file_key, set()),
+            _plan=self,
+        )
+
+    def impl_snippet(self, name: str) -> Optional[str]:
+        """Assemble the implementation body for `name` (a pure read of the captured impl lines), or None."""
+        body = self.impl_body.get(name)
+        if body is None:
+            return None
+        lines, info = body
+        return assemble_snippet_for_c(lines, info)
+
+    def record_header_doc(self, name: str, doc: str) -> None:
+        """Store the full doc generated for a header prototype (consumed by the paired impl's block-pass override)."""
+        self.header_docs[name] = doc
+
+    def header_doc(self, name: str) -> Optional[str]:
+        """The full doc generated this run for `name`'s prototype, or None - the block-pass `doc_override` lookup."""
+        return self.header_docs.get(name)
+
+    def has_work(self) -> bool:
+        """Whether the plan redirects anything (else the run behaves exactly as without `--doc-site`)."""
+        return bool(self.skip or self.header_names)
+
+
+def plan_doc_sites_c(files: List[Tuple[str, bool, str, Chunk]], policy: str = "auto") -> CDocPlan:
+    """
+    Build the run-wide header/implementation documentation plan from every C file's definitions and prototypes.
+
+    Confident-only pairing: a function name is redirected to a header only when it has exactly one definition across
+    the run (ambiguous names - e.g. `static` dupes - are left documented at their definitions and logged). A prototype
+    is only a documentation *site* when it appears in a **target** file (a read-only reference is never written).
+
+    Policy:
+    - `"auto"` (default): each target-header prototype is documented (prose from the unique definition's body when one
+      exists, else from the prototype alone) and the definition's impl docstring is skipped when that `.c` is a target.
+    - `"impl"`: definitions are always documented (legacy behaviour); a target-header prototype is still documented, but
+      from its own prototype text, so a header is not left blank and docs may appear in both places.
+
+    Parameters:
+    - `files`: `(file_key, is_target, source_blob, source_lines)` for every C file in the run (targets and references).
+    - `policy`: `"auto"` or `"impl"`.
+
+    Returns:
+    - The populated `CDocPlan`.
+    """
+
+    target_keys = {fk for fk, is_target, _blob, _lines in files if is_target}
+
+    defs_by_name: Dict[str, List[Tuple[str, Chunk, DefInfoC]]] = {}
+    target_decls: Dict[str, List[str]] = {}   # name -> target file keys that declare it (a prototype site)
+    for file_key, is_target, blob, lines in files:
+        try:
+            tree, sb = _parse_c(blob)
+        except Exception:
+            continue
+        for d in iter_defs_with_info_c(tree, sb):
+            defs_by_name.setdefault(d.qualname, []).append((file_key, lines, d))
+        if is_target:
+            for d in iter_decls_with_info_c(tree, sb):
+                target_decls.setdefault(d.qualname, []).append(file_key)
+
+    skip: Dict[str, Set[str]] = {}
+    header_names: Dict[str, Set[str]] = {}
+    impl_body: Dict[str, Tuple[Chunk, DefInfoC]] = {}
+    impl_file: Dict[str, str] = {}
+    pairs: List[Tuple[str, str]] = []
+
+    for name, decl_files in target_decls.items():
+        defs = defs_by_name.get(name, [])
+        unique_def = defs[0] if len(defs) == 1 else None
+        if unique_def is None and len(defs) >= 2:
+            echo(f"doc-site: '{name}' has {len(defs)} definitions across the run; documenting at each (ambiguous).")
+
+        # Every target prototype of this name becomes a documentation site.
+        for dfile in set(decl_files):
+            header_names.setdefault(dfile, set()).add(name)
+
+        if policy == "auto" and unique_def is not None:
+            def_file, def_lines, def_info = unique_def
+            impl_body[name] = (def_lines, def_info)   # header prose is generated from the body
+            impl_file[name] = def_file
+            if def_file in target_keys:
+                skip.setdefault(def_file, set()).add(name)   # the redirected definition's docstring is skipped
+                for dfile in set(decl_files):
+                    if dfile != def_file:
+                        pairs.append((dfile, def_file))      # header documented before the impl's block pass
+
+    return CDocPlan(skip=skip, header_names=header_names, impl_body=impl_body, impl_file=impl_file, pairs=pairs)
+
+
 # ---------------- LLM exchange
 
 def _render_c_block_comment(text: str, base_indent: str) -> List[str]:
@@ -993,6 +1263,65 @@ def _render_c_block_comment(text: str, base_indent: str) -> List[str]:
         out.append(f"{base_indent} * (no documentation)")
     out.append(f"{base_indent} */")
     return out
+
+
+def _render_c_line_comment(text: str, base_indent: str) -> List[str]:
+    """
+    Render a documentation comment as `//` line comments (the line-comment counterpart to `_render_c_block_comment`).
+
+    Used when a file's existing doc comments are `//`-style, so generated docs match the file's prevailing convention
+    instead of always introducing a `/* ... */` block.
+
+    Parameters:
+    - `text`: The comment text (possibly multi-line).
+    - `base_indent`: The base indentation for the comment lines.
+
+    Returns:
+    - A list of `//`-prefixed comment lines.
+    """
+
+    lines = text.splitlines()
+    if not lines:
+        return [f"{base_indent}// (no documentation)"]
+    # rstrip the whole line so a blank doc line is "//" rather than "// " with a trailing space.
+    return [f"{base_indent}// {ln.rstrip()}".rstrip() for ln in lines]
+
+
+def _detect_doc_style_c(tree, source_bytes: bytes) -> str:
+    """
+    Detect whether a C file documents its code with `//` line comments or `/* ... */` block comments.
+
+    Only the leading file-header banner (the first top-level comment) is ignored - a Doxygen `/** ... */` banner is
+    near-universal even in files whose function docs are all `//` - so every other comment is weighed (including the
+    first function's own doc and any `/* ... */` section dividers in the body). Following the rule "if both styles are
+    present, prefer the block form": the result is `"line"` only when the remaining comments use `//` and no
+    `/* ... */`, otherwise `"block"` (the default, including a file with no other comments).
+
+    Parameters:
+    - `tree`: The parsed Tree-sitter tree.
+    - `source_bytes`: The source bytes the tree was parsed from.
+
+    Returns:
+    - `"line"` or `"block"`.
+    """
+
+    root = tree.root_node
+    banner_start = (root.children[0].start_byte
+                    if root.children and root.children[0].type == "comment" else None)
+
+    has_line = has_block = False
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if n.type == "comment" and n.start_byte != banner_start:
+            if source_bytes[n.start_byte:n.start_byte + 2] == b"//":
+                has_line = True
+            else:
+                has_block = True
+        for i in range(n.named_child_count):
+            stack.append(n.named_child(i))
+
+    return "line" if (has_line and not has_block) else "block"
 
 
 def _extract_first_c_comment_block(reply: str) -> str:
@@ -1043,14 +1372,16 @@ def generate_comments_c(
     doc_order: Optional[List[str]] = None,
     callee_context: Optional[Callable[[str], str]] = None,
     on_doc: Optional[Callable[[str, str], None]] = None,
+    doc_plan: Optional[CFileDocPlan] = None,
+    decls: Optional[List[DefInfoC]] = None,
 ) -> Dict[Tuple[int, int], str]:
     """
-    Generate doc comments for each function definition.
+    Generate doc comments for each documentable C record (function definitions and, when redirecting, prototypes).
 
-    This function generates documentation comments for a list of C function definitions.
-    It assembles a snippet of code for each function, prompts the language model to generate a comment,
-    extracts the first C block comment from the response, and stores the result in a dictionary keyed by the
-    function's header span.
+    This function generates documentation comments for a list of C function definitions and (under `--doc-site`)
+    header prototypes. It assembles a snippet of code for each, prompts the language model to generate a comment,
+    extracts the first C block comment from the response, and stores the result in a dictionary keyed by the record's
+    header span.
 
     Parameters:
     - `llm`: The language model instance used for generating comments.
@@ -1063,17 +1394,34 @@ def generate_comments_c(
       order (callees first) instead of source order, falling back to source order for any not listed.
     - `callee_context`: Optional callback `qualname -> notes` appended to each function's generation turn.
     - `on_doc`: Optional callback `(qualname, comment)` invoked after each generated comment (updates the contract).
+    - `doc_plan`: Optional per-file `--doc-site` plan: its `skip` names are left undocumented (redirected to a header),
+      and a prototype's prose is generated from the implementation body via `impl_snippet` when available.
+    - `decls`: Optional prototype records to document (the header documentation site); each generated doc is recorded
+      on the plan so the paired implementation's block pass can reuse it.
 
     Returns:
-    - A dictionary mapping each function's header span to its corresponding documentation comment.
+    - A dictionary mapping each record's header span to its corresponding documentation comment.
     """
 
     doc_map: Dict[Tuple[int, int], str] = {}
 
+    skip = doc_plan.skip if doc_plan is not None else set()
+    records: List[DefInfoC] = [d for d in defs if d.qualname not in skip]
+    if decls:
+        records = records + list(decls)
+
     # C has no nesting; default order is source order. A call-graph `doc_order` documents callees before callers.
-    ordered = apply_doc_order(defs, lambda d: d.qualname, doc_order, lambda d: d.start) if doc_order else defs
+    ordered = apply_doc_order(records, lambda d: d.qualname, doc_order, lambda d: d.start) if doc_order else records
     for info in ordered:
-        snippet = assemble_snippet_for_c(source_lines, info)
+        is_decl = info.kind == "declaration"
+
+        # A redirected prototype's prose is generated from the implementation body (the model needs the body); when
+        # no implementation is available in the run, the prototype text itself is used.
+        snippet = None
+        if is_decl and doc_plan is not None:
+            snippet = doc_plan.impl_snippet(info.qualname)
+        if not snippet:
+            snippet = assemble_snippet_for_c(source_lines, info)
 
         # Elide the body if this function is too large for the context window (the patch is unaffected).
         header_lines = max(1, info.header_end - info.header_start + 1)
@@ -1109,13 +1457,17 @@ def generate_comments_c(
         # Publish this function's freshly-generated contract for later callers.
         if on_doc is not None:
             on_doc(info.qualname, body)
+        # Record a header prototype's full doc so the paired implementation's block pass can reuse it as context.
+        if is_decl and doc_plan is not None:
+            doc_plan.record_header_doc(info.qualname, body)
 
     return doc_map
 
 
 # ---------------- Textual patcher
 
-def patch_comments_textually_c(source_lines: Chunk, defs: List[DefInfoC], doc_map: Dict[Tuple[int, int], str]) -> Chunk:
+def patch_comments_textually_c(source_lines: Chunk, defs: List[DefInfoC], doc_map: Dict[Tuple[int, int], str],
+                               style: str = "block") -> Chunk:
     """
     Insert or replace documentation blocks for each C function.
 
@@ -1130,11 +1482,14 @@ def patch_comments_textually_c(source_lines: Chunk, defs: List[DefInfoC], doc_ma
     - `source_lines`: The original source code as a list of lines.
     - `defs`: A list of `DefInfoC` objects containing information about each C function definition.
     - `doc_map`: A dictionary mapping function definition keys to their corresponding documentation comments.
+    - `style`: `"block"` to render each doc as a `/* ... */` block (default) or `"line"` to render it as `//` line
+      comments (chosen to match the file's prevailing doc-comment convention; see `_detect_doc_style_c`).
 
     Returns:
     - The updated source code with inserted or replaced documentation blocks.
     """
 
+    render = _render_c_line_comment if style == "line" else _render_c_block_comment
     out_lines = source_lines[:]
 
     # Edit bottom-up to keep line numbers stable
@@ -1147,7 +1502,7 @@ def patch_comments_textually_c(source_lines: Chunk, defs: List[DefInfoC], doc_ma
 
         header_line_text = source_lines[info.header_start - 1]
         indent = header_line_text[: len(header_line_text) - len(header_line_text.lstrip())]
-        new_block_lines = _render_c_block_comment(doc, indent)
+        new_block_lines = render(doc, indent)
 
         existing = _scan_existing_comment_block_above(out_lines, info.header_start)
         if existing:
@@ -1171,6 +1526,7 @@ def generate_language_comments(
     doc_order: Optional[List[str]] = None,
     callee_context: Optional[Callable[[str], str]] = None,
     on_doc: Optional[Callable[[str, str], None]] = None,
+    doc_plan: Optional[CFileDocPlan] = None,
 ) -> Chunk:
     """
     Generate language comments for a given C source code.
@@ -1178,9 +1534,9 @@ def generate_language_comments(
     This function performs the following steps:
 
     - Parses the C source code using Tree-sitter C.
-    - Collects function definitions, ignoring forward declarations.
-    - Asks the LLM to generate block comment text for each definition.
-    - Patches the original source code by inserting or replacing blocks above function headers.
+    - Collects function definitions (and, under `--doc-site`, header prototypes to document).
+    - Asks the LLM to generate block comment text for each documentable record.
+    - Patches the original source code by inserting or replacing blocks above function headers/prototypes.
     - Returns the updated source lines.
 
     Parameters:
@@ -1191,6 +1547,8 @@ def generate_language_comments(
     - `source_lines`: The original source code split into lines.
     - `doc_order`/`callee_context`/`on_doc`: Optional call-graph hooks (see `generate_comments_c`); absent, behaviour
       is unchanged.
+    - `doc_plan`: Optional per-file `--doc-site` plan: redirected definitions are left undocumented and any header
+      prototypes it names are documented (prose from the implementation body) above their declarations.
 
     Returns:
     - The updated source lines with generated comments.
@@ -1201,13 +1559,25 @@ def generate_language_comments(
     defs = iter_defs_with_info_c(tree, source_bytes)
     echo(f"Found {len(defs)} C function definition(s)")
 
+    # Under --doc-site, also document the file's prototypes the plan has chosen as documentation sites.
+    decls: List[DefInfoC] = []
+    if doc_plan is not None and doc_plan.header_names:
+        decls = [d for d in iter_decls_with_info_c(tree, source_bytes) if d.qualname in doc_plan.header_names]
+        echo(f"Documenting {len(decls)} prototype(s) at the header (doc-site redirect)")
+
+    # Match the file's prevailing doc-comment convention (a header whose function docs are `//` should not be given
+    # `/* ... */` blocks); the leading Doxygen banner is ignored, and a mix prefers the block form.
+    style = _detect_doc_style_c(tree, source_bytes)
+    echo(f"Doc-comment style for this file: {style}")
+
     # Provide a list of #includes to the LLM (if there are any)
     echo("Identifying #includes...")
     describe_includes_c(llm, cfg, messages, tree, source_bytes)
 
     echo("Generating C comments...\n")
     doc_map = generate_comments_c(llm, cfg, messages, defs, source_blob, source_lines,
-                                  doc_order=doc_order, callee_context=callee_context, on_doc=on_doc)
+                                  doc_order=doc_order, callee_context=callee_context, on_doc=on_doc,
+                                  doc_plan=doc_plan, decls=decls)
 
     echo("Applying C patches...\n")
-    return patch_comments_textually_c(source_lines, defs, doc_map)
+    return patch_comments_textually_c(source_lines, defs + decls, doc_map, style=style)

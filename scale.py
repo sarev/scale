@@ -33,6 +33,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import argparse
 import hashlib
 import pickle
+import re
 import sys
 import uuid
 
@@ -83,6 +84,43 @@ SHORT_SUMMARY_INSTRUCTION = (
     "In one or two sentences, say what this {language} source file is for and the kind of code it contains - quick "
     "context for a reader, not a full description. Plain prose, no list, no preamble."
 )
+
+
+# File suffixes treated as headers (a public-interface declaration file rather than an implementation). Knowing a file
+# is a header changes how its documentation should read - the external contract callers rely on, not internal detail -
+# so the file's identity is injected into the priming context of the summary, definition, and block passes.
+_HEADER_SUFFIXES = {".h", ".hpp", ".hh", ".hxx", ".h++", ".hp"}
+
+# `--block-comments` density -> the 1-3 value threshold a paragraph comment must clear to be written. 'high' keeps all
+# (threshold 1), 'medium' drops bare restatements (2), 'low' keeps only intent/gotcha notes (3). Spacing-only (no
+# --block-comments) uses 4, which no 1-3 score can clear, so the comment turns are skipped entirely.
+BLOCK_COMMENT_LEVELS = {"high": 1, "medium": 2, "low": 3}
+
+
+def _file_identity_note(src_path: Path, language: str) -> str:
+    """
+    Return a one-line note naming the file being documented and (for C) whether it is a header or an implementation.
+
+    A header's documentation describes the external interface; an implementation's describes internal behaviour. Naming
+    the file and its role in the priming context steers the summary, definition, and block passes accordingly - most
+    sharply for a header, whose comments should read as the public contract rather than implementation detail.
+
+    Parameters:
+    - `src_path`: The source file being documented.
+    - `language`: The resolved language identifier.
+
+    Returns:
+    - A short context sentence.
+    """
+
+    name = src_path.name
+    if src_path.suffix.lower() in _HEADER_SUFFIXES:
+        return (f"The file being documented is `{name}`, a header file: it declares a module's public interface, so "
+                f"its documentation should describe the external contract a caller relies on - each function's "
+                f"purpose, its parameters and its return value - rather than internal implementation detail.")
+    if language == "c":
+        return f"The file being documented is `{name}`, a C implementation file."
+    return f"The file being documented is `{name}`."
 
 
 # ---------------------------- CLI harness ----------------------------
@@ -639,6 +677,61 @@ def _fill_summary_instruction(desc_spec: Optional[str], language: str, seed: Opt
     return template.replace("{language}", language).replace("{seed}", seed_clause)
 
 
+# A line that opens with a list/heading marker: numbered ("1." / "2)"), bulleted ("- "/"* "/"+ "/"• "), a markdown
+# heading ("## "), or a bold label ("**Key operations**:"). The file-DESCRIPTION spec asks for flowing prose, but a
+# small model summarising a large file via map-reduce sometimes returns a structured list anyway - this catches it.
+_LIST_MARKER_RE = re.compile(r"(?m)^\s*(?:\d+[.)]\s|[-*+•]\s|#{1,6}\s|\*\*[^*\n]+\*\*\s*:)")
+
+
+def _looks_listy(text: str) -> bool:
+    """Return True if `text` reads as a list/headings rather than flowing prose (>= 2 list/heading markers)."""
+    return len(_LIST_MARKER_RE.findall(text or "")) >= 2
+
+
+def _strip_list_markers(text: str) -> str:
+    """Deterministically remove leading list/heading markers and bold emphasis (the last-resort de-list fallback)."""
+    out: List[str] = []
+    for ln in (text or "").split("\n"):
+        s = re.sub(r"^\s*(?:\d+[.)]|[-*+•]|#{1,6})\s+", "", ln)   # leading number/bullet/heading marker
+        s = re.sub(r"\*\*([^*\n]+)\*\*", r"\1", s)                      # **bold** -> bold
+        out.append(s)
+    return "\n".join(out)
+
+
+def _reflow_if_listy(llm: LocalChatModel, cfg: GenerationConfig, base_messages: Messages, text: str,
+                     max_tokens: int) -> str:
+    """
+    If a generated file description came back as a list/headings, ask the model once to rewrite it as flowing prose.
+
+    The summary spec asks for prose, but the small model occasionally ignores that on a large (map-reduced) file. One
+    reflow turn usually fixes it; if it still looks listy (or comes back empty) the markers are stripped
+    deterministically so the final description never carries list/heading syntax into a doc-comment.
+
+    Parameters:
+    - `llm`/`cfg`: The model and base generation config.
+    - `base_messages`: The priming context to rewrite against.
+    - `text`: The candidate description.
+    - `max_tokens`: The reply-token cap for the reflow turn.
+
+    Returns:
+    - A description in flowing prose (reflowed, or marker-stripped as a fallback), or the original if it was fine.
+    """
+
+    if not _looks_listy(text):
+        return text
+    echo("File description came back as a list; asking for flowing prose...")
+    prompt = (
+        "The following file description uses lists, numbering, headings, or bold markers. Rewrite it as two or three "
+        "short paragraphs of flowing prose that preserve the information but contain NO numbered or bulleted lists, NO "
+        "headings, and no bold or asterisk markers. Give only the rewritten description.\n\n" + text
+    )
+    turn_cfg = replace(cfg, max_new_tokens=max_tokens)
+    reflowed = llm.generate((base_messages or []) + [{"role": "user", "content": prompt}], cfg=turn_cfg).strip()
+    if reflowed and not _looks_listy(reflowed):
+        return reflowed
+    return _strip_list_markers(reflowed or text)
+
+
 def _generate_file_summary(
     llm: LocalChatModel,
     cfg: GenerationConfig,
@@ -679,9 +772,10 @@ def _generate_file_summary(
 
     # Fast path: the whole file fits in a single turn, written straight to the description spec.
     if base_overhead + llm.estimate_tokens(source_blob) + SUMMARY_WRAPPER_TOKENS <= limit:
-        return summarise(llm, summary_cfg, source_blob, LENGTH_PARAGRAPHS, base_messages=base_messages,
-                         subject=f"a complete {language} source file", max_tokens=SUMMARY_MAX_TOKENS,
-                         instruction=description_instruction)
+        result = summarise(llm, summary_cfg, source_blob, LENGTH_PARAGRAPHS, base_messages=base_messages,
+                           subject=f"a complete {language} source file", max_tokens=SUMMARY_MAX_TOKENS,
+                           instruction=description_instruction)
+        return _reflow_if_listy(llm, summary_cfg, base_messages, result, SUMMARY_MAX_TOKENS)
 
     # Map: summarise the file in context-sized chunks (64 tokens of headroom for the wrapper text). The map/reduce
     # steps stay thorough/generic so no detail is lost before the final description-shaping turn.
@@ -698,9 +792,10 @@ def _generate_file_summary(
 
     # Reduce the partials into one overall summary, then reshape it to the file-description spec in a final turn.
     overall = _reduce_summaries(llm, summary_cfg, base_messages, partials, language, limit, base_overhead)
-    return summarise(llm, summary_cfg, overall, LENGTH_PARAGRAPHS, base_messages=base_messages,
-                     subject=f"a draft overview of a {language} source file", max_tokens=SUMMARY_MAX_TOKENS,
-                     instruction=description_instruction)
+    result = summarise(llm, summary_cfg, overall, LENGTH_PARAGRAPHS, base_messages=base_messages,
+                       subject=f"a draft overview of a {language} source file", max_tokens=SUMMARY_MAX_TOKENS,
+                       instruction=description_instruction)
+    return _reflow_if_listy(llm, summary_cfg, base_messages, result, SUMMARY_MAX_TOKENS)
 
 
 def _get_file_summary(
@@ -857,6 +952,11 @@ def prime_llm_for_comments(
             "Here is some background on the wider project this file belongs to:\n\n" + project_context})
         messages.append({"role": "assistant", "content": PRIMING_ACK})
 
+    # Name the file (and, for C, whether it is a header or an implementation) so the summary and every routine/block
+    # turn write to the file's role - a header's external contract vs an implementation's internal detail.
+    messages.append({"role": "user", "content": _file_identity_note(src_path, language)})
+    messages.append({"role": "assistant", "content": PRIMING_ACK})
+
     # Now summarise the whole file for context (chunked map-reduce kicks in automatically for large files; see
     # _generate_file_summary). The summary is generated against the system prompt alone (the only turn so far). The
     # definition pass is context-starved - the routine body matters more there - so it gets the SHORT (squashed) file
@@ -895,6 +995,7 @@ def _def_pass(
     doc_order: Optional[List[str]] = None,
     callee_context: Optional[Callable[[str], str]] = None,
     on_doc: Optional[Callable[[str, str], None]] = None,
+    doc_plan=None,
 ) -> List[str]:
     """
     Run the definition (docstring/header-comment) pass for the resolved language.
@@ -909,6 +1010,8 @@ def _def_pass(
     - `escalation`: Optional `scale_escalate.Escalation` (Python only).
     - `doc_order`/`callee_context`/`on_doc`: Optional call-graph hooks threaded to the worker (all three languages);
       absent, the worker's behaviour is unchanged.
+    - `doc_plan`: Optional per-file `--doc-site` plan (C only); redirects docs to header prototypes and skips the
+      redirected definitions' docstrings.
 
     Returns:
     - The annotated source split into individual lines.
@@ -923,6 +1026,10 @@ def _def_pass(
         from scale_javascript import generate_language_comments
     elif language == "c":
         from scale_c import generate_language_comments
+        # Only the C worker has a header/implementation doc-site plan.
+        return generate_language_comments(llm, cfg, messages, source_blob, source_lines,
+                                          doc_order=doc_order, callee_context=callee_context, on_doc=on_doc,
+                                          doc_plan=doc_plan)
     else:
         raise ValueError(f"Unsupported language '{language}'")
     return generate_language_comments(llm, cfg, messages, source_blob, source_lines,
@@ -956,7 +1063,7 @@ def _block_provider_for(language: str):
         from scale_javascript import iter_block_targets_js
         return iter_block_targets_js
     raise NotImplementedError(
-        f"The --blocks pass does not yet support '{language}'."
+        f"The block pass does not yet support '{language}'."
     )
 
 
@@ -1022,6 +1129,72 @@ def _build_call_graph(targets: List[Path], references: List[Path], language_arg:
     return graph, scale_project.ContractStore(graph)
 
 
+def _build_c_doc_plan(targets: List[Path], references: List[Path], language_arg: Optional[str], policy: str):
+    """
+    Build the C header/implementation documentation-site plan, or None if the run has no C file (the model-free pass).
+
+    Every target and reference file is loaded and, if it is C, parsed for definitions and prototypes; the plan decides
+    where each function's doc lives (see `scale_c.plan_doc_sites_c`). References supply bodies/prototypes but are never
+    written (only target prototypes are documentation sites).
+
+    Parameters:
+    - `targets`: The files to be annotated.
+    - `references`: The read-only reference files.
+    - `language_arg`: The forced `--language` value (lowercased), or None to auto-detect per file.
+    - `policy`: The `--doc-site` policy (`"auto"` or `"impl"`).
+
+    Returns:
+    - A `scale_c.CDocPlan`, or None when no C file is present.
+    """
+
+    target_keys = {str(t.resolve()) for t in targets}
+    files: list = []
+    for f in list(targets) + list(references):
+        try:
+            blob, lines, _le, lang = load_source(f, language_arg)
+        except OSError:
+            continue
+        if lang != "c":
+            continue
+        key = str(f.resolve())
+        files.append((key, key in target_keys, blob, lines))
+
+    if not files:
+        return None
+    from scale_c import plan_doc_sites_c
+    return plan_doc_sites_c(files, policy)
+
+
+def _order_header_before_impl(targets: List[Path], pairs: List[Tuple[str, str]]) -> List[Path]:
+    """
+    Reorder target files so each header precedes the implementation it is paired with, preserving the prior order.
+
+    A stable topological sort over the `(header_key, impl_key)` constraints with the current position as the tiebreak,
+    so the call-graph file order is kept except where a header must move ahead of its impl. Any cycle (which a clean
+    header/impl split cannot produce) collapses harmlessly via the shared SCC ordering.
+
+    Parameters:
+    - `targets`: The current target ordering.
+    - `pairs`: `(header_file_key, impl_file_key)` constraints from the doc-site plan.
+
+    Returns:
+    - The targets reordered.
+    """
+
+    if not pairs:
+        return targets
+    keys = [str(t.resolve()) for t in targets]
+    by_key = {str(t.resolve()): t for t in targets}
+    idx = {k: i for i, k in enumerate(keys)}
+    kset = set(keys)
+    succ: dict = {k: set() for k in keys}
+    for hk, ik in pairs:
+        if hk in kset and ik in kset and hk != ik:
+            succ[hk].add(ik)                       # the header precedes the implementation
+    ordered = scale_project._leaf_first_order(keys, succ, tiebreak=lambda k: idx[k])
+    return [by_key[k] for k in ordered]
+
+
 def _block_style_for(language: str, comment_style: str = "line"):
     """
     Return the comment-style descriptor that drives block-comment rendering for `language`.
@@ -1044,7 +1217,7 @@ def _block_style_for(language: str, comment_style: str = "line"):
     if language in ("c", "js", "javascript"):
         return SLASH_BLOCK_STYLE if comment_style == "block" else SLASH_LINE_STYLE
     raise NotImplementedError(
-        f"The --blocks pass does not yet support '{language}'."
+        f"The block pass does not yet support '{language}'."
     )
 
 
@@ -1075,6 +1248,7 @@ def _block_pass(
     comment_style: str = "line",
     comment_value: Optional[int] = None,
     escalation=None,
+    doc_override: Optional[Callable[[str], Optional[str]]] = None,
 ) -> List[str]:
     """
     Run the within-function "blob" pass: annotate logical groups of statements inside each routine body.
@@ -1100,7 +1274,12 @@ def _block_pass(
     from scale_blocks import annotate_blocks
     provider = _block_provider_for(language)
     style = _block_style_for(language, comment_style)
-    targets = provider(source_blob, source_lines)
+    # The C provider accepts a `--doc-site` header-doc override (so a redirected implementation's block pass still has
+    # the routine's contract); other providers do not take it.
+    if doc_override is not None and language == "c":
+        targets = provider(source_blob, source_lines, doc_override=doc_override)
+    else:
+        targets = provider(source_blob, source_lines)
     return annotate_blocks(
         llm, cfg, messages, source_lines, targets, style,
         segment_prompt=_read_optional(scale_path / "blocks.segment.txt"),
@@ -1199,6 +1378,11 @@ def _file_doc_pass(
                 "Here is some background on the wider project this file belongs to:\n\n" + project_context},
             {"role": "assistant", "content": PRIMING_ACK},
         ]
+    # Name the file and its role (header vs implementation) so the generated header description reads accordingly.
+    base = base + [
+        {"role": "user", "content": _file_identity_note(src_path, language)},
+        {"role": "assistant", "content": PRIMING_ACK},
+    ]
 
     def summary_provider(seed: Optional[str]) -> str:
         return _get_file_summary(
@@ -1231,6 +1415,8 @@ def generate_comments(
     doc_order: Optional[List[str]] = None,
     callee_context: Optional[Callable[[str], str]] = None,
     on_doc: Optional[Callable[[str, str], None]] = None,
+    doc_plan=None,
+    doc_override: Optional[Callable[[str], Optional[str]]] = None,
 ) -> int:
     """
     Generate comments for the provided (already-loaded) source code using a Large Language Model (LLM).
@@ -1258,6 +1444,8 @@ def generate_comments(
       instead of being commented by the local model (the caller serialises the manifest afterwards).
     - `doc_order`/`callee_context`/`on_doc`: Optional call-graph hooks for the definition pass (see `_def_pass`),
       bound by the caller over the shared `ContractStore` and this file. Absent, the def pass behaves as before.
+    - `doc_plan`: Optional per-file `--doc-site` plan (C only) threaded to the def pass; `doc_override` is the matching
+      block-pass header-doc lookup so a redirected implementation's block pass keeps the routine's contract.
 
     Returns:
     - 0 if the operation was successful, or an error number.
@@ -1286,7 +1474,7 @@ def generate_comments(
         )
         current_blob = line_ending.join(new_lines)
         new_lines = _def_pass(llm, cfg, messages, current_blob, new_lines, language, escalation=escalation,
-                              doc_order=doc_order, callee_context=callee_context, on_doc=on_doc)
+                              doc_order=doc_order, callee_context=callee_context, on_doc=on_doc, doc_plan=doc_plan)
 
     if do_blocks:
         try:
@@ -1300,7 +1488,8 @@ def generate_comments(
             project_context=project_context,
         )
         new_lines = _block_pass(llm, cfg, scale_path, messages, current_blob, new_lines, language,
-                                comment_style=block_comment_style, comment_value=comment_value, escalation=escalation)
+                                comment_style=block_comment_style, comment_value=comment_value, escalation=escalation,
+                                doc_override=doc_override)
 
     # Write the output
     if dst_path:
@@ -1322,22 +1511,6 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     Parameters:
     - argv: Optional list of strings to parse as command-line arguments. If not provided, sys.argv[1:] is used.
-    - model: Path to GGUF model file (optional).
-    - output: Output filename (optional).
-    - comment: Add and update comments in the source code (optional).
-    - language: Source file language (optional). SCALE currently supports 'python', 'js', 'c'.
-    - verbose: Output progress information to stdout (optional).
-    - very-verbose: Output LLM debug information to stdout (optional).
-    - no-cache: Don't load the summary text for this file from cache.
-    - n-ctx: Number of tokens to use as context (default: 32 * 1024).
-    - max-new-tokens: Maximum number of new tokens to generate (default: 8 * 1024).
-    - format: Chat format override (default: 'auto').
-    - temperature: Temperature value for the LLM (default: 0.2).
-    - top-p: Top-p value for the LLM (default: 0.9).
-    - top-k: Top-k value for the LLM (default: 60).
-    - repeat-penalty: Repeat penalty value for the LLM (default: 1.05).
-    - n-batch: Number of batches to process (default: 512).
-    - n-gpu-layers: Number of GPU layers to use (default: -1).
 
     Returns:
     - An argparse.Namespace object containing the parsed arguments.
@@ -1352,23 +1525,28 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--model", "-m", default="", help="Optional path to GGUF model file")
     p.add_argument("--output", "-o", default="", help="Optional output filename")
     p.add_argument("--comment", "-c", action="store_true", help="Add and update definition docstrings/header comments")
-    p.add_argument("--blocks", "-b", action="store_true", help="Add and update within-function block comments (Python, C, JS)")
-    p.add_argument("--file-doc", action="store_true",
+    p.add_argument("--block-spacing", "-b", action="store_true",
+                   help="Within-function block pass (Python, C, JS): split each routine body into paragraphs with "
+                        "blank lines. On its own this adds spacing only; add --block-comments to also write comments.")
+    p.add_argument("--file-doc", "-fd", action="store_true",
                    help="Add or update a file-level header doccomment (Python module docstring, or C/JS header "
                         "comment), preserving shebang/copyright/license/boilerplate byte-for-byte.")
-    p.add_argument("--block-comment-style", default="line", choices=("line", "block"),
+    p.add_argument("--block-comment-style", "-bs", default="line", choices=("line", "block"),
                    help="Delimiter for block-pass comments in C/JS: 'line' (//) or 'block' (/* */). Ignored for Python.")
-    p.add_argument("--comment-value", type=int, default=None, metavar="N",
-                   help="Block pass: only write a paragraph comment whose model-rated value is >= N (1-5; default 3). "
-                        "Higher is stricter; 1 keeps all. N above 5 (e.g. 6) skips the comment turns entirely and only "
-                        "paragraphs the body (no model work). Lower-value notes still inform later paragraphs' context.")
+    p.add_argument("--block-comments", "-bc", choices=("low", "medium", "high"), default=None,
+                   help="Write within-function block comments at the chosen density (implies the block pass): 'high' "
+                        "keeps all of them, 'medium' drops bare restatements, 'low' keeps only intent/gotcha notes.")
     p.add_argument("--language", "-l", default=None, help="Source file language. SCALE currently supports: 'python', 'js', 'c'")
-    p.add_argument("--project-doc", default="", metavar="PATH",
+    p.add_argument("--project-doc", "-p", default="", metavar="PATH",
                    help="Project overview to distil into background context for every file (e.g. CLAUDE.md/README). "
                         "Default: auto-detect near the source. 'none' disables it; or pass an explicit path.")
-    p.add_argument("--reference", action="append", default=[], metavar="PATH",
+    p.add_argument("--reference", "-r", action="append", default=[], metavar="PATH",
                    help="Read-only file(s)/dir(s)/glob(s) for SCALE to consult for context but never edit (e.g. the "
                         "project's headers). Repeatable. Their one-line summaries are shared with every target.")
+    p.add_argument("--doc-site", default="auto", choices=("auto", "impl"),
+                   help="C only: where an extern function is documented. 'auto' (default) documents a target header's "
+                        "prototype (prose from the definition's body) and skips the implementation's docstring; 'impl' "
+                        "keeps the implementation docstring (legacy) while still documenting target prototypes.")
     p.add_argument("--verbose", "-v", action="store_true", help="Output progress information to stdout")
     p.add_argument("--very-verbose", "-vv", action="store_true", help="Output LLM debug information to stdout")
     p.add_argument("--no-cache", "-nc", action="store_true", help="Don't load the summary text for this file from cache")
@@ -1380,7 +1558,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--top-k", "-K", type=int, default=60, help="Top-k value for the LLM")
     p.add_argument("--repeat-penalty", "-R", type=float, default=1.05, help="Repeat penalty value for the LLM")
     p.add_argument("--n-batch", type=int, default=256, help="Number of batches to process")
-    p.add_argument("--n-gpu-layers", type=int, default=-1, help="Number of GPU layers to use")
+    p.add_argument("--n-gpu-layers", "-g", type=int, default=-1, help="Number of GPU layers to use")
 
     # Selective escalation to a stronger model (Python only for now).
     p.add_argument("--emit-manifest", default="", metavar="PATH",
@@ -1536,8 +1714,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 1
         return _apply_manifest_file(src_path, dst_path, language, source_blob, source_lines, line_ending, manifest)
 
-    if not (args.comment or args.blocks or args.file_doc):
-        # Nothing to do without --comment, --blocks, or --file-doc.
+    # The block pass runs when spacing is requested or comments are requested (comments imply the pass). The comment
+    # density maps to the 1-3 value threshold; with spacing only, 4 disables the comment turns (paragraph only).
+    do_blocks = args.block_spacing or args.block_comments is not None
+    block_threshold = BLOCK_COMMENT_LEVELS.get(args.block_comments, 4)
+
+    if not (args.comment or do_blocks or args.file_doc):
+        # Nothing to do without --comment, --block-spacing/--block-comments, or --file-doc.
         return 0
 
     if dst_path is not None and len(targets) > 1:
@@ -1593,6 +1776,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             key_to_path = {str(t.resolve()): t for t in targets}
             targets = [key_to_path[k] for k in graph.file_order(list(key_to_path.keys()))]
 
+    # Build the C header/implementation documentation-site plan (model-free) and reorder targets so a header is
+    # documented before the implementation it is paired with (so the impl's block pass can reuse the header doc).
+    # Only the definition pass acts on it; a non-C run yields None and changes nothing.
+    c_plan = None
+    if args.comment:
+        c_plan = _build_c_doc_plan(targets, references, language_arg, args.doc_site)
+        if c_plan is not None and c_plan.pairs:
+            targets = _order_header_before_impl(targets, c_plan.pairs)
+
     # Annotate each target in turn (single target -> -o or stdout; multiple targets -> in place).
     rc = 0
     for target in targets:
@@ -1626,6 +1818,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             callee_context = lambda q, fk=file_key: store.callee_notes(fk, q)
             on_doc = lambda q, doc, fk=file_key: store.update(fk, q, doc)
 
+        # Bind the C doc-site plan for this file (redirected defs / documentable prototypes) and the block-pass
+        # header-doc override (so a redirected implementation's block pass still sees the routine's contract).
+        doc_plan = doc_override = None
+        if c_plan is not None and language == "c":
+            doc_plan = c_plan.for_file(str(target.resolve()))
+            doc_override = lambda name, p=c_plan: p.header_doc(name)
+
         out = dst_path if len(targets) == 1 else target
         echo(f"Annotating {target}...")
         frc = generate_comments(
@@ -1633,18 +1832,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             source_blob, source_lines, line_ending, language,
             no_cache=args.no_cache,
             do_comment=args.comment,
-            do_blocks=args.blocks,
+            do_blocks=do_blocks,
             do_file_doc=args.file_doc,
             block_comment_style=args.block_comment_style,
-            comment_value=args.comment_value,
+            comment_value=block_threshold,
             escalation=escalation,
             project_context=project_context,
             doc_order=doc_order,
             callee_context=callee_context,
             on_doc=on_doc,
+            doc_plan=doc_plan,
+            doc_override=doc_override,
         )
         if frc != 0:
             rc = frc
+
+        # Propagate any header docs generated this file to the implementation's contract key, so a later caller that
+        # resolved to the definition still sees the freshly-generated contract (a redirected def writes no docstring).
+        if c_plan is not None and store is not None:
+            for nm, doc in list(c_plan.header_docs.items()):
+                ik = c_plan.impl_file.get(nm)
+                if ik:
+                    store.update(ik, nm, doc)
 
         # Serialise the deferred requests so a stronger model can answer them (then re-run with --apply-manifest).
         if frc == 0 and escalation is not None:

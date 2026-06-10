@@ -1,1 +1,1 @@
-This is a longer routine - a good section heading earns its place, so score generously when the note helps a reader navigate the body, even if it lightly echoes the docstring.
+This is a longer routine, so a clear signpost earns its place: a good navigational heading is a 2 even if it lightly echoes the code - but still give 1 to a bare restatement, and 3 to genuine intent or a gotcha.

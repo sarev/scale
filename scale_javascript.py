@@ -1326,6 +1326,64 @@ def _render_jsdoc_block(text: str, base_indent: str) -> List[str]:
     return out
 
 
+def _render_js_line_comment(text: str, base_indent: str) -> List[str]:
+    """
+    Render a documentation comment as `//` line comments (the line-comment counterpart to `_render_jsdoc_block`).
+
+    Used when a file's existing doc comments are `//`-style, so generated docs match the file's convention instead of
+    always introducing a `/** ... */` JSDoc block.
+
+    Parameters:
+    - `text`: The comment text (possibly multi-line).
+    - `base_indent`: The base indentation for the comment lines.
+
+    Returns:
+    - A list of `//`-prefixed comment lines.
+    """
+
+    lines = text.splitlines()
+    if not lines:
+        return [f"{base_indent}// (no documentation)"]
+    # rstrip the whole line so a blank doc line is "//" rather than "// " with a trailing space.
+    return [f"{base_indent}// {ln.rstrip()}".rstrip() for ln in lines]
+
+
+def _detect_doc_style_js(tree, source_bytes: bytes) -> str:
+    """
+    Detect whether a JS file documents its code with `//` line comments or `/* ... */` (JSDoc) block comments.
+
+    Only the leading file-header banner (the first top-level comment) is ignored, so every other comment is weighed
+    (including the first definition's own doc). Following "if both styles are present, prefer the block form", the
+    result is `"line"` only when the remaining comments use `//` and no `/* ... */`, otherwise `"block"` (the default,
+    including a file with no other comments).
+
+    Parameters:
+    - `tree`: The parsed Tree-sitter tree.
+    - `source_bytes`: The source bytes the tree was parsed from.
+
+    Returns:
+    - `"line"` or `"block"`.
+    """
+
+    root = tree.root_node
+    banner_start = (root.children[0].start_byte
+                    if root.children and root.children[0].type == "comment" else None)
+
+    has_line = has_block = False
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if n.type == "comment" and n.start_byte != banner_start:
+            if source_bytes[n.start_byte:n.start_byte + 2] == b"//":
+                has_line = True
+            else:
+                has_block = True
+        for i in range(n.named_child_count):
+            stack.append(n.named_child(i))
+
+    return "line" if (has_line and not has_block) else "block"
+
+
 def _strip_jsdoc_gutters(block: List[str]) -> str:
     """
     Strip the leading JSDoc gutter from each line of a comment block and join the result.
@@ -1593,7 +1651,8 @@ def _scan_existing_comment_block_above(source_lines: Chunk, header_start_line_1b
     return None
 
 
-def patch_comments_textually_js(source_lines: Chunk, defs: List[DefInfoJS], doc_map: Dict[int, str]) -> Chunk:
+def patch_comments_textually_js(source_lines: Chunk, defs: List[DefInfoJS], doc_map: Dict[int, str],
+                                style: str = "block") -> Chunk:
     """
     Insert or replace documentation blocks for each JS definition.
 
@@ -1606,11 +1665,14 @@ def patch_comments_textually_js(source_lines: Chunk, defs: List[DefInfoJS], doc_
     - `source_lines`: The input source code as a list of lines.
     - `defs`: A list of `DefInfoJS` objects representing the definitions to be processed.
     - `doc_map`: A dictionary mapping definition names to their corresponding documentation strings.
+    - `style`: `"block"` to render each doc as a `/** ... */` JSDoc block (default) or `"line"` to render it as `//`
+      line comments (chosen to match the file's prevailing doc-comment convention; see `_detect_doc_style_js`).
 
     Returns:
     - The modified source code with inserted or replaced documentation blocks.
     """
 
+    render = _render_js_line_comment if style == "line" else _render_jsdoc_block
     out_lines = source_lines[:]
 
     for info in sorted(defs, key=lambda d: d.start, reverse=True):
@@ -1622,7 +1684,7 @@ def patch_comments_textually_js(source_lines: Chunk, defs: List[DefInfoJS], doc_
         header_line_text = source_lines[info.header_start - 1]
         indent = header_line_text[: len(header_line_text) - len(header_line_text.lstrip())]
 
-        new_block_lines = _render_jsdoc_block(doc, indent)
+        new_block_lines = render(doc, indent)
 
         existing = _scan_existing_comment_block_above(out_lines, info.header_start)
         if existing:
@@ -1677,6 +1739,11 @@ def generate_language_comments(
     defs = iter_defs_with_info_js(tree, source_bytes)
     echo(f"Found {len(defs)} JS definitions")
 
+    # Match the file's prevailing doc-comment convention (a file whose docs are `//` should not be given `/** */`
+    # JSDoc blocks); the leading banner is ignored, and a mix prefers the block form.
+    style = _detect_doc_style_js(tree, source_bytes)
+    echo(f"Doc-comment style for this file: {style}")
+
     # Provide a list of imports/requires to the LLM (if there are any)
     echo("Identifying imports/requires...")
     describe_imports_js(llm, cfg, messages, tree, source_bytes)
@@ -1686,4 +1753,4 @@ def generate_language_comments(
                                    doc_order=doc_order, callee_context=callee_context, on_doc=on_doc)
 
     echo("Applying JS patches...\n")
-    return patch_comments_textually_js(source_lines, defs, doc_map)
+    return patch_comments_textually_js(source_lines, defs, doc_map, style=style)

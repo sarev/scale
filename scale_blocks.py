@@ -90,29 +90,33 @@ COMMENT_PROMPT = (
     "Function `{qualname}` does: {doc}\n\n"
     "One-line notes on the earlier paragraphs of its body (your running context):\n{priors}\n\n"
     "Here is the NEXT paragraph of its body:\n\n{block}\n\n"
-    "In ONE short line, say what this paragraph does - what it accomplishes, or the reason / gotcha / subtlety / edge "
-    "case behind it. Always give a real description (later paragraphs rely on it); never reply 'NONE' or leave it "
+    "In ONE short line, capture this paragraph's POINT: why it is here, what it accomplishes for the function, or the "
+    "reason / gotcha / subtlety / edge case behind it. Assume the reader can already read the code - do NOT narrate "
+    "the statements or restate what the lines plainly say. If the paragraph really is just a mechanical step, say that "
+    "plainly and briefly. Always give a real description (later paragraphs rely on it); never reply 'NONE' or leave it "
     "blank.\n"
     "Bare sentence. No #, no quotes, no list."
 )
-# TURN 2 (the value score) judges whether that one-line note earns a place in the code: 1 (noise) .. 5 (essential).
-# The {length_note} biases strictness by routine size. EVERY note is kept as running context, but only notes scoring
-# >= COMMENT_VALUE_THRESHOLD are inserted into the code; a low-scoring note is tagged with VALUE_FLAG - a magic,
-# otherwise-meaningless marker - so it still flows into later turns' context (which ignore it) yet is recognised and
-# skipped at the output stage. Keeping the carrier on the comment string (rather than a second return value) keeps the
-# blast radius tiny.
+# TURN 2 (the value score) judges whether that one-line note earns a place in the code, on a deliberately narrow 1-3
+# scale (the small model collapsed the old 1-5 scale - it never used 2 and parked ~80% at 4, so the wide middle
+# carried no signal). The three points are spelled out so the model knows what each means, and restatement is named
+# as the bottom rung. The {length_note} biases strictness by routine size. EVERY note is kept as running context, but
+# only notes scoring >= COMMENT_VALUE_THRESHOLD are inserted into the code; a low-scoring note is tagged with
+# VALUE_FLAG - a magic, otherwise-meaningless marker - so it still flows into later turns' context (which ignore it)
+# yet is recognised and skipped at the output stage. Keeping the carrier on the comment string (rather than a second
+# return value) keeps the blast radius tiny.
 SCORE_PROMPT = (
     "{length_note}\n\n"
-    "How much would that one-line note help a reader of the code, placed as a comment above this paragraph?\n"
-    "  1 - noise (it just restates one obvious line)\n"
-    "  2 - marginal\n"
-    "  3 - useful section heading\n"
-    "  4 - valuable (a non-obvious reason, or what a block achieves)\n"
-    "  5 - essential (a gotcha or subtlety a reader would otherwise miss)\n"
-    "Reply with a single digit 1-5 and nothing else."
+    "Score the one-line note you just wrote: how much would it help a READER OF THE CODE, placed as a comment above "
+    "that paragraph?\n"
+    "  1 - it just restates what the code already says (no insight beyond reading the lines themselves)\n"
+    "  2 - it signposts the block - a heading that helps a reader navigate, even if it lightly echoes the code\n"
+    "  3 - it explains intent, a reason, a gotcha, or behaviour that is not obvious from the code\n"
+    "A note that only restates the code is a 1, however well it is worded. Reply with a single digit 1, 2 or 3 and "
+    "nothing else."
 )
 VALUE_FLAG = "{@X@}"        # magic marker tagging a low-value note: kept for context, skipped at output
-COMMENT_VALUE_THRESHOLD = 3  # minimum 1-5 value score for a note to be written into the code
+COMMENT_VALUE_THRESHOLD = 2  # minimum 1-3 value score for a note to be written into the code (drop bare restatements)
 
 # A routine with at most this many chunks is "short": its docstring plus the visible code already walk a reader
 # through it, so its notes are scored strictly. Longer routines invite a per-block walkthrough. The matching note is
@@ -127,12 +131,12 @@ SHORT_FUNCTION_CHUNKS = 3
 # COMMENT_NUDGE is a follow-up used ONLY when the first reply is not a usable description - a push to give one rather
 # than punt (no placeholders; the paragraph is still in the conversation).
 COMMENT_NOTE_SHORT = (
-    "This is a short routine - its docstring and code already make it clear, so score strictly: reserve 3+ for a note "
-    "that genuinely adds something not obvious from the code itself."
+    "This is a short routine - its docstring and code already make it clear, so be strict: give 1 to anything that "
+    "merely restates the code, and reserve 3 for a note that genuinely reveals intent or a gotcha."
 )
 COMMENT_NOTE_LONG = (
-    "This is a longer routine - a good section heading earns its place, so score generously when the note helps a "
-    "reader navigate the body, even if it lightly echoes the docstring."
+    "This is a longer routine, so a clear signpost earns its place: a good navigational heading is a 2 even if it "
+    "lightly echoes the code - but still give 1 to a bare restatement, and 3 to genuine intent or a gotcha."
 )
 COMMENT_NUDGE = (
     "Describe what that paragraph does in ONE short line - even if it is simple, say plainly what it accomplishes. "
@@ -717,9 +721,14 @@ def _parse_summary(reply: str, style: CommentStyle) -> str:
 
 
 def _parse_score(reply: str, default: int = COMMENT_VALUE_THRESHOLD) -> int:
-    """Extract the 1-5 value score from a model reply, falling back to `default` if none is present."""
-    m = re.search(r"[1-5]", reply or "")
-    return int(m.group()) if m else default
+    """
+    Extract the 1-3 value score from a model reply, clamped to [1, 3], falling back to `default` if no digit is present.
+
+    Clamping keeps a model that lapses into the old 1-5 habit safe: a stray 4 or 5 reads as "top of the scale" (3,
+    keep) rather than being missed, and a 0 reads as 1.
+    """
+    m = re.search(r"[0-9]", reply or "")
+    return min(3, max(1, int(m.group()))) if m else default
 
 
 def _comment_to_insert(comment: Optional[str]) -> Optional[str]:
@@ -752,7 +761,7 @@ def request_block_comment(
     summary is the running record (`priors`) that later paragraphs depend on (a paragraph left undescribed used to
     starve its successors of context and drive hallucinations). The paragraph is shown with only light context - the
     routine's purpose and the notes on earlier paragraphs; the file overview is already primed. **Turn 2** asks for a
-    1-5 value score for that summary as a code comment.
+    1-3 value score for that summary as a code comment (1 = restates the code, 2 = signpost, 3 = intent/gotcha).
 
     The summary is always returned (for the caller to keep as context). When its score falls below
     `value_threshold`, the magic `VALUE_FLAG` is appended so the caller can recognise it as low-value - keeping it as
@@ -772,7 +781,7 @@ def request_block_comment(
     - `prompt_template`: Optional override for the summary prompt (defaults to `COMMENT_PROMPT`).
     - `nudge_template`: Optional override for the summary retry nudge (defaults to `COMMENT_NUDGE`).
     - `score_template`: Optional override for the value-score prompt (defaults to `SCORE_PROMPT`).
-    - `value_threshold`: The minimum 1-5 score for the summary to be left unflagged (insertable); below it the
+    - `value_threshold`: The minimum 1-3 score for the summary to be left unflagged (insertable); below it the
       summary is tagged with `VALUE_FLAG` (defaults to `COMMENT_VALUE_THRESHOLD`).
 
     Returns:
@@ -816,7 +825,10 @@ def request_block_comment(
     for _ in range(appended):
         messages.pop()
 
-    return summary if score >= value_threshold else f"{summary} {VALUE_FLAG}"
+    kept = score >= value_threshold
+    echo(f"[block] {target.qualname} L{blob_start}-{blob_end} score={score}/{value_threshold} "
+         f"{'KEEP' if kept else 'drop'}: {summary}")
+    return summary if kept else f"{summary} {VALUE_FLAG}"
 
 
 # ---------------------------- insertion patcher ----------------------------
@@ -1016,8 +1028,8 @@ def annotate_blocks(
     - `note_short`/`note_long`: Optional overrides for the short-/long-routine length notes (defaults
       `COMMENT_NOTE_SHORT`/`COMMENT_NOTE_LONG`); injected into the value-score turn.
     - `score_prompt`: Optional override for the value-score prompt template (defaults to `SCORE_PROMPT`).
-    - `value_threshold`: Minimum 1-5 value score for a comment to be written into the code (`--comment-value`); when
-      None, `COMMENT_VALUE_THRESHOLD` is used. Higher is stricter; `1` keeps all. A value above 5 (e.g. `6`) can never
+    - `value_threshold`: Minimum 1-3 value score for a comment to be written into the code (`--block-comments`); when
+      None, `COMMENT_VALUE_THRESHOLD` is used. Higher is stricter; `1` keeps all. A value above 3 (e.g. `4`) can never
       be cleared, so the comment turns are skipped entirely - the pass only paragraphs the body, no model work.
     - `escalation`: Optional `scale_escalate.Escalation`. When supplied, a routine whose complexity exceeds the cutoff
       has its (still-local) segmentation recorded as a manifest request and its comment turns deferred to a stronger
@@ -1029,7 +1041,7 @@ def annotate_blocks(
 
     ordered = sorted(targets, key=lambda t: (t.depth, t.body_start, -t.body_end), reverse=True)
     threshold = value_threshold if value_threshold is not None else COMMENT_VALUE_THRESHOLD
-    comments_off = threshold > 5  # no 1-5 score can clear it, so skip the comment turns entirely (paragraph only)
+    comments_off = threshold > 3  # no 1-3 score can clear it, so skip the comment turns entirely (paragraph only)
 
     all_edits: List[Tuple[int, Optional[str], str]] = []
     for target in ordered:

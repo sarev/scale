@@ -1,9 +1,7 @@
 {length_note}
 
-How much would that one-line note help a reader of the code, placed as a comment above this paragraph?
-  1 - noise (it just restates one obvious line)
-  2 - marginal
-  3 - useful section heading
-  4 - valuable (a non-obvious reason, or what a block achieves)
-  5 - essential (a gotcha or subtlety a reader would otherwise miss)
-Reply with a single digit 1-5 and nothing else.
+Score the one-line note you just wrote: how much would it help a READER OF THE CODE, placed as a comment above that paragraph?
+  1 - it just restates what the code already says (no insight beyond reading the lines themselves)
+  2 - it signposts the block - a heading that helps a reader navigate, even if it lightly echoes the code
+  3 - it explains intent, a reason, a gotcha, or behaviour that is not obvious from the code
+A note that only restates the code is a 1, however well it is worded. Reply with a single digit 1, 2 or 3 and nothing else.

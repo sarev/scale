@@ -1,6 +1,6 @@
 # Block-pass evaluation harnesses
 
-Model-**dependent** tools for eyeballing the quality of the within-function block pass (`-b`) as SCALE evolves. Unlike
+Model-**dependent** tools for eyeballing the quality of the within-function block pass (`--block-comments`) as SCALE evolves. Unlike
 the fast, model-free regressions in `tests/` (run by `run_all.py`), these load a real GGUF and exercise the actual
 segment/comment passes. They live in this subdirectory so `run_all.py`'s `test_*.py` glob never tries to run them.
 
@@ -20,7 +20,7 @@ python tests/block_eval/make_wall.py --strip-docstrings scale_text.py temp/wall.
 ../.llm-venv/Scripts/python.exe tests/block_eval/show_comments.py temp/wall.py
 
 # Full end-to-end: annotate and diff (note -l python; the wall can defeat language auto-guess):
-../.llm-venv/Scripts/python.exe scale.py -b -nc -l python temp/wall.py -o temp/wall.scaled.py
+../.llm-venv/Scripts/python.exe scale.py --block-comments medium -nc -l python temp/wall.py -o temp/wall.scaled.py
 git --no-pager diff --no-index temp/wall.py temp/wall.scaled.py
 ```
 

@@ -586,6 +586,8 @@ def build_project_graph(symbols_by_file: Dict[str, List[Symbol]]) -> ProjectGrap
     for key, s in symbols.items():
         file, q = key
         simple = q.rsplit(".", 1)[-1]
+        if s.kind == "declaration":
+            continue   # a C prototype seeds a contract but is never a resolution target (the definition is)
         if s.parent_qualname is None:
             free_funcs.setdefault(simple, []).append(key)
         else:

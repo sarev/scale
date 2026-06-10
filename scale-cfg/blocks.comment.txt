@@ -7,5 +7,5 @@ Here is the NEXT paragraph of its body:
 
 {block}
 
-In ONE short line, say what this paragraph does - what it accomplishes, or the reason / gotcha / subtlety / edge case behind it. Always give a real description (later paragraphs rely on it); never reply 'NONE' or leave it blank.
+In ONE short line, capture this paragraph's POINT: why it is here, what it accomplishes for the function, or the reason / gotcha / subtlety / edge case behind it. Assume the reader can already read the code - do NOT narrate the statements or restate what the lines plainly say. If the paragraph really is just a mechanical step, say that plainly and briefly. Always give a real description (later paragraphs rely on it); never reply 'NONE' or leave it blank.
 Bare sentence. No #, no quotes, no list.
