@@ -1206,7 +1206,8 @@ def _render_jsdoc_block(text: str, base_indent: str) -> List[str]:
     out = [f"{base_indent}/**"]
     if lines:
         for ln in lines:
-            out.append(f"{base_indent} * {ln.rstrip()}")
+            # rstrip the whole line: a blank doc line would otherwise leave " * " with a trailing space.
+            out.append(f"{base_indent} * {ln.rstrip()}".rstrip())
     else:
         out.append(f"{base_indent} * (no documentation)")
     out.append(f"{base_indent} */")

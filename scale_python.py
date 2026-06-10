@@ -1115,7 +1115,8 @@ def patch_docstrings_textually(source_lines: Chunk, defs: List[DefInfo], doc_map
         def_line_text = source_lines[info.def_line - 1]
         base_indent = def_line_text[: len(def_line_text) - len(def_line_text.lstrip())] + "    "
 
-        new_doc_lines = [f'{base_indent}"""', *[f"{base_indent}{line}" for line in doc.splitlines()], f'{base_indent}"""']
+        # rstrip each line so a blank docstring line is not left as bare indentation (trailing whitespace).
+        new_doc_lines = [f'{base_indent}"""', *[f"{base_indent}{line}".rstrip() for line in doc.splitlines()], f'{base_indent}"""']
 
         existing_doc = (
             has_body

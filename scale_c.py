@@ -1011,7 +1011,9 @@ def _render_c_block_comment(text: str, base_indent: str) -> List[str]:
     out = [f"{base_indent}/*"]
     if lines:
         for ln in lines:
-            out.append(f"{base_indent} * {ln.rstrip()}")
+            # rstrip the whole line, not just the content: a blank doc line would otherwise leave " * " with a
+            # trailing space (the user-visible nuisance this guards against).
+            out.append(f"{base_indent} * {ln.rstrip()}".rstrip())
     else:
         out.append(f"{base_indent} * (no documentation)")
     out.append(f"{base_indent} */")
