@@ -1,0 +1,8 @@
+Below are the comment lines that make up the existing header of a {language} source file, one per numbered entry.
+Identify the contiguous range of entries that form the human-readable DESCRIPTION of what the file does - as opposed to
+a shebang, copyright or author boilerplate, a filename, dates, or license/legal text.
+
+{entries}
+
+Reply with just the range as `START-END` (inclusive, using the numbers above), or a single number for one line, or the
+word NONE if there is no descriptive prose. Give only the range or NONE - no other words.

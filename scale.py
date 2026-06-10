@@ -601,6 +601,45 @@ def _generate_file_summary(
     return _reduce_summaries(llm, summary_cfg, base_messages, partials, language, limit, base_overhead)
 
 
+def _get_file_summary(
+    llm: LocalChatModel,
+    cfg: GenerationConfig,
+    src_path: Path,
+    source_blob: str,
+    language: str,
+    base_messages: Messages,
+    no_cache: Optional[bool] = False,
+) -> str:
+    """
+    Return the whole-file summary, using the file-backed cache when possible and generating it otherwise.
+
+    Shared by the comment-priming path and the file-doc pass so both reuse the same cached summary (the summary is
+    slow to produce). The cache is keyed on the source content, so the choice of `base_messages` does not affect cache
+    identity; it only seeds a freshly generated summary's context.
+
+    Parameters:
+    - `llm`: The LocalChatModel instance.
+    - `cfg`: The base generation configuration.
+    - `src_path`: The source file path (the cache key).
+    - `source_blob`: The complete source text.
+    - `language`: The source language identifier.
+    - `base_messages`: The priming context a freshly generated summary is produced against (typically just the system
+      prompt).
+    - `no_cache`: When True, regenerate the summary rather than loading a cached one.
+
+    Returns:
+    - The whole-file summary text.
+    """
+
+    summary_cache = SummaryCache(src_path, source_blob)
+    if no_cache is False and summary_cache.summary:
+        echo("Loaded full source summary from cache...")
+    else:
+        echo("Generating full source summary...")
+        summary_cache.summary = _generate_file_summary(llm, cfg, base_messages, source_blob, language)
+    return summary_cache.summary
+
+
 def prime_llm_for_comments(
     llm: LocalChatModel,
     cfg: GenerationConfig,
@@ -630,9 +669,6 @@ def prime_llm_for_comments(
     - A list of messages exchanged between the system and the LLM, including the priming prompts and the generated responses.
     """
 
-    # Initialise the summary cache (keyed on path + a hash of the current contents)
-    summary_cache = SummaryCache(src_path, source_blob)
-
     echo("Priming LLM...")
 
     # Load the system prompt for doing comment generation. For the definition pass, append the house-style guidelines
@@ -657,21 +693,17 @@ def prime_llm_for_comments(
     # Now summarise the whole file for context. This automatically switches to a chunked map-reduce
     # approach when the file is too large to summarise in one pass (see _generate_file_summary). The summary is
     # generated against the system prompt alone (the only turn so far).
-    if no_cache is False and summary_cache.summary:
-        echo("Loaded full source summary from cache...")
-    else:
-        echo("Generating full source summary...")
-        summary_cache.summary = _generate_file_summary(llm, cfg, messages, source_blob, language)
+    summary = _get_file_summary(llm, cfg, src_path, source_blob, language, messages, no_cache=no_cache)
 
-    reply_length = 1 + summary_cache.summary.count("\n")
+    reply_length = 1 + summary.count("\n")
     echo(f"Source file summarised? {reply_length} lines of summary created")
-    echo(f"\n{summary_cache.summary}\n")
+    echo(f"\n{summary}\n")
 
     # Establish the working context with plain turns, each followed by a fixed acknowledgement we supply ourselves
     # (see PRIMING_ACK) - the model is never asked to generate an "OK", so its first *generated* turn is a real comment.
     messages.append({"role": "user", "content":
         "To give you context, here is an overview of what the program as a whole does:\n\n"
-        f"{summary_cache.summary}"})
+        f"{summary}"})
     messages.append({"role": "assistant", "content": PRIMING_ACK})
 
     # The preferred comment format / style template.
@@ -841,6 +873,89 @@ def _block_pass(
     )
 
 
+def _file_doc_target_for(language: str):
+    """
+    Return the per-language file-doc target provider, or raise if the language is not yet supported.
+
+    The provider has the signature `provider(source_blob, source_lines) -> Optional[FileDocTarget]` and describes the
+    file's leading-comment zone (see `scale_filedoc`).
+
+    Parameters:
+    - `language`: The programming language identifier (already validated).
+
+    Returns:
+    - The provider callable for `language`.
+
+    Raises:
+    - `NotImplementedError`: If the language has no file-doc provider yet (currently only C is wired).
+    """
+
+    if language == "c":
+        from scale_c import file_doc_target_c
+        return file_doc_target_c
+    raise NotImplementedError(f"The --file-doc pass does not yet support '{language}'.")
+
+
+def _file_doc_pass(
+    llm: LocalChatModel,
+    cfg: GenerationConfig,
+    scale_path: Path,
+    src_path: Path,
+    source_blob: str,
+    source_lines: List[str],
+    language: str,
+    no_cache: Optional[bool] = False,
+) -> List[str]:
+    """
+    Run the file-level header doccomment pass: add or update the top-of-file description, preserving everything else.
+
+    The local model only classifies which existing header lines are the description and writes the new description
+    prose; the deterministic patcher in `scale_filedoc` preserves shebang/copyright/license/boilerplate byte-for-byte
+    (see that module). Reuses the cached whole-file summary as the description's grounding.
+
+    Parameters:
+    - `llm`: The LocalChatModel instance.
+    - `cfg`: The GenerationConfig instance.
+    - `scale_path`: The path to the SCALE configuration directory.
+    - `src_path`: The source file path (the summary cache key).
+    - `source_blob`: The complete source text.
+    - `source_lines`: The same source split into lines.
+    - `language`: The programming language identifier (already validated).
+    - `no_cache`: When True, regenerate the summary rather than loading a cached one.
+
+    Returns:
+    - The annotated source split into lines (unchanged if the language is unsupported or there is nothing to do).
+    """
+
+    from scale_filedoc import annotate_file_doc
+    try:
+        provider = _file_doc_target_for(language)
+    except NotImplementedError as exc:
+        error(str(exc))
+        return source_lines
+
+    target = provider(source_blob, source_lines)
+    if target is None:
+        echo("file-doc: nothing to annotate.")
+        return source_lines
+
+    # Minimal priming: the system prompt + an optional per-language style note. The whole-file summary is supplied to
+    # the engine separately (it adds it to the generate turn), reusing the same cache as the comment passes.
+    comment_prompt = (scale_path / "comment.txt").read_text(encoding="utf-8")
+    base: Messages = [{"role": "system", "content": comment_prompt}]
+    summary = _get_file_summary(llm, cfg, src_path, source_blob, language, base, no_cache=no_cache)
+
+    note = _read_optional(scale_path / f"filedoc.{language}.txt")
+    if note:
+        base = base + [{"role": "user", "content": note}, {"role": "assistant", "content": PRIMING_ACK}]
+
+    return annotate_file_doc(
+        llm, cfg, base, source_lines, target, summary, language,
+        classify_prompt=_read_optional(scale_path / "filedoc.classify.txt"),
+        generate_prompt=_read_optional(scale_path / "filedoc.generate.txt"),
+    )
+
+
 def generate_comments(
     llm: LocalChatModel,
     cfg: GenerationConfig,
@@ -854,6 +969,7 @@ def generate_comments(
     no_cache: Optional[bool] = False,
     do_comment: bool = True,
     do_blocks: bool = False,
+    do_file_doc: bool = False,
     block_comment_style: str = "line",
     comment_value: Optional[int] = None,
     escalation=None,
@@ -891,15 +1007,23 @@ def generate_comments(
     - If the destination path is not provided, the generated comments will be printed to the console.
     """
 
-    # The summary is primed from the original source for both passes, so the content-hash cache stays warm; only the
+    # The summary is primed from the original source for every pass, so the content-hash cache stays warm; only the
     # worker input advances from one pass to the next.
     new_lines = source_lines
+
+    # The file-doc pass runs first: a top-of-file comment edit does not disturb routine spans, and the later passes
+    # then see the updated header. It primes its own minimal context (it does not need the def-pass guidelines).
+    if do_file_doc:
+        new_lines = _file_doc_pass(
+            llm, cfg, scale_path, src_path, source_blob, new_lines, language, no_cache=no_cache
+        )
 
     if do_comment:
         messages = prime_llm_for_comments(
             llm, cfg, scale_path, src_path, source_blob, language, no_cache=no_cache, template="comment"
         )
-        new_lines = _def_pass(llm, cfg, messages, source_blob, new_lines, language, escalation=escalation)
+        current_blob = line_ending.join(new_lines)
+        new_lines = _def_pass(llm, cfg, messages, current_blob, new_lines, language, escalation=escalation)
 
     if do_blocks:
         try:
@@ -963,6 +1087,9 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--output", "-o", default="", help="Optional output filename")
     p.add_argument("--comment", "-c", action="store_true", help="Add and update definition docstrings/header comments")
     p.add_argument("--blocks", "-b", action="store_true", help="Add and update within-function block comments (Python, C, JS)")
+    p.add_argument("--file-doc", action="store_true",
+                   help="Add or update a file-level header doccomment, preserving shebang/copyright/license/"
+                        "boilerplate byte-for-byte (C only for now).")
     p.add_argument("--block-comment-style", default="line", choices=("line", "block"),
                    help="Delimiter for block-pass comments in C/JS: 'line' (//) or 'block' (/* */). Ignored for Python.")
     p.add_argument("--comment-value", type=int, default=None, metavar="N",
@@ -1076,8 +1203,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 1
         return _apply_manifest_file(src_path, dst_path, language, source_blob, source_lines, line_ending, manifest)
 
-    if not (args.comment or args.blocks):
-        # Nothing to do without --comment or --blocks.
+    if not (args.comment or args.blocks or args.file_doc):
+        # Nothing to do without --comment, --blocks, or --file-doc.
         return 0
 
     # Load the source and resolve the language up front, so an unsupported file fails fast
@@ -1131,6 +1258,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         no_cache=args.no_cache,
         do_comment=args.comment,
         do_blocks=args.blocks,
+        do_file_doc=args.file_doc,
         block_comment_style=args.block_comment_style,
         comment_value=args.comment_value,
         escalation=escalation,

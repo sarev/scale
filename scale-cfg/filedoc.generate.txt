@@ -1,0 +1,16 @@
+Write the file-level description for the top of this {language} source file: the short note that tells a developer
+opening it what the file is for. Use AT MOST THREE SENTENCES, one short paragraph.{existing}
+
+Lead with the file's role in the wider program, then name the main things it defines or the key operations it provides.
+Stay grounded in the overview above: do not invent APIs or behaviour. Do NOT pad with generic remarks about logging,
+debugging, tracing, error handling, or the headers it includes - leave those out unless they are the whole point of the
+file. Mention a caveat only if it is genuinely important to a reader.
+
+Example of the right length and style (for an unrelated file):
+
+    Parses the workspace file into the in-memory program representation and writes it back out on save. Handles both
+    the tokenised and plain-text formats, and reports a malformed file through the shared error channel rather than
+    aborting.
+
+Write only the description prose: no comment markers (no /*, *, //, or triple quotes), no heading, no file name, no
+copyright or license text, and no preamble. Give only the description.
