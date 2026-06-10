@@ -62,6 +62,7 @@ def summarise(
     base_messages: Optional[List[dict]] = None,
     subject: str = "the following",
     max_tokens: Optional[int] = None,
+    instruction: Optional[str] = None,
 ) -> str:
     """
     Ask the model to summarise `text` into a target length, and return the summary.
@@ -80,12 +81,15 @@ def summarise(
       standalone summary that needs no wider context.
     - `subject`: A short noun phrase describing what `text` is, woven into the prompt (e.g. "a Python source file").
     - `max_tokens`: Optional reply-token cap overriding the per-length default.
+    - `instruction`: Optional instruction text that replaces the default length-based one (e.g. a file-description
+      spec). The `length` still picks the reply-token cap unless `max_tokens` is given.
 
     Returns:
     - The summary text, stripped.
     """
 
-    instruction = _LENGTH_INSTRUCTION.get(length, _LENGTH_INSTRUCTION[LENGTH_PARAGRAPH])
+    if instruction is None:
+        instruction = _LENGTH_INSTRUCTION.get(length, _LENGTH_INSTRUCTION[LENGTH_PARAGRAPH])
     prompt = (
         f"Here is {subject}:\n\n{text}\n\n"
         f"{instruction} Do not ask questions or add any conversational discussion; give only the summary."

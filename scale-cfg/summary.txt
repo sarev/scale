@@ -1,0 +1,9 @@
+Describe what this {language} source file is for, as the file-level overview a developer would read at the top of the
+file. Lead with the file's role in the wider program, then the main things it defines or the key operations it provides,
+grouping related functionality rather than listing every function. Stay grounded in the code: do not invent APIs or
+behaviour, and do not pad with generic remarks about logging, debugging, tracing, error handling, or the headers it
+includes unless that is genuinely the point of the file. Do not comment on how well-organised, clean, or readable the
+code is - describe what it does, not its quality.
+
+Write two or three short paragraphs of FLOWING PROSE only. No bulleted, dashed, or numbered lists; no section headings
+(e.g. "Key operations:"); no comment markers. Keep it tight.{seed}

@@ -1,7 +1,0 @@
-We are writing the file-level header description for a C source file. This is the short paragraph at the very top of the
-file that tells a developer what the file is for - the role it plays in the wider program, the main things it defines,
-and any important caveat.
-
-Keep it to one short paragraph of plain prose. Do not restate the file name, the copyright, or the license - those are
-preserved separately. Do not include any comment delimiters; the wording is wrapped into the file's comment style for
-you. British English.

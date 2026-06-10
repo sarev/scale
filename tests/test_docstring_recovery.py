@@ -51,8 +51,8 @@ class Stub:
 
     def generate(self, messages, cfg=None, stop=None):
         self.calls += 1
-        if "Summarise it" in messages[-1]["content"]:
-            return "A one-line module overview."
+        if "source file" in messages[-1]["content"]:
+            return "A one-line module overview."     # the file-description summary (full or short squash)
         return self.reply
 
 
@@ -71,7 +71,9 @@ def main():
         msgs = prime_llm_for_comments(stub, GenerationConfig(), SCALE_CFG, Path("x.py"),
                                       source_blob=SRC, language="python", no_cache=True)
 
-    assert stub.calls == 1, f"priming should generate only the summary, not acks; made {stub.calls} calls"
+    # The definition pass primes with the SHORT file description, which is a squash of the full one: two summary
+    # generations (full, then condensation), and no ack turns.
+    assert stub.calls == 2, f"priming should generate the full + short summary only, not acks; made {stub.calls} calls"
     assert not any(m["role"] == "assistant" and m["content"].strip().upper() == "OK" for m in msgs), \
         "no priming turn may be a bare 'OK' (that conditions the model to reply OK to the first real task)"
     assert any(m["role"] == "assistant" and m["content"] == PRIMING_ACK for m in msgs), \

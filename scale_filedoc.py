@@ -29,7 +29,7 @@ inserted. The engine here orchestrates the two model turns (classify, then gener
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 import re
 import textwrap
 
@@ -43,10 +43,8 @@ Chunk = List[str]
 
 CLASSIFY_TEMPERATURE = 0.0
 CLASSIFY_REPLY_TOKENS = 16
-GENERATE_TEMPERATURE = 0.2
-GENERATE_REPLY_TOKENS = 160
 
-# Width the generated description is wrapped to (the per-line decoration prefix is subtracted from this).
+# Width the description is wrapped to (the per-line decoration prefix is subtracted from this).
 WRAP_WIDTH = 118
 
 CLASSIFY_PROMPT = (
@@ -56,17 +54,6 @@ CLASSIFY_PROMPT = (
     "{entries}\n\n"
     "Reply with just the range as `START-END` (inclusive, using the numbers above), or a single number for one line, "
     "or the word NONE if there is no descriptive prose. Give only the range or NONE - no other words."
-)
-
-GENERATE_PROMPT = (
-    "Write the file-level description for the top of this {language} source file: the short note that tells a "
-    "developer opening it what the file is for. Use AT MOST THREE SENTENCES, one short paragraph.{existing}\n\n"
-    "Lead with the file's role in the wider program, then name the main things it defines or the key operations it "
-    "provides. Stay grounded in the overview above: do not invent APIs or behaviour. Do NOT pad with generic remarks "
-    "about logging, debugging, tracing, error handling, or the headers it includes - leave those out unless they are "
-    "the whole point of the file. Mention a caveat only if it is genuinely important to a reader.\n\n"
-    "Write only the description prose: no comment markers (no /*, *, //, or \"\"\"), no heading, no file name, no "
-    "copyright or license text, and no preamble. Give only the description."
 )
 
 # Deterministic legal-text veto. Substrings are matched case-insensitively against a candidate description line; any
@@ -246,28 +233,30 @@ def annotate_file_doc(
     base_messages,
     source_lines: Chunk,
     target: FileDocTarget,
-    summary: str,
+    summary_provider: Callable[[Optional[str]], str],
     language: str,
     *,
     classify_prompt: Optional[str] = None,
-    generate_prompt: Optional[str] = None,
 ) -> Chunk:
     """
-    Run the file-doc pass: classify the existing description (if any), generate fresh prose, and splice it in safely.
+    Run the file-doc pass: classify the existing description (if any), then splice the file summary in as the header.
 
-    The model performs at most two turns - a deterministic classify turn (only when there are eligible header lines)
-    and a generate turn - and never re-emits any preserved text. The result is applied as one guarded splice; if the
-    guard rejects it, the original lines are returned unchanged.
+    The whole-file summary *is* the file description (see `scale.py`), so there is no separate generate turn - the
+    model only does a deterministic classify turn (when there are eligible header lines) to find which lines are the
+    existing description, then `summary_provider` returns the description prose (seeded with that existing text so the
+    author's wording is incorporated). The model never re-emits any preserved text; the result is applied as one
+    guarded splice, and if the guard rejects it the original lines are returned unchanged.
 
     Parameters:
     - `llm`: A model exposing `generate`.
-    - `cfg`: The base generation configuration (cloned per turn with a capped reply length).
-    - `base_messages`: The primed context (system prompt + file overview + any style note). Not mutated.
+    - `cfg`: The base generation configuration (cloned for the classify turn with a capped reply length).
+    - `base_messages`: The primed context (system prompt). Not mutated.
     - `source_lines`: The source split into lines.
     - `target`: The `FileDocTarget` from the language adapter.
-    - `summary`: The whole-file summary, used to ground the generated description.
-    - `language`: The language identifier, woven into the prompts.
-    - `classify_prompt`/`generate_prompt`: Optional prompt overrides (default to the built-in constants).
+    - `summary_provider`: Callable taking the existing description text (or None) and returning the file-description
+      prose to insert. This is where the whole-file summary is produced/fetched.
+    - `language`: The language identifier, woven into the classify prompt.
+    - `classify_prompt`: Optional classify-prompt override (defaults to the built-in constant).
 
     Returns:
     - The annotated source split into lines (unchanged if there was nothing to do or the guard failed).
@@ -278,9 +267,8 @@ def annotate_file_doc(
         return source_lines
 
     classify_tmpl = classify_prompt or CLASSIFY_PROMPT
-    generate_tmpl = generate_prompt or GENERATE_PROMPT
 
-    # ---- Turn 1: classify which eligible lines are the description (skipped when none are eligible). ----
+    # ---- Classify which eligible lines are the existing description (skipped when none are eligible). ----
     desc_range: Optional[Tuple[int, int]] = None
     if target.eligible:
         entries = "\n".join(f"{i}. {inner}" for i, (_, _, inner) in enumerate(target.eligible, start=1))
@@ -298,29 +286,16 @@ def annotate_file_doc(
                 echo("file-doc: classified range looks like license/legal text; leaving it untouched.")
                 desc_range = None
 
-    # The existing description text we are updating (if any), fed to the generate turn.
+    # The existing description text we are updating (if any), fed to the summary provider as a seed.
     existing_text = ""
     if desc_range is not None:
         lo, hi = desc_range
         existing_text = " ".join(target.eligible[i - 1][2] for i in range(lo, hi + 1)).strip()
 
-    # ---- Turn 2: generate the description prose. ----
-    existing_clause = (
-        f" The current description reads: \"{existing_text}\" - refine and correct it where the code has moved on, "
-        f"keeping any wording that is still accurate." if existing_text else ""
-    )
-    prompt = _fill(generate_tmpl, language=language, existing=existing_clause)
-    turn_cfg = replace(cfg, max_new_tokens=min(cfg.max_new_tokens, GENERATE_REPLY_TOKENS),
-                       temperature=GENERATE_TEMPERATURE)
-    messages = base_messages + [
-        {"role": "user", "content": f"Here is an overview of the whole file:\n\n{summary}"},
-        {"role": "assistant", "content": "Understood."},
-        {"role": "user", "content": prompt},
-    ]
-    description = llm.generate(messages, cfg=turn_cfg).strip()
-    description = _sanitise_description(description)
+    # ---- Fetch the file-description prose (the whole-file summary, seeded with any existing description). ----
+    description = _sanitise_description(summary_provider(existing_text or None))
     if not description:
-        echo("file-doc: the model produced no usable description; leaving the file unchanged.")
+        echo("file-doc: no usable description was produced; leaving the file unchanged.")
         return source_lines
 
     # ---- Build the single splice. ----

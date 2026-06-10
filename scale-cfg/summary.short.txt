@@ -1,0 +1,2 @@
+In one or two sentences, say what this {language} source file is for and the kind of code it contains - quick context
+for a reader, not a full description. Plain prose, no list, no preamble.

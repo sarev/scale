@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 File summarisation must use a single pass when the file fits, and fall back to chunked map-reduce
-(map each chunk, then reduce the partials) when it does not.
+(map each chunk, then reduce the partials) when it does not. The large-file path ends in one extra
+"shaping" turn that rewrites the reduced overall summary to the file-description spec.
 
 Exercises scale._generate_file_summary directly with a stubbed LLM and a small context window, so no
 GGUF model is required.
@@ -32,7 +33,9 @@ class FakeLLM:
     def generate(self, messages, *, cfg=None, stop=None):
         self.calls += 1
         content = messages[-1]["content"]
-        # The summarise() prompt names its subject; map/reduce/one-shot use distinct, unique words for it.
+        # The summarise() prompt names its subject; map/reduce/shape/one-shot use distinct, unique words for it.
+        if "draft overview" in content:
+            return "SHAPED_SUMMARY"          # the final description-shaping turn (large-file path)
         if "consecutive parts" in content:
             return "REDUCED_SUMMARY"
         if "chunk" in content:
@@ -50,14 +53,14 @@ def main():
     assert summary == "ONESHOT_SUMMARY", summary
     assert llm.calls == 1, f"one-pass should make exactly one call, made {llm.calls}"
 
-    # 2. Large file + small context -> map-reduce (several map calls + a reduce call).
+    # 2. Large file + small context -> map-reduce, then a final description-shaping turn.
     big = "\n".join(f"def func_{i}(x):\n    return x + {i}" for i in range(200))  # well over the budget
     llm = FakeLLM(n_ctx=2048)  # limit = 2048 - 0 - SUMMARY_MAX_TOKENS(1024) = 1024 tokens
     summary = _generate_file_summary(llm, cfg, BASE, big, "python")
-    assert summary == "REDUCED_SUMMARY", summary
-    assert llm.calls >= 3, f"map-reduce should make multiple calls (>=2 map + 1 reduce), made {llm.calls}"
+    assert summary == "SHAPED_SUMMARY", summary
+    assert llm.calls >= 4, f"map-reduce + shaping should make multiple calls (>=2 map + reduce + shape), made {llm.calls}"
 
-    print("PASS: one-pass for small files, map-reduce for large files")
+    print("PASS: one-pass for small files, map-reduce + shaping turn for large files")
     return 0
 
 

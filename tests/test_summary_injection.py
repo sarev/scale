@@ -47,9 +47,10 @@ class FakeLLM:
     def generate(self, messages, *, cfg=None, stop=None):
         self.calls += 1
         # Priming no longer asks the model to acknowledge turns (it supplies a canned ack itself), so the only
-        # generation during priming is the whole-file summary; recognise it by its prompt rather than call order.
-        if "Summarise it" in messages[-1]["content"]:
-            return SENTINEL      # the generated whole-file summary
+        # generation during priming is the whole-file summary (now a file-description, plus a short squash of it for
+        # the definition pass). Both name "a ... source file" as their subject; recognise either by that phrase.
+        if "source file" in messages[-1]["content"]:
+            return SENTINEL      # the generated file-description summary (full or short)
         return "OK"
 
 

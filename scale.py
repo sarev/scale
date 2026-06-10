@@ -26,7 +26,7 @@ from dataclasses import replace
 from pathlib import Path
 from scale_llm import LocalChatModel, GenerationConfig, llm_formatters, Messages, Chunk
 from scale_log import echo, error, set_verbosity
-from scale_text import summarise, LENGTH_PARAGRAPH, LENGTH_PARAGRAPHS, PRIMING_ACK
+from scale_text import summarise, LENGTH_LINE, LENGTH_PARAGRAPH, LENGTH_PARAGRAPHS, PRIMING_ACK
 import scale_escalate
 from typing import Callable, List, Optional, Sequence, Tuple
 import argparse
@@ -56,6 +56,32 @@ SUMMARY_MAX_TOKENS = 1024
 # Rough token allowance for the fixed wrapper text `summarise` wraps around the content, used only when deciding
 # whether a summary fits in one pass; a small over-estimate just biases marginally towards the (safe) map-reduce path.
 SUMMARY_WRAPPER_TOKENS = 64
+
+
+# Reply-length cap for the SHORT file summary - the squashed file description used to prime the (context-starved)
+# definition pass, where the routine body matters more than a detailed file overview.
+SHORT_SUMMARY_MAX_TOKENS = 110
+
+
+# The whole-file summary is written to a file-DESCRIPTION spec, so the one piece of prose serves both the `--file-doc`
+# header and the per-routine priming context (overridable via scale-cfg/summary.txt). `{language}` and `{seed}` are
+# filled by literal substitution. The block pass uses this full description; the definition pass uses a one/two-sentence
+# squash of it (SHORT_SUMMARY_INSTRUCTION, scale-cfg/summary.short.txt) to spend its scarce context on the body.
+SUMMARY_INSTRUCTION = (
+    "Describe what this {language} source file is for, as the file-level overview a developer would read at the top "
+    "of the file. Lead with the file's role in the wider program, then the main things it defines or the key "
+    "operations it provides, grouping related functionality rather than listing every function. Stay grounded in the "
+    "code: do not invent APIs or behaviour, and do not pad with generic remarks about logging, debugging, tracing, "
+    "error handling, or the headers it includes unless that is genuinely the point of the file. Do not comment on how "
+    "well-organised, clean, or readable the code is - describe what it does, not its quality.\n\n"
+    "Write two or three short paragraphs of FLOWING PROSE only. No bulleted, dashed, or numbered lists; no section "
+    "headings (e.g. \"Key operations:\"); no comment markers. Keep it tight.{seed}"
+)
+
+SHORT_SUMMARY_INSTRUCTION = (
+    "In one or two sentences, say what this {language} source file is for and the kind of code it contains - quick "
+    "context for a reader, not a full description. Plain prose, no list, no preamble."
+)
 
 
 # ---------------------------- CLI harness ----------------------------
@@ -266,6 +292,7 @@ class SummaryCache:
         """
 
         self._summary: Optional[str] = None
+        self._short: Optional[str] = None
         self._hash = hashlib.sha256(source_blob.encode("utf-8", errors="surrogateescape")).hexdigest()
 
         # Load or create index
@@ -279,24 +306,23 @@ class SummaryCache:
             self._save_index(index)
 
         self._uid = uid
-        self._data_path = self._CACHE_DIR / f"{self._uid}.txt"      # one summary file per uid
-        self._hash_path = self._CACHE_DIR / f"{self._uid}.sha256"   # content hash for invalidation
+        self._data_path = self._CACHE_DIR / f"{self._uid}.txt"        # the full (description) summary
+        self._short_path = self._CACHE_DIR / f"{self._uid}.short.txt"  # the squashed summary for the definition pass
+        self._hash_path = self._CACHE_DIR / f"{self._uid}.sha256"     # content hash for invalidation
 
-        # Load the existing summary only if it was generated from the same source content.
+        # Load the existing summaries only if they were generated from the same source content.
         try:
             cached_hash = self._hash_path.read_text(encoding="utf-8").strip()
         except FileNotFoundError:
             cached_hash = None
 
         if cached_hash == self._hash:
-            try:
-                raw = self._data_path.read_bytes()
-                self._summary = raw.decode("utf-8", errors="surrogateescape")
-            except FileNotFoundError:
-                self._summary = None
+            self._summary = self._read_optional_text(self._data_path)
+            self._short = self._read_optional_text(self._short_path)
         else:
-            # Stale (or missing) hash: ignore any cached summary so it is regenerated.
+            # Stale (or missing) hash: ignore any cached summaries so they are regenerated.
             self._summary = None
+            self._short = None
 
     @property
     def summary(self) -> Optional[str]:
@@ -325,6 +351,44 @@ class SummaryCache:
         )
         # Record the content hash so this summary is reused only while the source is unchanged.
         self._atomic_write_bytes(self._hash_path, self._hash.encode("utf-8"))
+
+    @property
+    def short(self) -> Optional[str]:
+        """
+        Return the squashed (one/two-sentence) summary used to prime the definition pass, or None if not cached.
+        """
+
+        return self._short
+
+    @short.setter
+    def short(self, text: str) -> None:
+        """
+        Persist the squashed summary in the cache, tagged with the same content hash as the full summary.
+
+        Parameters:
+        - `text`: The short summary text.
+        """
+
+        self._short = text
+        self._atomic_write_bytes(self._short_path, text.encode("utf-8", errors="surrogateescape"))
+        self._atomic_write_bytes(self._hash_path, self._hash.encode("utf-8"))
+
+    @staticmethod
+    def _read_optional_text(path: Path) -> Optional[str]:
+        """
+        Read a cache text file with surrogateescape decoding, returning None if it is absent.
+
+        Parameters:
+        - `path`: The cache file to read.
+
+        Returns:
+        - The decoded contents, or None when the file does not exist.
+        """
+
+        try:
+            return path.read_bytes().decode("utf-8", errors="surrogateescape")
+        except FileNotFoundError:
+            return None
 
     @classmethod
     def _load_index(cls) -> dict[str, str]:
@@ -547,45 +611,79 @@ def _reduce_summaries(
     return _reduce_summaries(llm, summary_cfg, base_messages, reduced, language, limit, base_overhead)
 
 
+def _fill_summary_instruction(desc_spec: Optional[str], language: str, seed: Optional[str]) -> str:
+    """
+    Build the file-description instruction for the summary turn, filling `{language}` and `{seed}`.
+
+    Substitution is literal (so an existing description carrying braces is safe). When `seed` is given, a clause is
+    woven in asking the model to keep accurate wording and correct or extend the rest, so the unified summary
+    incorporates the author's existing file description.
+
+    Parameters:
+    - `desc_spec`: The instruction template (defaults to `SUMMARY_INSTRUCTION`).
+    - `language`: The source language identifier.
+    - `seed`: The existing file description to fold in, or None.
+
+    Returns:
+    - The filled instruction text.
+    """
+
+    template = desc_spec if desc_spec is not None else SUMMARY_INSTRUCTION
+    seed_clause = ""
+    if seed and seed.strip():
+        seed_clause = (
+            f' The file already carries this description: "{seed.strip()}". Keep any wording that is still accurate '
+            f"and correct or extend the rest."
+        )
+    return template.replace("{language}", language).replace("{seed}", seed_clause)
+
+
 def _generate_file_summary(
     llm: LocalChatModel,
     cfg: GenerationConfig,
     base_messages: Messages,
     source_blob: str,
     language: str,
+    desc_spec: Optional[str] = None,
+    seed: Optional[str] = None,
 ) -> str:
     """
-    Summarise a whole source file, falling back to chunked map-reduce when it is too large for one pass.
+    Summarise a whole source file as a file-level DESCRIPTION, falling back to chunked map-reduce when it is too large.
 
-    The summary primes the per-routine commenting turns with an understanding of the file as a whole. Files that fit
-    the context window are summarised in a single request. Larger files are split into context-sized chunks, each
-    summarised independently (the "map" step), and those partial summaries are then combined into one overall summary
-    (the "reduce" step, applied recursively if the partials are themselves too large). Every request uses a capped
-    reply length so the resulting summary - and therefore the persistent priming context - stays small regardless of
-    file size.
+    The result is the one piece of prose used both as the `--file-doc` header and as the per-routine priming context,
+    so it is written to a file-description spec (`desc_spec`, default `SUMMARY_INSTRUCTION`) rather than a generic
+    summary. Files that fit the window are described in a single request. Larger files are split into context-sized
+    chunks, each summarised independently (the "map" step, kept thorough/generic to preserve detail), the partials are
+    combined into one overall summary (the "reduce" step, recursive if needed), and then a single final turn reshapes
+    that overall summary to the description spec - so the map-reduce keeps the detail while only the last turn applies
+    the description shape (and folds in any `seed`).
 
     Parameters:
     - `llm`: The LocalChatModel instance.
     - `cfg`: The base generation configuration (cloned with a smaller `max_new_tokens` for summaries).
-    - `base_messages`: The primed context to summarise against (typically the system prompt and its acknowledgement);
-      this list is not mutated.
+    - `base_messages`: The primed context to summarise against (typically the system prompt); not mutated.
     - `source_blob`: The complete source text.
     - `language`: The source language identifier (used to phrase the prompts).
+    - `desc_spec`: The file-description instruction template (default `SUMMARY_INSTRUCTION`).
+    - `seed`: An existing file description to incorporate, or None.
 
     Returns:
-    - The overall summary text for the file.
+    - The file-description summary text.
     """
 
     summary_cfg = replace(cfg, max_new_tokens=SUMMARY_MAX_TOKENS)
     limit = llm.n_ctx - llm.ctx_margin - SUMMARY_MAX_TOKENS
     base_overhead = llm.count_tokens(base_messages) if base_messages else 0
+    description_instruction = _fill_summary_instruction(desc_spec, language, seed)
 
-    # Fast path: the whole file fits in a single summarisation turn.
+    # Fast path: the whole file fits in a single turn, written straight to the description spec.
     if base_overhead + llm.estimate_tokens(source_blob) + SUMMARY_WRAPPER_TOKENS <= limit:
         return summarise(llm, summary_cfg, source_blob, LENGTH_PARAGRAPHS, base_messages=base_messages,
-                         subject=f"a complete {language} source file", max_tokens=SUMMARY_MAX_TOKENS)
+                         subject=f"a complete {language} source file", max_tokens=SUMMARY_MAX_TOKENS,
+                         instruction=description_instruction)
 
-    # Map: summarise the file in context-sized chunks (64 tokens of headroom for the wrapper text).
+    # Map: summarise the file in context-sized chunks (64 tokens of headroom for the wrapper text). The map/reduce
+    # steps stay thorough/generic so no detail is lost before the final description-shaping turn.
     chunk_budget = max(1, limit - base_overhead - 64)
     chunks = _split_source(source_blob, chunk_budget, llm.estimate_tokens)
     echo(f"Source too large for a single-pass summary; summarising in {len(chunks)} chunk(s)...")
@@ -597,38 +695,44 @@ def _generate_file_summary(
                                   max_tokens=SUMMARY_MAX_TOKENS))
         echo(f"Summarised part {idx}/{len(chunks)}")
 
-    # Reduce: combine the partial summaries into a single overall summary.
-    return _reduce_summaries(llm, summary_cfg, base_messages, partials, language, limit, base_overhead)
+    # Reduce the partials into one overall summary, then reshape it to the file-description spec in a final turn.
+    overall = _reduce_summaries(llm, summary_cfg, base_messages, partials, language, limit, base_overhead)
+    return summarise(llm, summary_cfg, overall, LENGTH_PARAGRAPHS, base_messages=base_messages,
+                     subject=f"a draft overview of a {language} source file", max_tokens=SUMMARY_MAX_TOKENS,
+                     instruction=description_instruction)
 
 
 def _get_file_summary(
     llm: LocalChatModel,
     cfg: GenerationConfig,
+    scale_path: Path,
     src_path: Path,
     source_blob: str,
     language: str,
     base_messages: Messages,
     no_cache: Optional[bool] = False,
+    seed: Optional[str] = None,
 ) -> str:
     """
-    Return the whole-file summary, using the file-backed cache when possible and generating it otherwise.
+    Return the full file-description summary, using the file-backed cache when possible and generating it otherwise.
 
-    Shared by the comment-priming path and the file-doc pass so both reuse the same cached summary (the summary is
-    slow to produce). The cache is keyed on the source content, so the choice of `base_messages` does not affect cache
-    identity; it only seeds a freshly generated summary's context.
+    This is the one piece of prose shared by the `--file-doc` header and the block-pass priming context (the summary
+    is slow to produce). The cache is keyed on the source content, so neither `base_messages` nor `seed` affects cache
+    identity; on a cache hit the `seed` is moot (the description already exists).
 
     Parameters:
     - `llm`: The LocalChatModel instance.
     - `cfg`: The base generation configuration.
+    - `scale_path`: The SCALE configuration directory (for the optional `summary.txt` instruction override).
     - `src_path`: The source file path (the cache key).
     - `source_blob`: The complete source text.
     - `language`: The source language identifier.
-    - `base_messages`: The priming context a freshly generated summary is produced against (typically just the system
-      prompt).
+    - `base_messages`: The priming context a freshly generated summary is produced against (typically the system prompt).
     - `no_cache`: When True, regenerate the summary rather than loading a cached one.
+    - `seed`: An existing file description to fold into a freshly generated summary, or None.
 
     Returns:
-    - The whole-file summary text.
+    - The full file-description summary text.
     """
 
     summary_cache = SummaryCache(src_path, source_blob)
@@ -636,8 +740,59 @@ def _get_file_summary(
         echo("Loaded full source summary from cache...")
     else:
         echo("Generating full source summary...")
-        summary_cache.summary = _generate_file_summary(llm, cfg, base_messages, source_blob, language)
+        desc_spec = _read_optional(scale_path / "summary.txt") or SUMMARY_INSTRUCTION
+        summary_cache.summary = _generate_file_summary(
+            llm, cfg, base_messages, source_blob, language, desc_spec=desc_spec, seed=seed)
     return summary_cache.summary
+
+
+def _get_short_summary(
+    llm: LocalChatModel,
+    cfg: GenerationConfig,
+    scale_path: Path,
+    src_path: Path,
+    source_blob: str,
+    language: str,
+    base_messages: Messages,
+    no_cache: Optional[bool] = False,
+) -> str:
+    """
+    Return the squashed file description used to prime the (context-starved) definition pass.
+
+    The short summary is a one/two-sentence condensation of the full file description, so it stays consistent with it
+    while spending almost no context - the definition pass cares far more about the routine body than a detailed file
+    overview. It is cached alongside the full summary (same content-hash invalidation).
+
+    Parameters:
+    - `llm`: The LocalChatModel instance.
+    - `cfg`: The base generation configuration.
+    - `scale_path`: The SCALE configuration directory (for the optional `summary.short.txt` instruction override).
+    - `src_path`: The source file path (the cache key).
+    - `source_blob`: The complete source text.
+    - `language`: The source language identifier.
+    - `base_messages`: The priming context the condensation is produced against.
+    - `no_cache`: When True, regenerate rather than loading from cache.
+
+    Returns:
+    - The short file-description summary text.
+    """
+
+    cache = SummaryCache(src_path, source_blob)
+    if no_cache is False and cache.short:
+        echo("Loaded short source summary from cache...")
+        return cache.short
+
+    # Condense the full description (generated/cached on demand) into a quick one/two-sentence note.
+    full = _get_file_summary(llm, cfg, scale_path, src_path, source_blob, language, base_messages, no_cache=no_cache)
+    echo("Condensing the file description for the definition pass...")
+    instruction = (_read_optional(scale_path / "summary.short.txt") or SHORT_SUMMARY_INSTRUCTION).replace(
+        "{language}", language)
+    short_cfg = replace(cfg, max_new_tokens=SHORT_SUMMARY_MAX_TOKENS)
+    short = summarise(llm, short_cfg, full, LENGTH_LINE, base_messages=base_messages,
+                      subject=f"a fuller description of a {language} source file",
+                      max_tokens=SHORT_SUMMARY_MAX_TOKENS, instruction=instruction)
+    cache.short = short
+    return short
 
 
 def prime_llm_for_comments(
@@ -690,10 +845,14 @@ def prime_llm_for_comments(
     messages = []
     messages.append({"role": "system", "content": comment_prompt})
 
-    # Now summarise the whole file for context. This automatically switches to a chunked map-reduce
-    # approach when the file is too large to summarise in one pass (see _generate_file_summary). The summary is
-    # generated against the system prompt alone (the only turn so far).
-    summary = _get_file_summary(llm, cfg, src_path, source_blob, language, messages, no_cache=no_cache)
+    # Now summarise the whole file for context (chunked map-reduce kicks in automatically for large files; see
+    # _generate_file_summary). The summary is generated against the system prompt alone (the only turn so far). The
+    # definition pass is context-starved - the routine body matters more there - so it gets the SHORT (squashed) file
+    # description; the block pass has more room, so it gets the full one (the same prose --file-doc puts in the header).
+    if template == "comment":
+        summary = _get_short_summary(llm, cfg, scale_path, src_path, source_blob, language, messages, no_cache=no_cache)
+    else:
+        summary = _get_file_summary(llm, cfg, scale_path, src_path, source_blob, language, messages, no_cache=no_cache)
 
     reply_length = 1 + summary.count("\n")
     echo(f"Source file summarised? {reply_length} lines of summary created")
@@ -909,9 +1068,10 @@ def _file_doc_pass(
     """
     Run the file-level header doccomment pass: add or update the top-of-file description, preserving everything else.
 
-    The local model only classifies which existing header lines are the description and writes the new description
-    prose; the deterministic patcher in `scale_filedoc` preserves shebang/copyright/license/boilerplate byte-for-byte
-    (see that module). Reuses the cached whole-file summary as the description's grounding.
+    The local model only classifies which existing header lines are the description; the description prose itself is
+    the whole-file summary (the same prose that primes the block pass), seeded with the existing description so the
+    author's wording is incorporated. The deterministic patcher in `scale_filedoc` preserves shebang/copyright/license/
+    boilerplate byte-for-byte (see that module).
 
     Parameters:
     - `llm`: The LocalChatModel instance.
@@ -939,20 +1099,18 @@ def _file_doc_pass(
         echo("file-doc: nothing to annotate.")
         return source_lines
 
-    # Minimal priming: the system prompt + an optional per-language style note. The whole-file summary is supplied to
-    # the engine separately (it adds it to the generate turn), reusing the same cache as the comment passes.
+    # Minimal priming for the classify turn: just the system prompt. The description prose is the whole-file summary,
+    # fetched (and cached) via the provider below, seeded with whatever existing description the classify turn finds.
     comment_prompt = (scale_path / "comment.txt").read_text(encoding="utf-8")
     base: Messages = [{"role": "system", "content": comment_prompt}]
-    summary = _get_file_summary(llm, cfg, src_path, source_blob, language, base, no_cache=no_cache)
 
-    note = _read_optional(scale_path / f"filedoc.{language}.txt")
-    if note:
-        base = base + [{"role": "user", "content": note}, {"role": "assistant", "content": PRIMING_ACK}]
+    def summary_provider(seed: Optional[str]) -> str:
+        return _get_file_summary(
+            llm, cfg, scale_path, src_path, source_blob, language, base, no_cache=no_cache, seed=seed)
 
     return annotate_file_doc(
-        llm, cfg, base, source_lines, target, summary, language,
+        llm, cfg, base, source_lines, target, summary_provider, language,
         classify_prompt=_read_optional(scale_path / "filedoc.classify.txt"),
-        generate_prompt=_read_optional(scale_path / "filedoc.generate.txt"),
     )
 
 
@@ -1100,8 +1258,8 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--verbose", "-v", action="store_true", help="Output progress information to stdout")
     p.add_argument("--very-verbose", "-vv", action="store_true", help="Output LLM debug information to stdout")
     p.add_argument("--no-cache", "-nc", action="store_true", help="Don't load the summary text for this file from cache")
-    p.add_argument("--n-ctx", type=int, default=12 * 1024, help="Number of tokens to use as context")
-    p.add_argument("--max-new-tokens", "-M", type=int, default=8 * 1024, help="Maximum number of new tokens to generate")
+    p.add_argument("--n-ctx", type=int, default=16 * 1024, help="Number of tokens to use as context")
+    p.add_argument("--max-new-tokens", "-M", type=int, default=2 * 1024, help="Maximum number of new tokens to generate")
     p.add_argument("--format", "-f", default="auto", help=f"Chat format override. One of {formatters}")
     p.add_argument("--temperature", "-T", type=float, default=0.2, help="Temperature value for the LLM")
     p.add_argument("--top-p", "-P", type=float, default=0.9, help="Top-p value for the LLM")
