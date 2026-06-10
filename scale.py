@@ -28,6 +28,7 @@ from scale_llm import LocalChatModel, GenerationConfig, llm_formatters, Messages
 from scale_log import echo, error, set_verbosity
 from scale_text import summarise, LENGTH_LINE, LENGTH_PARAGRAPH, LENGTH_PARAGRAPHS, PRIMING_ACK
 import scale_escalate
+import scale_project
 from typing import Callable, List, Optional, Sequence, Tuple
 import argparse
 import hashlib
@@ -804,6 +805,7 @@ def prime_llm_for_comments(
     language: str,
     no_cache: Optional[bool] = False,
     template: str = "comment",
+    project_blurb: str = "",
 ) -> Messages:
     """
     Prepare the Large Language Model (LLM) for generating comments by priming it with a system prompt and the source file as context.
@@ -816,6 +818,8 @@ def prime_llm_for_comments(
     - `source_blob`: The source code as a string.
     - `language`: The programming language of the source code.
     - `no_cache`: Generate new summary - don't use the cached version.
+    - `project_blurb`: Optional short project-overview blurb (see `scale_project`); injected before the file summary so
+      both the summary and the per-routine turns understand the file's place in the wider project.
     - `template`: Which per-language style template to load as the final priming turn: `"comment"` loads
       `comment.<lang>.txt` (the definition/docstring pass) and `"blocks"` loads `blocks.<lang>.txt` (the
       within-function "blob" pass). Only one is ever loaded so the two passes never share each other's guidance.
@@ -844,6 +848,13 @@ def prime_llm_for_comments(
     # Prime the LLM with our system prompt
     messages = []
     messages.append({"role": "system", "content": comment_prompt})
+
+    # Inject the project blurb (if any) before the file summary, so the broader-project context informs both the
+    # generated summary and every routine turn that follows (see scale_project).
+    if project_blurb:
+        messages.append({"role": "user", "content":
+            "Here is some background on the wider project this file belongs to:\n\n" + project_blurb})
+        messages.append({"role": "assistant", "content": PRIMING_ACK})
 
     # Now summarise the whole file for context (chunked map-reduce kicks in automatically for large files; see
     # _generate_file_summary). The summary is generated against the system prompt alone (the only turn so far). The
@@ -1070,6 +1081,7 @@ def _file_doc_pass(
     source_lines: List[str],
     language: str,
     no_cache: Optional[bool] = False,
+    project_blurb: str = "",
 ) -> List[str]:
     """
     Run the file-level header doccomment pass: add or update the top-of-file description, preserving everything else.
@@ -1105,10 +1117,17 @@ def _file_doc_pass(
         echo("file-doc: nothing to annotate.")
         return source_lines
 
-    # Minimal priming for the classify turn: just the system prompt. The description prose is the whole-file summary,
-    # fetched (and cached) via the provider below, seeded with whatever existing description the classify turn finds.
+    # Minimal priming for the classify turn: the system prompt plus any project blurb (so the file description, which
+    # is the whole-file summary, understands the file's place in the wider project). The description prose is fetched
+    # (and cached) via the provider below, seeded with whatever existing description the classify turn finds.
     comment_prompt = (scale_path / "comment.txt").read_text(encoding="utf-8")
     base: Messages = [{"role": "system", "content": comment_prompt}]
+    if project_blurb:
+        base = base + [
+            {"role": "user", "content":
+                "Here is some background on the wider project this file belongs to:\n\n" + project_blurb},
+            {"role": "assistant", "content": PRIMING_ACK},
+        ]
 
     def summary_provider(seed: Optional[str]) -> str:
         return _get_file_summary(
@@ -1137,6 +1156,7 @@ def generate_comments(
     block_comment_style: str = "line",
     comment_value: Optional[int] = None,
     escalation=None,
+    project_blurb: str = "",
 ) -> int:
     """
     Generate comments for the provided (already-loaded) source code using a Large Language Model (LLM).
@@ -1179,12 +1199,14 @@ def generate_comments(
     # then see the updated header. It primes its own minimal context (it does not need the def-pass guidelines).
     if do_file_doc:
         new_lines = _file_doc_pass(
-            llm, cfg, scale_path, src_path, source_blob, new_lines, language, no_cache=no_cache
+            llm, cfg, scale_path, src_path, source_blob, new_lines, language, no_cache=no_cache,
+            project_blurb=project_blurb,
         )
 
     if do_comment:
         messages = prime_llm_for_comments(
-            llm, cfg, scale_path, src_path, source_blob, language, no_cache=no_cache, template="comment"
+            llm, cfg, scale_path, src_path, source_blob, language, no_cache=no_cache, template="comment",
+            project_blurb=project_blurb,
         )
         current_blob = line_ending.join(new_lines)
         new_lines = _def_pass(llm, cfg, messages, current_blob, new_lines, language, escalation=escalation)
@@ -1197,7 +1219,8 @@ def generate_comments(
             return 1
         current_blob = line_ending.join(new_lines)
         messages = prime_llm_for_comments(
-            llm, cfg, scale_path, src_path, source_blob, language, no_cache=no_cache, template="blocks"
+            llm, cfg, scale_path, src_path, source_blob, language, no_cache=no_cache, template="blocks",
+            project_blurb=project_blurb,
         )
         new_lines = _block_pass(llm, cfg, scale_path, messages, current_blob, new_lines, language,
                                 comment_style=block_comment_style, comment_value=comment_value, escalation=escalation)
@@ -1261,6 +1284,9 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "Higher is stricter; 1 keeps all. N above 5 (e.g. 6) skips the comment turns entirely and only "
                         "paragraphs the body (no model work). Lower-value notes still inform later paragraphs' context.")
     p.add_argument("--language", "-l", default=None, help="Source file language. SCALE currently supports: 'python', 'js', 'c'")
+    p.add_argument("--project-doc", default="", metavar="PATH",
+                   help="Project overview to distil into background context for every file (e.g. CLAUDE.md/README). "
+                        "Default: auto-detect near the source. 'none' disables it; or pass an explicit path.")
     p.add_argument("--verbose", "-v", action="store_true", help="Output progress information to stdout")
     p.add_argument("--very-verbose", "-vv", action="store_true", help="Output LLM debug information to stdout")
     p.add_argument("--no-cache", "-nc", action="store_true", help="Don't load the summary text for this file from cache")
@@ -1415,6 +1441,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         repeat_penalty=args.repeat_penalty,
     )
 
+    # Resolve and distil the project overview (CLAUDE.md/README/...) into a short blurb shared by every pass, giving
+    # the per-file annotation a sense of the wider project. Auto-detected near the source unless --project-doc says
+    # otherwise ('none' disables).
+    project_blurb = ""
+    project_doc = scale_project.resolve_project_doc(args.project_doc, src_path)
+    if project_doc is not None:
+        project_blurb = scale_project.project_blurb(llm, cfg, scale_path, project_doc, no_cache=args.no_cache)
+
     echo("Generating comments...")
     rc = generate_comments(
         llm, cfg, scale_path, src_path, dst_path,
@@ -1426,6 +1460,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         block_comment_style=args.block_comment_style,
         comment_value=args.comment_value,
         escalation=escalation,
+        project_blurb=project_blurb,
     )
 
     # Serialise the deferred requests so a stronger model can answer them (then re-run with --apply-manifest).

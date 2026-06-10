@@ -1,0 +1,4 @@
+Summarise what this software project is, for a developer who is about to read its source files. In two or three
+sentences say what the project does, its domain, and any key concepts or terminology a reader should know. This is
+background shown above individual files, so keep it short and general: do not describe individual files, functions, or
+APIs, and do not pad with build/usage/installation detail. Plain prose - no headings, no lists.
