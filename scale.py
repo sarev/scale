@@ -892,6 +892,9 @@ def _def_pass(
     source_lines: List[str],
     language: str,
     escalation=None,
+    doc_order: Optional[List[str]] = None,
+    callee_context: Optional[Callable[[str], str]] = None,
+    on_doc: Optional[Callable[[str, str], None]] = None,
 ) -> List[str]:
     """
     Run the definition (docstring/header-comment) pass for the resolved language.
@@ -903,6 +906,9 @@ def _def_pass(
     - `source_blob`: The complete source text to annotate (with original line endings).
     - `source_lines`: The same source text split into individual lines.
     - `language`: The programming language identifier (already validated).
+    - `escalation`: Optional `scale_escalate.Escalation` (Python only).
+    - `doc_order`/`callee_context`/`on_doc`: Optional call-graph hooks threaded to the worker (all three languages);
+      absent, the worker's behaviour is unchanged.
 
     Returns:
     - The annotated source split into individual lines.
@@ -911,14 +917,16 @@ def _def_pass(
     if language == "python":
         from scale_python import generate_language_comments
         # Only the Python worker understands selective escalation for now.
-        return generate_language_comments(llm, cfg, messages, source_blob, source_lines, escalation=escalation)
+        return generate_language_comments(llm, cfg, messages, source_blob, source_lines, escalation=escalation,
+                                          doc_order=doc_order, callee_context=callee_context, on_doc=on_doc)
     elif language == "js":
         from scale_javascript import generate_language_comments
     elif language == "c":
         from scale_c import generate_language_comments
     else:
         raise ValueError(f"Unsupported language '{language}'")
-    return generate_language_comments(llm, cfg, messages, source_blob, source_lines)
+    return generate_language_comments(llm, cfg, messages, source_blob, source_lines,
+                                      doc_order=doc_order, callee_context=callee_context, on_doc=on_doc)
 
 
 def _block_provider_for(language: str):
@@ -950,6 +958,68 @@ def _block_provider_for(language: str):
     raise NotImplementedError(
         f"The --blocks pass does not yet support '{language}'."
     )
+
+
+def _symbol_provider_for(language: str):
+    """
+    Return the per-language `iter_symbols` provider for the call-graph pre-pass, or None if the language has none.
+
+    The provider has the signature `provider(source_blob, source_lines) -> List[scale_project.Symbol]` and is
+    model-free. None is returned (rather than raising) for an unsupported language so the pre-pass can simply skip a
+    file it cannot parse for symbols, without aborting the run.
+
+    Parameters:
+    - `language`: The programming language identifier (already validated).
+
+    Returns:
+    - The provider callable, or None.
+    """
+
+    if language == "python":
+        from scale_python import iter_symbols
+        return iter_symbols
+    if language == "c":
+        from scale_c import iter_symbols
+        return iter_symbols
+    if language == "js":
+        from scale_javascript import iter_symbols
+        return iter_symbols
+    return None
+
+
+def _build_call_graph(targets: List[Path], references: List[Path], language_arg: Optional[str]):
+    """
+    Build the run's call graph and contract store from every target and reference file (the model-free pre-pass).
+
+    Each file is parsed for its symbols (definitions + resolved-or-not call sites); a file that cannot be loaded or has
+    no symbol provider is skipped. The resulting `ProjectGraph` drives leaf-first documentation order and callee-context
+    injection; the seeded `ContractStore` carries each routine's one-line contract (from existing docs at first, then
+    refined as the def pass writes docstrings).
+
+    Parameters:
+    - `targets`: The files to be annotated.
+    - `references`: The read-only reference files (seed contracts only; never documented).
+    - `language_arg`: The forced `--language` value (lowercased), or None to auto-detect per file.
+
+    Returns:
+    - A `(graph, store)` pair, or `(None, None)` if no file yielded symbols.
+    """
+
+    symbols_by_file: dict = {}
+    for f in list(targets) + list(references):
+        try:
+            blob, lines, _le, lang = load_source(f, language_arg)
+        except OSError:
+            continue
+        provider = _symbol_provider_for(lang) if lang in SUPPORTED_LANGUAGES else None
+        if provider is None:
+            continue
+        symbols_by_file[str(f.resolve())] = provider(blob, lines)
+
+    if not symbols_by_file:
+        return None, None
+    graph = scale_project.build_project_graph(symbols_by_file)
+    return graph, scale_project.ContractStore(graph)
 
 
 def _block_style_for(language: str, comment_style: str = "line"):
@@ -1158,6 +1228,9 @@ def generate_comments(
     comment_value: Optional[int] = None,
     escalation=None,
     project_context: str = "",
+    doc_order: Optional[List[str]] = None,
+    callee_context: Optional[Callable[[str], str]] = None,
+    on_doc: Optional[Callable[[str, str], None]] = None,
 ) -> int:
     """
     Generate comments for the provided (already-loaded) source code using a Large Language Model (LLM).
@@ -1183,6 +1256,8 @@ def generate_comments(
     - `do_blocks`: Run the within-function block pass.
     - `escalation`: Optional `scale_escalate.Escalation`; when supplied, complex routines are deferred to its manifest
       instead of being commented by the local model (the caller serialises the manifest afterwards).
+    - `doc_order`/`callee_context`/`on_doc`: Optional call-graph hooks for the definition pass (see `_def_pass`),
+      bound by the caller over the shared `ContractStore` and this file. Absent, the def pass behaves as before.
 
     Returns:
     - 0 if the operation was successful, or an error number.
@@ -1210,7 +1285,8 @@ def generate_comments(
             project_context=project_context,
         )
         current_blob = line_ending.join(new_lines)
-        new_lines = _def_pass(llm, cfg, messages, current_blob, new_lines, language, escalation=escalation)
+        new_lines = _def_pass(llm, cfg, messages, current_blob, new_lines, language, escalation=escalation,
+                              doc_order=doc_order, callee_context=callee_context, on_doc=on_doc)
 
     if do_blocks:
         try:
@@ -1505,6 +1581,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     related = _reference_oneliners(llm, cfg, scale_path, references, project_blurb, args.no_cache)
     project_context = scale_project.compose_project_context(project_blurb, related)
 
+    # Build the call graph once over targets ∪ references (model-free). It drives the definition pass's documentation
+    # order (callees/children first) and the callee-contract context injected into each routine's turn; the seeded
+    # store accumulates contracts across files. Only relevant when the def pass runs. Targets are reordered so a
+    # callee's file is documented before a caller's (coarse, by file).
+    graph = store = None
+    language_arg = args.language.lower() if args.language else None
+    if args.comment:
+        graph, store = _build_call_graph(targets, references, language_arg)
+        if graph is not None:
+            key_to_path = {str(t.resolve()): t for t in targets}
+            targets = [key_to_path[k] for k in graph.file_order(list(key_to_path.keys()))]
+
     # Annotate each target in turn (single target -> -o or stdout; multiple targets -> in place).
     rc = 0
     for target in targets:
@@ -1529,6 +1617,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             escalation = scale_escalate.Escalation(
                 threshold=args.escalate_cognitive, override=override, doc_style=doc_style)
 
+        # Bind the call-graph hooks for this file over the shared store (closing the file key into each closure). The
+        # store accumulates across files, so a callee documented in an earlier-ordered target informs a later caller.
+        doc_order = callee_context = on_doc = None
+        if graph is not None and store is not None:
+            file_key = str(target.resolve())
+            doc_order = graph.doc_order(file_key)
+            callee_context = lambda q, fk=file_key: store.callee_notes(fk, q)
+            on_doc = lambda q, doc, fk=file_key: store.update(fk, q, doc)
+
         out = dst_path if len(targets) == 1 else target
         echo(f"Annotating {target}...")
         frc = generate_comments(
@@ -1542,6 +1639,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             comment_value=args.comment_value,
             escalation=escalation,
             project_context=project_context,
+            doc_order=doc_order,
+            callee_context=callee_context,
+            on_doc=on_doc,
         )
         if frc != 0:
             rc = frc

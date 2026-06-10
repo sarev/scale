@@ -47,8 +47,9 @@ from scale_blocks import BlockTarget, SegStatement, structural_breaks
 from scale_filedoc import FileDocTarget, PYTHON_DOC_STYLE
 from scale_llm import LocalChatModel, GenerationConfig, Messages, Chunk
 from scale_log import echo
+from scale_project import Symbol, apply_doc_order
 from scale_text import fit_snippet, summarise, LENGTH_LINE, MARKER_PYTHON, PRIMING_ACK
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 import ast
 import copy
 import hashlib
@@ -433,6 +434,84 @@ def iter_defs_with_info(tree: ast.AST) -> List[DefInfo]:
         completed.append(replace(info, children_ids=child_ids))
 
     return sorted(completed, key=lambda d: d.start)
+
+
+def _collect_calls_py(node: ast.AST) -> List[Tuple[str, str]]:
+    """
+    Collect a routine's own call sites, classified for the call-graph resolver, without descending into nested defs.
+
+    Mirrors the opacity of `cognitive_complexity`: only the routine's own body is walked (nested functions/classes/
+    lambdas are scored/resolved as their own routines, so they are not descended into). Each `ast.Call` is classified
+    by its callee expression:
+      - a bare name `f(...)` -> `("f", "free")`;
+      - `self.m(...)` -> `("m", "self")` (the enclosing class's own method);
+      - any other attribute call `obj.m(...)` -> `("m", "method")` (linked only if `m` is a unique method name).
+    Calls through anything else (a subscript, a call result, ...) contribute no entry.
+
+    Parameters:
+    - `node`: A function/async-function/class definition node.
+
+    Returns:
+    - The call sites as `(name, kind)` pairs in source order (duplicates kept; the graph dedups on resolution).
+    """
+
+    calls: List[Tuple[str, str]] = []
+
+    def visit(n: ast.AST) -> None:
+        """Record `n` if it is a call site, then recurse - but a nested definition/lambda is opaque (not descended)."""
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            return
+        if isinstance(n, ast.Call):
+            f = n.func
+            if isinstance(f, ast.Name):
+                calls.append((f.id, "free"))
+            elif isinstance(f, ast.Attribute):
+                if isinstance(f.value, ast.Name) and f.value.id == "self":
+                    calls.append((f.attr, "self"))
+                else:
+                    calls.append((f.attr, "method"))
+        for child in ast.iter_child_nodes(n):
+            visit(child)
+
+    for stmt in getattr(node, "body", []):
+        visit(stmt)
+    return calls
+
+
+def iter_symbols(source_blob: str, source_lines: Chunk) -> List[Symbol]:
+    """
+    Extract the call-graph `Symbol` for every routine in a Python file (the model-free pre-pass per-file step).
+
+    Reuses `iter_defs_with_info` for the definition records, then attaches each routine's parent qualname, header
+    signature, existing docstring (the seed contract) and classified call sites (`_collect_calls_py`). Returns `[]` if
+    the file does not parse - a single unparseable file must not abort the whole run's pre-pass.
+
+    Parameters:
+    - `source_blob`: The complete source text.
+    - `source_lines`: The same source split into lines.
+
+    Returns:
+    - One `Symbol` per definition (the `file` field is left blank for `build_project_graph` to stamp).
+    """
+
+    try:
+        tree = ast.parse(source_blob)
+    except SyntaxError:
+        return []
+
+    defs = iter_defs_with_info(tree)
+    qual_by_node_id: Dict[int, str] = {id(d.node): d.qualname for d in defs}
+
+    symbols: List[Symbol] = []
+    for d in defs:
+        signature = "\n".join(source_lines[d.header_start - 1:d.header_end]) if d.header_end >= d.header_start else ""
+        parent_qualname = qual_by_node_id.get(d.parent_id) if d.parent_id is not None else None
+        existing_doc = ast.get_docstring(d.node) or "" if _is_def_node(d.node) else ""
+        symbols.append(Symbol(
+            qualname=d.qualname, kind=d.kind, signature=signature, start=d.start, depth=d.depth,
+            parent_qualname=parent_qualname, existing_doc=existing_doc, calls=_collect_calls_py(d.node),
+        ))
+    return symbols
 
 
 def _is_module_docstring_expr(node: ast.AST) -> bool:
@@ -901,6 +980,9 @@ def generate_docstrings(
     source_blob: str,
     source_lines: Chunk,
     escalation=None,
+    doc_order: Optional[List[str]] = None,
+    callee_context: Optional[Callable[[str], str]] = None,
+    on_doc: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[int, str]:
     """
     Generate or update docstrings for definitions in a Python source code AST.
@@ -919,6 +1001,14 @@ def generate_docstrings(
     - `escalation`: Optional `scale_escalate.Escalation`. When supplied, a definition whose complexity exceeds the
       cutoff has its docstring deferred to a stronger model: a manifest request carrying the assembled snippet is
       recorded and no docstring is produced locally (the routine is left untouched for the apply phase).
+    - `doc_order`: Optional call-graph documentation order (qualnames); when given, routines are processed in this
+      order (callees/children first) instead of the internal deepest-first sort, falling back to that sort for any
+      routine not listed.
+    - `callee_context`: Optional callback `qualname -> notes`; the resolved-callee contract block it returns is
+      appended to that routine's generation turn (so the docstring can draw on what it calls). Not added to escalated
+      routines (their snippet goes verbatim to the stronger model).
+    - `on_doc`: Optional callback `(qualname, docstring)` invoked after each locally-generated docstring, so the shared
+      `ContractStore` can update the routine's contract for later callers. Escalated/deferred routines do not call it.
 
     Returns:
     - A dictionary mapping qualified names to generated or updated docstrings.
@@ -1108,7 +1198,14 @@ def generate_docstrings(
 
     # ---------------- LLM loop (deepest-first using DefInfo.depth) ----------------
 
-    defs_deepest_first: List[DefInfo] = sorted(defs, key=lambda d: (d.depth, d.start, -d.end), reverse=True)
+    # Default order is deepest-first (children before parents, so a parent sees its child stubs). A call-graph
+    # `doc_order` overrides it (callees/children first), still keeping children ahead of parents; unlisted routines
+    # fall back to deepest-first via the same key.
+    deepest_first_key = lambda d: (-d.depth, d.start, -d.end)
+    if doc_order:
+        defs_deepest_first = apply_doc_order(defs, lambda d: d.qualname, doc_order, deepest_first_key)
+    else:
+        defs_deepest_first = sorted(defs, key=lambda d: (d.depth, d.start, -d.end), reverse=True)
 
     def record_escalation(info: DefInfo, score: int, snippet: str) -> None:
         """Record a deferred docstring request for `info` on the active manifest."""
@@ -1153,6 +1250,13 @@ def generate_docstrings(
                 f"comment as required:\n\n{local_snippet}\n"
             )
 
+        # Inject the one-line contracts of the routines this one calls (call-graph context), so the docstring can
+        # describe what it does in terms of its collaborators rather than guessing.
+        if callee_context is not None:
+            notes = callee_context(info.qualname)
+            if notes:
+                prompt += "\n" + notes + "\n"
+
         # Ask, and nudge once if the reply is not a usable docstring (the small model sometimes parrots "OK").
         appended = 0
         messages.append({"role": "user", "content": prompt})
@@ -1182,6 +1286,9 @@ def generate_docstrings(
             docstring = f"{info.kind} `{info.qualname}` - comment generation failed."
 
         docs_by_node_id[node_id] = docstring
+        # Publish this routine's freshly-generated contract so later callers (in this file or a later target) see it.
+        if on_doc is not None:
+            on_doc(info.qualname, docstring)
 
     return docs_by_node_id
 
@@ -1587,6 +1694,9 @@ def generate_language_comments(
     source_blob: str,
     source_lines: Chunk,
     escalation=None,
+    doc_order: Optional[List[str]] = None,
+    callee_context: Optional[Callable[[str], str]] = None,
+    on_doc: Optional[Callable[[str, str], None]] = None,
 ) -> Chunk:
     """
     Process Python source code and generate new/updated docstrings for each definition.
@@ -1602,6 +1712,8 @@ def generate_language_comments(
     - source_lines: The source file split into individual lines.
     - escalation: Optional `scale_escalate.Escalation`; when supplied, complex definitions are deferred to the manifest
       rather than commented locally (see `generate_docstrings`).
+    - doc_order/callee_context/on_doc: Optional call-graph hooks (see `generate_docstrings`); absent, behaviour is
+      unchanged.
 
     Returns:
     - A patched source file text, containing the new docstrings, split into individual lines.
@@ -1626,7 +1738,8 @@ def generate_language_comments(
     echo(f"Found {len(defs)} definitions")
 
     echo("Generating docstrings...\n")
-    doc_map = generate_docstrings(llm, cfg, messages, defs, source_blob, source_lines, escalation=escalation)
+    doc_map = generate_docstrings(llm, cfg, messages, defs, source_blob, source_lines, escalation=escalation,
+                                  doc_order=doc_order, callee_context=callee_context, on_doc=on_doc)
 
     echo("Applying Python patches...\n")
     return patch_docstrings_textually(source_lines, defs, doc_map)

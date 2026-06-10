@@ -25,10 +25,11 @@ from scale_blocks import BlockTarget, SegStatement, structural_breaks, SEG_MIN_L
 from scale_filedoc import FileDocTarget, scan_brace_leading_zone
 from scale_llm import LocalChatModel, GenerationConfig, Messages, Chunk
 from scale_log import echo
+from scale_project import Symbol, apply_doc_order
 from scale_text import fit_snippet, MARKER_C
 from tree_sitter import Parser, Language  # type: ignore
 from tree_sitter_c import language as c_language
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import re
 import textwrap
 
@@ -578,6 +579,67 @@ def iter_defs_with_info_c(tree, source_bytes: bytes) -> List[DefInfoC]:
     return sorted(results, key=lambda d: (d.start, d.end))
 
 
+def _collect_calls_c(node, source_bytes: bytes) -> List[Tuple[str, str]]:
+    """
+    Collect a C function's call sites for the call-graph resolver: every `f(...)` with a bare-identifier callee.
+
+    C has no nested functions or methods, so the whole function subtree is walked and only direct calls through a plain
+    identifier are recorded (all as `"free"`). Calls through a field/pointer expression or a function pointer are not
+    bare identifiers, so they are left unresolved (no entry).
+
+    Parameters:
+    - `node`: The `function_definition` tree-sitter node.
+    - `source_bytes`: The source bytes the tree was parsed from.
+
+    Returns:
+    - The call sites as `(name, "free")` pairs.
+    """
+
+    calls: List[Tuple[str, str]] = []
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if n.type == "call_expression":
+            fn = n.child_by_field_name("function")
+            if fn is not None and fn.type == "identifier":
+                calls.append((_node_text(source_bytes, fn), "free"))
+        for i in range(n.named_child_count):
+            stack.append(n.named_child(i))
+    return calls
+
+
+def iter_symbols(source_blob: str, source_lines: Chunk) -> List[Symbol]:
+    """
+    Extract the call-graph `Symbol` for every function in a C file (the model-free pre-pass per-file step).
+
+    Reuses `iter_defs_with_info_c` for the definition records, then attaches each function's header signature, the
+    existing doc comment above it (the seed contract, via `_doc_above_header`) and its bare-identifier call sites.
+    Every C function is at file scope (no nesting, no parent). Returns `[]` if the file cannot be parsed.
+
+    Parameters:
+    - `source_blob`: The complete source text.
+    - `source_lines`: The same source split into lines.
+
+    Returns:
+    - One `Symbol` per function definition (the `file` field is left blank for `build_project_graph` to stamp).
+    """
+
+    try:
+        tree, source_bytes = _parse_c(source_blob)
+    except Exception:
+        return []
+
+    symbols: List[Symbol] = []
+    for d in iter_defs_with_info_c(tree, source_bytes):
+        signature = "\n".join(source_lines[d.header_start - 1:d.header_end]) if d.header_end >= d.header_start else ""
+        symbols.append(Symbol(
+            qualname=d.qualname, kind=d.kind, signature=signature, start=d.start, depth=d.depth,
+            parent_qualname=None, existing_doc=_doc_above_header(source_lines, d.header_start),
+            calls=_collect_calls_c(d.node, source_bytes),
+        ))
+    return symbols
+
+
 # ---------------- Within-function block targets (the `-b` block pass)
 
 
@@ -977,7 +1039,10 @@ def generate_comments_c(
     messages: Messages,
     defs: List[DefInfoC],
     source_blob: str,
-    source_lines: Chunk
+    source_lines: Chunk,
+    doc_order: Optional[List[str]] = None,
+    callee_context: Optional[Callable[[str], str]] = None,
+    on_doc: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[Tuple[int, int], str]:
     """
     Generate doc comments for each function definition.
@@ -994,6 +1059,10 @@ def generate_comments_c(
     - `defs`: A list of function definition information.
     - `source_blob`: The original source code as a string.
     - `source_lines`: The source code broken down into chunks.
+    - `doc_order`: Optional call-graph documentation order (qualnames); when given, functions are documented in this
+      order (callees first) instead of source order, falling back to source order for any not listed.
+    - `callee_context`: Optional callback `qualname -> notes` appended to each function's generation turn.
+    - `on_doc`: Optional callback `(qualname, comment)` invoked after each generated comment (updates the contract).
 
     Returns:
     - A dictionary mapping each function's header span to its corresponding documentation comment.
@@ -1001,8 +1070,9 @@ def generate_comments_c(
 
     doc_map: Dict[Tuple[int, int], str] = {}
 
-    # No nesting to worry about; process in source order
-    for info in defs:
+    # C has no nesting; default order is source order. A call-graph `doc_order` documents callees before callers.
+    ordered = apply_doc_order(defs, lambda d: d.qualname, doc_order, lambda d: d.start) if doc_order else defs
+    for info in ordered:
         snippet = assemble_snippet_for_c(source_lines, info)
 
         # Elide the body if this function is too large for the context window (the patch is unaffected).
@@ -1020,6 +1090,13 @@ def generate_comments_c(
             "declaration (no code), describing purpose, parameters and return value.\n\n"
             f"{snippet}\n"
         )
+
+        # Inject the one-line contracts of the functions this one calls (call-graph context).
+        if callee_context is not None:
+            notes = callee_context(info.qualname)
+            if notes:
+                prompt += "\n" + notes + "\n"
+
         messages.append({"role": "user", "content": prompt})
         reply = llm.generate(messages, cfg=cfg)
         echo(f"\n[C] LLM output:\n\n{reply}")
@@ -1029,6 +1106,9 @@ def generate_comments_c(
         if not body:
             body = f"function `{info.qualname}` - documentation generation failed."
         doc_map[(info.header_start, info.header_end)] = body
+        # Publish this function's freshly-generated contract for later callers.
+        if on_doc is not None:
+            on_doc(info.qualname, body)
 
     return doc_map
 
@@ -1087,7 +1167,10 @@ def generate_language_comments(
     cfg: GenerationConfig,
     messages: Messages,
     source_blob: str,
-    source_lines: Chunk
+    source_lines: Chunk,
+    doc_order: Optional[List[str]] = None,
+    callee_context: Optional[Callable[[str], str]] = None,
+    on_doc: Optional[Callable[[str, str], None]] = None,
 ) -> Chunk:
     """
     Generate language comments for a given C source code.
@@ -1106,6 +1189,8 @@ def generate_language_comments(
     - `messages`: The Messages object containing any relevant messages.
     - `source_blob`: The raw C source code as a string.
     - `source_lines`: The original source code split into lines.
+    - `doc_order`/`callee_context`/`on_doc`: Optional call-graph hooks (see `generate_comments_c`); absent, behaviour
+      is unchanged.
 
     Returns:
     - The updated source lines with generated comments.
@@ -1121,7 +1206,8 @@ def generate_language_comments(
     describe_includes_c(llm, cfg, messages, tree, source_bytes)
 
     echo("Generating C comments...\n")
-    doc_map = generate_comments_c(llm, cfg, messages, defs, source_blob, source_lines)
+    doc_map = generate_comments_c(llm, cfg, messages, defs, source_blob, source_lines,
+                                  doc_order=doc_order, callee_context=callee_context, on_doc=on_doc)
 
     echo("Applying C patches...\n")
     return patch_comments_textually_c(source_lines, defs, doc_map)

@@ -25,10 +25,12 @@ into a short, cached "project blurb" that is injected into every file's priming 
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 import glob
 import hashlib
+import heapq
 
 from scale_text import summarise, LENGTH_PARAGRAPH
 from scale_log import echo
@@ -295,3 +297,401 @@ def resolve_project_doc(project_doc_arg: str, start: Path) -> Optional[Path]:
         p = Path(project_doc_arg)
         return p if p.is_file() else None
     return find_project_doc(start)
+
+
+# ============================================================================
+# Call-graph-aware documentation
+#
+# SCALE documents routines in isolation, so a function's docstring cannot draw on what the functions it *calls* do, and
+# routines are ordered by nesting rather than by call dependency. This layer adds a **model-free pre-pass** that parses
+# every run file into symbols + calls, builds a call graph, and lets the definition pass (1) document callees before
+# callers (leaf-first), and (2) inject the one-line contracts of each routine's resolved callees into its generation
+# turn. It is cost-neutral: contracts come only from existing docstrings (a seed) and the docstrings the def pass itself
+# generates (each one's first line updates the contract for later callers) - no extra model calls are made. The
+# byte-for-byte code guarantee is untouched; nothing here patches source.
+#
+# Call resolution is **confident-only** - it never guesses a receiver type. A call links only when it can be resolved
+# safely: a free function by name (same-file first, else a run-wide unique match); `self`/`this` method calls to the
+# enclosing class's own method; and `obj.m()` only when the method name `m` is defined by exactly one class across the
+# whole run. Everything else (typed-receiver dispatch, function pointers, dynamic calls) stays unresolved and simply
+# contributes no note.
+# ============================================================================
+
+
+# How many callee contracts to inject into a routine's generation turn (kept small so the per-turn context stays tight).
+CALLEE_NOTES_CAP = 6
+
+
+def apply_doc_order(items: List, qualname_of: Callable, doc_order: List[str], fallback_key: Callable) -> List:
+    """
+    Order `items` by a pre-pass `doc_order` (qualnames), falling back to `fallback_key` for unlisted items and ties.
+
+    A worker's def loop uses this to process routines callee/child-first per the call graph instead of its internal
+    sort. Items whose qualname is in `doc_order` come first in that order; any item not listed (or sharing a qualname
+    with another - a collision) is ordered by `fallback_key`, which should preserve the worker's own correctness
+    constraint (e.g. deepest-first so a child is still documented before its parent).
+
+    Parameters:
+    - `items`: The worker's definition records.
+    - `qualname_of`: Extracts an item's qualname.
+    - `doc_order`: The qualnames in desired documentation order.
+    - `fallback_key`: A sort key for unlisted items and intra-position ties.
+
+    Returns:
+    - The items reordered.
+    """
+
+    pos = {q: i for i, q in enumerate(doc_order)}
+    sentinel = len(pos)
+    return sorted(items, key=lambda it: (pos.get(qualname_of(it), sentinel), fallback_key(it)))
+
+
+@dataclass
+class Symbol:
+    """
+    One documentable routine in the run, as seen by the model-free call-graph pre-pass.
+
+    A worker's `iter_symbols` emits these (without `file`, which `build_project_graph` stamps from the run's file key)
+    by walking each routine's own body - not descending into nested definitions - so `calls` reflects only the
+    routine's own call sites.
+
+    Attributes:
+    - `qualname`: The routine's qualified name (e.g. "foo", "Class.method", "outer.inner").
+    - `kind`: The definition kind ("def"/"class"/"function"/"method"/...), as the worker reports it.
+    - `signature`: The routine's header text (used only for context/debugging; not patched).
+    - `start`: The 1-based start line of the routine (used as a deterministic ordering tiebreak).
+    - `depth`: The nesting depth (0 at file scope).
+    - `parent_qualname`: The qualname of the immediately enclosing definition, or None at file scope.
+    - `existing_doc`: The first line of any documentation the routine already has (the seed contract).
+    - `calls`: The routine's own call sites as `(name, kind)` pairs, kind ∈ {"free", "self", "method"}.
+    - `file`: The run's file key (a resolved-path string); stamped by `build_project_graph`.
+    """
+
+    qualname: str
+    kind: str
+    signature: str
+    start: int
+    depth: int
+    parent_qualname: Optional[str]
+    existing_doc: str
+    calls: List[Tuple[str, str]] = field(default_factory=list)
+    file: str = ""
+
+
+# A symbol key uniquely identifies a routine across the run: (file, qualname).
+SymKey = Tuple[str, str]
+
+
+def _first_line(text: str) -> str:
+    """Return the first non-blank line of `text`, stripped (or "" if there is none) - a routine's one-line contract."""
+
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if s:
+            return s
+    return ""
+
+
+def _tarjan_sccs(nodes: List, succ: Dict) -> List[List]:
+    """
+    Find the strongly-connected components of a directed graph, in reverse-topological order.
+
+    An iterative Tarjan (so deep/recursive graphs cannot blow the Python stack). `succ[n]` is the set of nodes that `n`
+    points to. The components are returned sink-first (a component is emitted after every component reachable from it),
+    which callers reverse to get a source-first topological order. Cycles (recursion / mutual recursion) collapse into a
+    single component, so the ordering never loops.
+
+    Parameters:
+    - `nodes`: All graph nodes (the iteration order seeds a deterministic DFS).
+    - `succ`: Adjacency mapping each node to an iterable of its successors.
+
+    Returns:
+    - A list of components (each a list of nodes), in reverse-topological order.
+    """
+
+    index: Dict = {}
+    low: Dict = {}
+    on_stack: Set = set()
+    stack: List = []
+    sccs: List[List] = []
+    counter = 0
+
+    for root in nodes:
+        if root in index:
+            continue
+        index[root] = low[root] = counter
+        counter += 1
+        stack.append(root)
+        on_stack.add(root)
+        work = [(root, iter(succ.get(root, ())))]
+        while work:
+            node, it = work[-1]
+            descended = False
+            for w in it:
+                if w not in index:
+                    index[w] = low[w] = counter
+                    counter += 1
+                    stack.append(w)
+                    on_stack.add(w)
+                    work.append((w, iter(succ.get(w, ()))))
+                    descended = True
+                    break
+                if w in on_stack:
+                    low[node] = min(low[node], index[w])
+            if descended:
+                continue
+            if low[node] == index[node]:
+                comp: List = []
+                while True:
+                    x = stack.pop()
+                    on_stack.discard(x)
+                    comp.append(x)
+                    if x == node:
+                        break
+                sccs.append(comp)
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[node])
+    return sccs
+
+
+def _leaf_first_order(nodes: List, succ: Dict, tiebreak: Callable) -> List:
+    """
+    Order `nodes` leaf-first: a node appears before any node it points to, with cycles collapsed.
+
+    `succ[n]` lists the nodes that must come *after* `n` (n "precedes" them). A deterministic Kahn topological sort over
+    the SCC condensation: cycles (recursion / mutual recursion) collapse into one component, and a component is emitted
+    only once everything that precedes it has been. Among components ready at the same time - and among unconstrained
+    nodes, which all are - `tiebreak` decides, so the order is stable and (for independent nodes) follows their natural
+    `tiebreak` order rather than an artefact of the DFS.
+
+    Parameters:
+    - `nodes`: The nodes to order.
+    - `succ`: Adjacency where `n -> m` means n precedes m.
+    - `tiebreak`: A sort key for ordering nodes within a component and for breaking ties between ready components.
+
+    Returns:
+    - The nodes in leaf-first order.
+    """
+
+    sccs = _tarjan_sccs(nodes, succ)
+    comp_of: Dict = {}
+    for i, comp in enumerate(sccs):
+        for n in comp:
+            comp_of[n] = i
+
+    cedges: Dict[int, Set[int]] = {i: set() for i in range(len(sccs))}
+    indeg: Dict[int, int] = {i: 0 for i in range(len(sccs))}
+    for n in nodes:
+        cn = comp_of[n]
+        for m in succ.get(n, ()):                      # n precedes m -> component cn precedes cm
+            cm = comp_of[m]
+            if cn != cm and cm not in cedges[cn]:
+                cedges[cn].add(cm)
+                indeg[cm] += 1
+
+    comp_key = [min(tiebreak(n) for n in comp) for comp in sccs]
+    heap = [(comp_key[i], i) for i in range(len(sccs)) if indeg[i] == 0]
+    heapq.heapify(heap)
+
+    out: List = []
+    while heap:
+        _, i = heapq.heappop(heap)
+        out.extend(sorted(sccs[i], key=tiebreak))
+        for cm in sorted(cedges[i]):
+            indeg[cm] -= 1
+            if indeg[cm] == 0:
+                heapq.heappush(heap, (comp_key[cm], cm))
+    return out
+
+
+@dataclass
+class ProjectGraph:
+    """
+    The resolved call graph for a run: a symbol table, the resolved callee edges, and a leaf-first documentation order.
+
+    Built by `build_project_graph` from every run file's symbols (targets and read-only references alike). `edges` maps
+    each routine to the routines it calls *that were confidently resolved*; `order` is every symbol key in leaf-first
+    order (callees and nested children before their callers/parents). References take part in resolution and ordering
+    inputs but are never documented - the caller restricts documentation to its targets.
+    """
+
+    symbols: Dict[SymKey, Symbol]
+    edges: Dict[SymKey, List[SymKey]]
+    order: List[SymKey]
+
+    def doc_order(self, file: str) -> List[str]:
+        """Return the qualnames of `file`'s symbols in leaf-first documentation order."""
+
+        return [q for (f, q) in self.order if f == file]
+
+    def file_order(self, target_files: List[str]) -> List[str]:
+        """
+        Order the target files coarsely so a callee's file is documented before a caller's (leaf-first), by file.
+
+        Only cross-file call edges constrain the order (nesting is intra-file); files with no constraint keep their
+        input order. Cycles between files collapse so the order never loops. References are not included - only the
+        targets are documented and reordered.
+
+        Parameters:
+        - `target_files`: The file keys to order (the run's targets).
+
+        Returns:
+        - The target file keys in leaf-first order.
+        """
+
+        idx = {f: i for i, f in enumerate(target_files)}
+        tset = set(target_files)
+        succ: Dict[str, Set[str]] = {f: set() for f in target_files}
+        for caller, callees in self.edges.items():
+            cf = caller[0]
+            if cf not in tset:
+                continue
+            for callee in callees:
+                kf = callee[0]
+                if kf != cf and kf in tset:
+                    succ[kf].add(cf)   # the callee's file precedes the caller's file
+        return _leaf_first_order(target_files, succ, tiebreak=lambda f: idx[f])
+
+
+def build_project_graph(symbols_by_file: Dict[str, List[Symbol]]) -> ProjectGraph:
+    """
+    Build the resolved call graph from every run file's symbols (the model-free pre-pass core).
+
+    Indexes the symbols, resolves each routine's call sites by the confident-only rules (free-by-name with same-file
+    preference then run-wide uniqueness; `self`/`this` to the enclosing class's own method; `obj.m()` only when `m` is
+    unique to one class run-wide), and computes a leaf-first documentation order from two edge kinds - nesting
+    (child precedes parent, so the existing child-stub mechanism still has children done first) and call (callee
+    precedes caller) - condensed by SCC so recursion / mutual recursion cannot deadlock or loop.
+
+    Parameters:
+    - `symbols_by_file`: Each run file's symbols, keyed by the file key (a resolved-path string). Each symbol's `file`
+      is stamped here.
+
+    Returns:
+    - The populated `ProjectGraph`.
+    """
+
+    symbols: Dict[SymKey, Symbol] = {}
+    for file, syms in symbols_by_file.items():
+        for s in syms:
+            s.file = file
+            symbols[(file, s.qualname)] = s
+
+    # Name indices for resolution. `free_funcs`: bare-name -> top-level symbol keys (functions/classes at file scope).
+    # `methods_by_name`: method simple-name -> keys of methods (a symbol whose immediate parent is a class).
+    free_funcs: Dict[str, List[SymKey]] = {}
+    methods_by_name: Dict[str, List[SymKey]] = {}
+    for key, s in symbols.items():
+        file, q = key
+        simple = q.rsplit(".", 1)[-1]
+        if s.parent_qualname is None:
+            free_funcs.setdefault(simple, []).append(key)
+        else:
+            parent = symbols.get((file, s.parent_qualname))
+            if parent is not None and parent.kind == "class":
+                methods_by_name.setdefault(simple, []).append(key)
+
+    def resolve(file: str, s: Symbol, name: str, ckind: str) -> Optional[SymKey]:
+        """Resolve one call site to a callee key by the confident-only rules, or None when it cannot be linked safely."""
+
+        if ckind == "free":
+            same = [k for k in free_funcs.get(name, []) if k[0] == file]
+            if same:
+                return same[0] if len(same) == 1 else None   # ambiguous same-file -> unresolved
+            allk = free_funcs.get(name, [])
+            return allk[0] if len(allk) == 1 else None        # else a run-wide unique match
+        if ckind == "self":
+            if s.parent_qualname:
+                cand = (file, f"{s.parent_qualname}.{name}")
+                if cand in symbols:
+                    return cand
+            return None
+        if ckind == "method":
+            cand = methods_by_name.get(name, [])
+            return cand[0] if len(cand) == 1 else None        # unique method-name across the run -> safe to link
+        return None
+
+    edges: Dict[SymKey, List[SymKey]] = {}
+    for key, s in symbols.items():
+        file = key[0]
+        resolved: List[SymKey] = []
+        seen: Set[SymKey] = set()
+        for (name, ckind) in s.calls:
+            target = resolve(file, s, name, ckind)
+            if target is not None and target != key and target not in seen:
+                seen.add(target)
+                resolved.append(target)
+        edges[key] = resolved
+
+    # Documentation order: a "precedes" graph (n -> m means n is documented before m), then leaf-first topo over SCCs.
+    succ: Dict[SymKey, Set[SymKey]] = {key: set() for key in symbols}
+    for key, s in symbols.items():
+        if s.parent_qualname:
+            pkey = (key[0], s.parent_qualname)
+            if pkey in symbols:
+                succ[key].add(pkey)                # a nested child precedes its parent
+    for caller, callees in edges.items():
+        for callee in callees:
+            succ[callee].add(caller)               # a callee precedes its caller
+
+    order = _leaf_first_order(
+        list(symbols.keys()), succ, tiebreak=lambda k: (symbols[k].start, k[1]))
+    return ProjectGraph(symbols=symbols, edges=edges, order=order)
+
+
+class ContractStore:
+    """
+    The run's evolving one-line contracts: each routine's first-line summary, used to feed callers their callees' gist.
+
+    Seeded from every symbol's existing documentation (so a callee already documented - or a reference file - has a
+    contract from the start), then refined as the definition pass writes each docstring (`update`). A caller's
+    generation turn pulls its resolved callees' contracts via `callee_notes`. Contracts thus come only from existing or
+    freshly-generated docs, so the whole layer adds no model calls.
+    """
+
+    def __init__(self, graph: ProjectGraph) -> None:
+        """Seed a contract for every symbol that already has documentation (its first line)."""
+
+        self._graph = graph
+        self._contracts: Dict[SymKey, str] = {}
+        for key, s in graph.symbols.items():
+            line = _first_line(s.existing_doc)
+            if line:
+                self._contracts[key] = line
+
+    def update(self, file: str, qualname: str, docstring: str) -> None:
+        """Set a routine's contract to the first line of a freshly-generated docstring (ignored if it is blank)."""
+
+        line = _first_line(docstring)
+        if line:
+            self._contracts[(file, qualname)] = line
+
+    def callee_notes(self, file: str, qualname: str, cap: int = CALLEE_NOTES_CAP) -> str:
+        """
+        Format the contracts of a routine's resolved callees as a short context block (or "" when there are none).
+
+        Callees without a contract yet (unresolved, or not documented and undocumented to begin with) are omitted, and
+        the list is capped so the injected context stays small.
+
+        Parameters:
+        - `file`/`qualname`: The calling routine.
+        - `cap`: The maximum number of callee contracts to include.
+
+        Returns:
+        - A "Functions/methods this routine calls:" block, or "" if no callee has a contract.
+        """
+
+        notes: List[Tuple[str, str]] = []
+        for callee in self._graph.edges.get((file, qualname), []):
+            line = self._contracts.get(callee)
+            if not line:
+                continue
+            notes.append((callee[1].rsplit(".", 1)[-1], line))
+            if len(notes) >= cap:
+                break
+        if not notes:
+            return ""
+        body = "\n".join(f"- {name}: {contract}" for name, contract in notes)
+        return "Functions/methods this routine calls:\n" + body

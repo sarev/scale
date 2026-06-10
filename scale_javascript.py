@@ -43,10 +43,11 @@ from scale_blocks import BlockTarget, SegStatement, structural_breaks, SEG_MIN_L
 from scale_filedoc import FileDocTarget, scan_brace_leading_zone
 from scale_llm import LocalChatModel, GenerationConfig, Messages, Chunk
 from scale_log import echo
+from scale_project import Symbol, apply_doc_order
 from scale_text import fit_snippet, MARKER_JS
 from tree_sitter import Parser, Language
 from tree_sitter_javascript import language as js_language
-from typing import Dict, List, Optional, Tuple, Iterable, Any
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import textwrap
 
 
@@ -813,6 +814,97 @@ def iter_defs_with_info_js(tree, source_bytes: bytes) -> List[DefInfoJS]:
     return sorted(completed, key=lambda d: d.start)
 
 
+def _collect_calls_js(node, source_bytes: bytes, def_node_ids: set) -> List[Tuple[str, str]]:
+    """
+    Collect a JS routine's own call sites for the call-graph resolver, without descending into nested routines.
+
+    The walk starts at the routine node and descends through everything *except* the subtrees of other recognised
+    definitions (any node whose id is in `def_node_ids`, except this routine's own node) - so a nested function/class/
+    function-valued binding is opaque and resolved as its own routine. This id-set approach is precise where a
+    type-based skip would not be: a `const f = () => {...}` is recorded as a `variable_declarator`, so its arrow value
+    is *not* a separate def node and is correctly walked. Each `call_expression` is classified by its callee:
+      - `f(...)` -> `("f", "free")`;
+      - `this.m(...)` -> `("m", "self")`;
+      - any other `obj.m(...)` -> `("m", "method")`.
+
+    Parameters:
+    - `node`: The routine's tree-sitter node.
+    - `source_bytes`: The source bytes the tree was parsed from.
+    - `def_node_ids`: The ids of every routine node in the file (used to treat nested routines as opaque).
+
+    Returns:
+    - The call sites as `(name, kind)` pairs.
+    """
+
+    root_id = node.id
+    calls: List[Tuple[str, str]] = []
+
+    def visit(n) -> None:
+        """Record `n` if it is a call site, then descend - skipping the subtree of any *other* recognised definition."""
+        if n.type == "call_expression":
+            fn = n.child_by_field_name("function")
+            if fn is not None:
+                if fn.type == "identifier":
+                    calls.append((_node_text(source_bytes, fn), "free"))
+                elif fn.type == "member_expression":
+                    obj = fn.child_by_field_name("object")
+                    prop = fn.child_by_field_name("property")
+                    if prop is not None:
+                        name = _node_text(source_bytes, prop)
+                        if obj is not None and obj.type == "this":
+                            calls.append((name, "self"))
+                        else:
+                            calls.append((name, "method"))
+        for i in range(n.named_child_count):
+            child = n.named_child(i)
+            if child.id in def_node_ids and child.id != root_id:
+                continue   # a nested routine: opaque, resolved on its own
+            visit(child)
+
+    visit(node)
+    return calls
+
+
+def iter_symbols(source_blob: str, source_lines: Chunk) -> List[Symbol]:
+    """
+    Extract the call-graph `Symbol` for every routine in a JS file (the model-free pre-pass per-file step).
+
+    Reuses `iter_defs_with_info_js` for the definition records, then attaches each routine's parent qualname, header
+    signature, the existing doc comment above it (the seed contract, via `_doc_above_header_js`) and its classified
+    call sites (`_collect_calls_js`, which treats nested routines as opaque). Returns `[]` if the file cannot be parsed.
+
+    Parameters:
+    - `source_blob`: The complete source text.
+    - `source_lines`: The same source split into lines.
+
+    Returns:
+    - One `Symbol` per definition (the `file` field is left blank for `build_project_graph` to stamp).
+    """
+
+    try:
+        tree, source_bytes = _parse_js(source_blob)
+    except Exception:
+        return []
+
+    defs = iter_defs_with_info_js(tree, source_bytes)
+    # `iter_defs_with_info_js` keys parent/child relationships by Python `id()` of the node objects it captured; reuse
+    # that for parent lookup. For the call walk (a fresh descent that yields new node wrappers) use the tree-stable
+    # `node.id` instead, since Python `id()` is not stable across separate node accesses.
+    qual_by_pyid: Dict[int, str] = {id(d.node): d.qualname for d in defs}
+    def_node_ids = {d.node.id for d in defs}
+
+    symbols: List[Symbol] = []
+    for d in defs:
+        signature = "\n".join(source_lines[d.header_start - 1:d.header_end]) if d.header_end >= d.header_start else ""
+        parent_qualname = qual_by_pyid.get(d.parent_id) if d.parent_id is not None else None
+        symbols.append(Symbol(
+            qualname=d.qualname, kind=d.kind, signature=signature, start=d.start, depth=d.depth,
+            parent_qualname=parent_qualname, existing_doc=_doc_above_header_js(source_lines, d.header_start),
+            calls=_collect_calls_js(d.node, source_bytes, def_node_ids),
+        ))
+    return symbols
+
+
 # ---- Within-function block targets (the `-b` block pass) --------------------
 
 
@@ -1367,7 +1459,10 @@ def generate_comments_js(
     messages: Messages,
     defs: List[DefInfoJS],
     source_blob: str,
-    source_lines: Chunk
+    source_lines: Chunk,
+    doc_order: Optional[List[str]] = None,
+    callee_context: Optional[Callable[[str], str]] = None,
+    on_doc: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[int, str]:
     """
     Generate JSDoc content for JS definitions in a deepest-first order, ensuring parents see child stubs.
@@ -1394,7 +1489,14 @@ def generate_comments_js(
     docs_by_node_id: Dict[int, str] = {}
     info_by_id: Dict[int, DefInfoJS] = {id(d.node): d for d in defs}
 
-    for info in deepest_first_js(defs):
+    # Default order is deepest-first (children before parents, so a parent sees its child stubs). A call-graph
+    # `doc_order` overrides it (callees/children first), still keeping children ahead of parents via the fallback key.
+    if doc_order:
+        ordered = apply_doc_order(defs, lambda d: d.qualname, doc_order, lambda d: (-d.depth, d.start, -d.end))
+    else:
+        ordered = deepest_first_js(defs)
+
+    for info in ordered:
         node_id = id(info.node)
         snippet = assemble_snippet_for_js(info_by_id, source_lines, node_id, docs_by_node_id)
 
@@ -1422,6 +1524,13 @@ def generate_comments_js(
                 "immediately above the definition:\n\n"
                 f"{snippet}\n"
             )
+
+        # Inject the one-line contracts of the routines this one calls (call-graph context).
+        if callee_context is not None:
+            notes = callee_context(info.qualname)
+            if notes:
+                prompt += "\n" + notes + "\n"
+
         messages.append({"role": "user", "content": prompt})
         reply = llm.generate(messages, cfg=cfg)
         echo(f"\n[JS] LLM output:\n\n{reply}")
@@ -1431,6 +1540,9 @@ def generate_comments_js(
         if not doc:
             doc = f"{info.kind} `{info.qualname}` - documentation generation failed."
         docs_by_node_id[node_id] = doc
+        # Publish this routine's freshly-generated contract for later callers.
+        if on_doc is not None:
+            on_doc(info.qualname, doc)
 
     return docs_by_node_id
 
@@ -1531,7 +1643,10 @@ def generate_language_comments(
     cfg: GenerationConfig,
     messages: Messages,
     source_blob: str,
-    source_lines: Chunk
+    source_lines: Chunk,
+    doc_order: Optional[List[str]] = None,
+    callee_context: Optional[Callable[[str], str]] = None,
+    on_doc: Optional[Callable[[str, str], None]] = None,
 ) -> Chunk:
     """
     Generate JSDoc comments for a JavaScript source code chunk.
@@ -1550,6 +1665,8 @@ def generate_language_comments(
     - `messages`: The messages object.
     - `source_blob`: The JavaScript source code as a string.
     - `source_lines`: The source code chunk.
+    - `doc_order`/`callee_context`/`on_doc`: Optional call-graph hooks (see `generate_comments_js`); absent, behaviour
+      is unchanged.
 
     Returns:
     - The updated source code chunk with generated JSDoc comments.
@@ -1565,7 +1682,8 @@ def generate_language_comments(
     describe_imports_js(llm, cfg, messages, tree, source_bytes)
 
     echo("Generating JSDoc comments...\n")
-    doc_map = generate_comments_js(llm, cfg, messages, defs, source_blob, source_lines)
+    doc_map = generate_comments_js(llm, cfg, messages, defs, source_blob, source_lines,
+                                   doc_order=doc_order, callee_context=callee_context, on_doc=on_doc)
 
     echo("Applying JS patches...\n")
     return patch_comments_textually_js(source_lines, defs, doc_map)

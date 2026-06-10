@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import scale_project  # noqa: E402
-from scale import _parse_args, main  # noqa: E402
+from scale import _parse_args, main, _build_call_graph, _symbol_provider_for  # noqa: E402
 
 
 def test_gather_files():
@@ -74,12 +74,37 @@ def test_main_guards_fail_fast():
         assert main([str(f1), str(f2), "--apply-manifest", str(root / "m.json")]) == 1
 
 
+def test_build_call_graph():
+    # The model-free call-graph pre-pass: parses targets ∪ references into a graph + seeded store, links a cross-file
+    # call, and orders the callee's file first. A reference seeds a contract but is not itself a documentation target.
+    assert _symbol_provider_for("python") is not None
+    assert _symbol_provider_for("ruby") is None     # unsupported language -> skipped, not an error
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        util = root / "util.py"
+        core = root / "core.py"
+        util.write_text('def clamp(x):\n    """Clamp x to range."""\n    return x\n', encoding="utf-8")
+        core.write_text("def run(xs):\n    return [clamp(x) for x in xs]\n", encoding="utf-8")
+
+        graph, store = _build_call_graph([core, util], [], "python")
+        assert graph is not None and store is not None
+
+        uk, ck = str(util.resolve()), str(core.resolve())
+        # The cross-file free call resolves (run-wide unique) and the callee's file is ordered first.
+        assert graph.edges[(ck, "run")] == [(uk, "clamp")]
+        assert graph.file_order([ck, uk]) == [uk, ck]
+        # The store is seeded from clamp's existing docstring, so run already has its callee's contract.
+        assert "clamp: Clamp x to range." in store.callee_notes(ck, "run")
+
+
 def main_():
     test_gather_files()
     test_compose_project_context()
     test_parse_args_multi_target_and_reference()
     test_main_guards_fail_fast()
-    print("PASS: target/reference expansion, project-context compose, and the multi-target CLI guards")
+    test_build_call_graph()
+    print("PASS: target/reference expansion, project-context compose, the multi-target CLI guards, and the call-graph pre-pass")
     return 0
 
 
