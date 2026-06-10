@@ -35,9 +35,9 @@ def main():
     h = {t.qualname: t for t in iter_block_targets_js(SRC, lines)}["h"]
 
     starts = [s for s, _ in h.segments]
-    assert starts == [3, 7, 8], f"unexpected segment starts: {starts} (segments {h.segments})"
+    assert starts == [2, 3, 7, 8], f"unexpected segment starts: {starts} (segments {h.segments})"
 
-    assert 2 not in starts, "the first body statement must never get a paragraph break above it"
+    assert 2 in starts, "the opening paragraph (line 2) is its own chunk, so it is summarised/scored"
     assert 7 in starts, "the statement after a nested definition must start a new paragraph (after_def)"
 
     # Ranges are well-formed: sorted, non-overlapping, legal starts, clamped to the body.

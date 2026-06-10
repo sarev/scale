@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scale_blocks import (  # noqa: E402
     BlockTarget, PYTHON_STYLE, VALUE_FLAG, COMMENT_VALUE_THRESHOLD,
-    request_block_comment, _parse_summary, _parse_score, _comment_to_insert,
+    request_block_comment, annotate_blocks, _parse_summary, _parse_score, _comment_to_insert,
 )
 
 
@@ -86,11 +86,30 @@ def test_unusable_first_reply_is_nudged():
     assert out == "Validate the inputs before use.", out
 
 
+class _BoomLLM:
+    """Fails if asked to generate - proves no model work happens."""
+    def generate(self, *a, **k):
+        raise AssertionError("the model must not be called when the value threshold is above 5")
+
+
+def test_threshold_above_five_skips_all_model_work_but_still_paragraphs():
+    src = ["void f() {", "    a();", "    b();", "    c();", "}"]
+    target = BlockTarget(qualname="f", kind="def", header_start=1, header_end=1, body_start=2, body_end=5,
+                         boundary_lines=(2, 3, 4), indent_of={2: "    ", 3: "    ", 4: "    "}, segments=[(3, 4)])
+    out = annotate_blocks(_BoomLLM(), _Cfg(), [], src, [target], PYTHON_STYLE, value_threshold=6)
+
+    assert not any(ln.lstrip().startswith("#") for ln in out), "threshold > 5 must insert no comments"
+    bi = out.index("    b();")
+    assert out[bi - 1] == "", "the chunk must still be paragraphed with a blank line above it"
+    assert [ln for ln in out if ln.strip()] == src, "only a blank line was added; code is untouched"
+
+
 def main():
     test_parsers()
     test_high_score_inserts_low_score_flags()
     test_threshold_knob_moves_the_cut()
     test_unusable_first_reply_is_nudged()
+    test_threshold_above_five_skips_all_model_work_but_still_paragraphs()
     print("PASS: two-turn summarise-then-score flags low-value comments, honours the threshold, and nudges")
     return 0
 

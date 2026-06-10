@@ -939,6 +939,11 @@ def generate_docstrings(
         statements. Direct child definitions are replaced with stubs, containing only their headers and docstrings
         to avoid recursive expansion.
 
+        The body is walked with a cursor over source lines (not statement-by-statement), so the **non-blank gaps
+        between statements - the author's standalone in-body comments - are preserved** and reach the model as
+        context (blank-only gaps are dropped to keep the snippet compact). This matches the C/JS workers, which send
+        the whole body verbatim. Only the model's *view* is affected; the docstring patcher works off the real source.
+
         Parameters:
         - `node_id`: The ID of the node for which to assemble the snippet.
 
@@ -953,14 +958,23 @@ def generate_docstrings(
 
         body_chunks: Chunk = []
         direct_children: set[int] = set(info.children_ids)
+        cursor = info.header_end + 1  # first body line (1-based)
 
         for stmt in getattr(node, "body", []):
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                stmt_id = id(stmt)
-                if stmt_id in direct_children:
-                    body_chunks.append(make_child_stub(stmt_id))
-                    continue
-            body_chunks.append(get_statement_source(stmt))
+            stmt_start = _header_span(stmt)[0] if _is_def_node(stmt) else stmt.lineno
+            # Carry across any standalone comment(s) sitting in the gap before this statement (skip blank-only gaps).
+            if cursor < stmt_start:
+                gap = get_text_for_lines(cursor, stmt_start - 1)
+                if gap.strip():
+                    body_chunks.append(gap)
+
+            stmt_id = id(stmt)
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and stmt_id in direct_children:
+                body_chunks.append(make_child_stub(stmt_id))
+                cursor = info_by_node_id[stmt_id].end + 1
+            else:
+                body_chunks.append(get_statement_source(stmt))
+                cursor = getattr(stmt, "end_lineno", stmt.lineno) + 1
 
         parts: Chunk = [header_text]
         if body_chunks:

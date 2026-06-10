@@ -967,8 +967,8 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Delimiter for block-pass comments in C/JS: 'line' (//) or 'block' (/* */). Ignored for Python.")
     p.add_argument("--comment-value", type=int, default=None, metavar="N",
                    help="Block pass: only write a paragraph comment whose model-rated value is >= N (1-5; default 3). "
-                        "Higher is stricter (6 keeps none in code; 1 keeps all). Lower-value notes still inform later "
-                        "paragraphs' context.")
+                        "Higher is stricter; 1 keeps all. N above 5 (e.g. 6) skips the comment turns entirely and only "
+                        "paragraphs the body (no model work). Lower-value notes still inform later paragraphs' context.")
     p.add_argument("--language", "-l", default=None, help="Source file language. SCALE currently supports: 'python', 'js', 'c'")
     p.add_argument("--verbose", "-v", action="store_true", help="Output progress information to stdout")
     p.add_argument("--very-verbose", "-vv", action="store_true", help="Output LLM debug information to stdout")

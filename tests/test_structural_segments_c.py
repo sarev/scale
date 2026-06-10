@@ -35,11 +35,11 @@ def main():
     t = iter_block_targets_c(SRC, lines)[0]
 
     starts = [s for s, _ in t.segments]
-    assert starts == [4, 8, 9], f"unexpected segment starts: {starts} (segments {t.segments})"
+    assert starts == [2, 4, 8, 9], f"unexpected segment starts: {starts} (segments {t.segments})"
 
-    assert 2 not in starts, "the first body statement must never get a paragraph break above it"
+    assert 2 in starts, "the opening paragraph (line 2) is its own chunk, so it is summarised/scored"
     assert 3 not in starts, "a tiny inline block must not earn a before-compound break"
-    assert t.segments[0] == (4, 7) and t.segments[-1][0] == 9, t.segments
+    assert t.segments[0] == (2, 3) and t.segments[-1][0] == 9, t.segments
 
     # Ranges are well-formed: sorted, non-overlapping, legal starts, clamped to the body.
     bl = set(t.boundary_lines)
@@ -48,7 +48,7 @@ def main():
         assert s in bl and t.body_start <= s <= e <= t.body_end and s > prev_end, (s, e)
         prev_end = e
 
-    print("PASS: C structural segmenter fires before-compound/return/dedent and skips first-in-scope and tiny blocks")
+    print("PASS: C structural segmenter emits the opening chunk and fires before-compound/return/dedent")
     return 0
 
 

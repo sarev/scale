@@ -47,18 +47,18 @@ def test_compound_return_dedent_and_ranges():
     ]
     boundary = (2, 3, 4, 6, 8, 9)
 
-    # No docstring: first statement gets no break; compound, dedent and return do.
+    # No docstring: the opening paragraph (line 2) is its own chunk; compound, dedent and return break the rest.
     ranges = structural_breaks(stmts, has_doc=False, boundary_lines=boundary, body_end=9)
-    assert ranges == [(4, 7), (8, 8), (9, 9)], ranges
+    assert ranges == [(2, 3), (4, 7), (8, 8), (9, 9)], ranges
 
-    # With a docstring (and the rule enabled), the first statement is paragraphed off too.
+    # With a docstring (and the rule enabled), the first statement is paragraphed off too (line 2 already a start).
     ranges_doc = structural_breaks(stmts, has_doc=True, boundary_lines=boundary, body_end=9)
     assert _starts(ranges_doc) == [2, 4, 8, 9], ranges_doc
 
-    # Brace-language config: has_doc is irrelevant once allow_first_in_scope is off.
+    # Brace-language config: has_doc is irrelevant; the opening chunk is still emitted (line 2).
     ranges_brace = structural_breaks(stmts, has_doc=True, boundary_lines=boundary, body_end=9,
                                      allow_first_in_scope=False)
-    assert _starts(ranges_brace) == [4, 8, 9], ranges_brace
+    assert _starts(ranges_brace) == [2, 4, 8, 9], ranges_brace
 
 
 def test_after_def_gating_small_block_and_boundary_gate():
@@ -71,14 +71,15 @@ def test_after_def_gating_small_block_and_boundary_gate():
     ]
     boundary = (2, 5, 6)  # note: 7 is deliberately not a legal boundary
 
-    # after_def on: the statement after the def breaks; the tiny block and the non-boundary return do not.
+    # after_def on: the opening chunk (line 2) plus the statement after the def; the tiny block / non-boundary
+    # return do not break.
     on = structural_breaks(stmts, has_doc=False, boundary_lines=boundary, body_end=8)
-    assert _starts(on) == [5], on
+    assert _starts(on) == [2, 5], on
 
-    # after_def off (C): nothing breaks at all.
+    # after_def off (C): only the opening chunk remains (no rule fires on the body).
     off = structural_breaks(stmts, has_doc=False, boundary_lines=boundary, body_end=8,
                             allow_after_def=False)
-    assert off == [], off
+    assert _starts(off) == [2], off
 
 
 def test_dedent_unknown_block_breaks_small_block_does_not():
@@ -91,7 +92,7 @@ def test_dedent_unknown_block_breaks_small_block_does_not():
     ]
     boundary = (2, 3, 4, 5, 6)
     ranges = structural_breaks(stmts, has_doc=False, boundary_lines=boundary, body_end=6)
-    assert _starts(ranges) == [4], ranges
+    assert _starts(ranges) == [2, 4], ranges  # opening chunk (2) + the dedent resume (4)
 
 
 def test_merge_anchor_redirects_a_trailing_return():
@@ -107,7 +108,18 @@ def test_merge_anchor_redirects_a_trailing_return():
     starts = _starts(structural_breaks(stmts, has_doc=False, boundary_lines=boundary, body_end=7))
     assert 5 in starts, f"the merge anchor must start a paragraph: {starts}"
     assert 6 not in starts, f"a merged return must NOT get its own break: {starts}"
-    assert starts == [3, 5], starts
+    assert starts == [2, 3, 5], starts  # opening chunk (2) + the `if` (3) + the merge anchor (5)
+
+
+def test_opening_paragraph_is_always_a_chunk():
+    # Even when no rule fires, the opening paragraph (first body statement -> first break) is emitted as a chunk,
+    # so it is summarised/scored rather than silently dropped. Here nothing breaks, so the whole body is one chunk.
+    stmts = [S(2, 0, first_in_scope=True), S(3, 0), S(4, 0)]
+    ranges = structural_breaks(stmts, has_doc=False, boundary_lines=(2, 3, 4), body_end=4)
+    assert ranges == [(2, 4)], ranges
+    # But it is only emitted when the first statement is a legal boundary (e.g. not a multi-statement line).
+    ranges2 = structural_breaks(stmts, has_doc=False, boundary_lines=(3, 4), body_end=4)
+    assert ranges2 == [], ranges2
 
 
 def main():
@@ -115,6 +127,7 @@ def main():
     test_after_def_gating_small_block_and_boundary_gate()
     test_dedent_unknown_block_breaks_small_block_does_not()
     test_merge_anchor_redirects_a_trailing_return()
+    test_opening_paragraph_is_always_a_chunk()
     print("PASS: structural_breaks fires each paragraph rule correctly and respects boundary/range constraints")
     return 0
 

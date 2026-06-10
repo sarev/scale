@@ -360,7 +360,13 @@ def structural_breaks(
         elif prev is not None and prev.depth > s.depth and (s.closed_block == 0 or s.closed_block >= min_block_lines):
             breaks.add(s.start)                      # resuming after a substantial nested block closed
 
+    # The opening paragraph - from the first body statement up to the first break - is a chunk too, so it is
+    # summarised and scored like every other paragraph rather than silently dropped. (A trivial opener, e.g. a
+    # declaration block, simply scores low and gets no comment; a meaningful one is not lost.) The patcher places no
+    # blank above it since it sits right after the header.
     starts = sorted(breaks)
+    if stmts and stmts[0].start in legal and (not starts or starts[0] != stmts[0].start):
+        starts.insert(0, stmts[0].start)
     return [(st, (starts[j + 1] - 1) if j + 1 < len(starts) else body_end) for j, st in enumerate(starts)]
 
 
@@ -1011,7 +1017,8 @@ def annotate_blocks(
       `COMMENT_NOTE_SHORT`/`COMMENT_NOTE_LONG`); injected into the value-score turn.
     - `score_prompt`: Optional override for the value-score prompt template (defaults to `SCORE_PROMPT`).
     - `value_threshold`: Minimum 1-5 value score for a comment to be written into the code (`--comment-value`); when
-      None, `COMMENT_VALUE_THRESHOLD` is used. Higher is stricter (6 keeps none in code; 1 keeps all).
+      None, `COMMENT_VALUE_THRESHOLD` is used. Higher is stricter; `1` keeps all. A value above 5 (e.g. `6`) can never
+      be cleared, so the comment turns are skipped entirely - the pass only paragraphs the body, no model work.
     - `escalation`: Optional `scale_escalate.Escalation`. When supplied, a routine whose complexity exceeds the cutoff
       has its (still-local) segmentation recorded as a manifest request and its comment turns deferred to a stronger
       model - it is left untouched here and annotated later by the apply phase.
@@ -1022,6 +1029,7 @@ def annotate_blocks(
 
     ordered = sorted(targets, key=lambda t: (t.depth, t.body_start, -t.body_end), reverse=True)
     threshold = value_threshold if value_threshold is not None else COMMENT_VALUE_THRESHOLD
+    comments_off = threshold > 5  # no 1-5 score can clear it, so skip the comment turns entirely (paragraph only)
 
     all_edits: List[Tuple[int, Optional[str], str]] = []
     for target in ordered:
@@ -1063,14 +1071,17 @@ def annotate_blocks(
         edits: List[Tuple[int, Optional[str], str]] = []
         prior_comments: List[str] = []
         for blob_start, blob_end in segments:
-            comment = request_block_comment(
-                llm, cfg, messages, source_lines, target, blob_start, blob_end, style,
-                prior_comments=prior_comments, length_note=length_note,
-                prompt_template=comment_prompt, nudge_template=comment_nudge, score_template=score_prompt,
-                value_threshold=threshold,
-            )
-            if comment:
-                prior_comments.append(comment)   # keep every summary (incl. low-value, VALUE_FLAG and all) as context
+            if comments_off:
+                comment = None                   # threshold > 5: paragraph only, no model work
+            else:
+                comment = request_block_comment(
+                    llm, cfg, messages, source_lines, target, blob_start, blob_end, style,
+                    prior_comments=prior_comments, length_note=length_note,
+                    prompt_template=comment_prompt, nudge_template=comment_nudge, score_template=score_prompt,
+                    value_threshold=threshold,
+                )
+                if comment:
+                    prior_comments.append(comment)  # keep every summary (incl. low-value, flag and all) as context
             edits.append((blob_start, _comment_to_insert(comment), target.indent_of.get(blob_start, "")))
 
         # Per-routine guard: simulate this routine's edits on the pristine source and keep them only if code is intact.
