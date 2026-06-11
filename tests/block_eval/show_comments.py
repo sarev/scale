@@ -6,7 +6,7 @@ Mirrors `annotate_blocks` (segment -> per-chunk comment, with the short/long len
 earlier comments), calling the real engine functions so it reflects actual behaviour (including the nudge retry).
 
 Usage:
-    ../.llm-venv/Scripts/python.exe tests/block_eval/show_comments.py <file.py>
+    env/Scripts/python.exe tests/block_eval/show_comments.py <file.py>
     SCALE_MODEL=/path/model.gguf python tests/block_eval/show_comments.py <file.py>
 """
 import sys

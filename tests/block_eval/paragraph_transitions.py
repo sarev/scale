@@ -15,7 +15,7 @@ one paragraph. This is the empirical basis for the deterministic segmenter's bre
 simple->simple mid-run breaks that pure structure cannot see.
 
 Usage:
-    ../.llm-venv/Scripts/python.exe tests/block_eval/paragraph_transitions.py [PATH ...] [--min-count N] [--top N]
+    env/Scripts/python.exe tests/block_eval/paragraph_transitions.py [PATH ...] [--min-count N] [--top N]
 """
 
 import argparse

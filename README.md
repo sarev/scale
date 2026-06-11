@@ -218,12 +218,12 @@ Assuming you've created a folder called 'scale' and put all of these files into 
 
 ```bash
 cd scale
-python -m venv .llm-venv
+python -m venv env
 
 # if you're running in bash on Windows
-. .llm-venv/Scripts/activate      
+. env/Scripts/activate
 # if you're running in PowerShell
-.\.venv\Scripts\Activate.ps1
+.\env\Scripts\Activate.ps1
 
 # Update the venv    
 python -m pip install --upgrade pip wheel setuptools
@@ -268,9 +268,11 @@ I have tried various models, notably:
 
 ```bash
 pip install -U "huggingface_hub[cli]"
-huggingface-cli login ...your login details...
-huggingface-cli download bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF --include "*Q5_K_M.gguf" --local-dir models/Qwen2.5.1-Coder-7B-Instruct-GGUF --local-dir-use-symlinks False
+hf auth login ...your login details...
+hf download bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF --include "*Q5_K_M.gguf" --local-dir models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF
 ```
+
+Note the `--local-dir`: SCALE's default model path is `models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF/Qwen2.5.1-Coder-7B-Instruct-Q5_K_M.gguf` relative to the project root, so downloading to that directory means no `-m` flag is needed. (`hf` is the current HuggingFace CLI name; `huggingface-cli` still works as a deprecated alias.)
 
 # GPU Tier List
 

@@ -24,8 +24,8 @@ holds regardless of which model wrote the words. Escalation supports **Python an
 Always use the sibling virtualenv interpreter and the sibling model (see CLAUDE.md), from the project root
 `D:\Programming\Aurora v2\scale`:
 
-- Python: `../.llm-venv/Scripts/python.exe`
-- Model (`-m`): `../models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF/Qwen2.5.1-Coder-7B-Instruct-Q5_K_M.gguf`
+- Python: `env/Scripts/python.exe`
+- Model (`-m`): `models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF/Qwen2.5.1-Coder-7B-Instruct-Q5_K_M.gguf`
 - Always pass `-l python` or `-l c` explicitly.
 
 ## Inputs
@@ -43,8 +43,8 @@ Pick working paths: `MANIFEST` (e.g. `scale-manifest.json`) and `REWORD` (e.g. `
 ## Step 1 — Emit (local model + challenges; deferred routines collected into ONE run manifest)
 
 ```
-../.llm-venv/Scripts/python.exe scale.py -c --block-comments medium -l <LANG> \
-  -m "../models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF/Qwen2.5.1-Coder-7B-Instruct-Q5_K_M.gguf" \
+env/Scripts/python.exe scale.py -c --block-comments medium -l <LANG> \
+  -m "models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF/Qwen2.5.1-Coder-7B-Instruct-Q5_K_M.gguf" \
   --escalate-cognitive 10 --emit-manifest "<MANIFEST>" \
   <TARGETS...> -v
 ```
@@ -59,7 +59,7 @@ If the manifest has **zero** requests, skip to Step 4.
 You are the driver. **Never read the target source files yourself** — every request is self-contained. Loop:
 
 1. Run the completeness checker:
-   `../.llm-venv/Scripts/python.exe scale.py --check-manifest "<MANIFEST>"`
+   `env/Scripts/python.exe scale.py --check-manifest "<MANIFEST>"`
    It prints each unfilled slot and exits 0 only when everything is answered.
 2. While there are unfilled slots: take ~10 unfilled request ids and spawn a **fresh subagent** (Agent tool,
    `general-purpose`) for just that batch — batches run sequentially (they edit the same JSON), and each gets a clean
@@ -83,7 +83,7 @@ carries the identical text; never duplicate it back). It has either or both of:
 ## Step 3 — Apply the function manifest (model-free)
 
 ```
-../.llm-venv/Scripts/python.exe scale.py -l <LANG> --apply-manifest "<MANIFEST>" <TARGETS...> -v
+env/Scripts/python.exe scale.py -l <LANG> --apply-manifest "<MANIFEST>" <TARGETS...> -v
 ```
 
 No model loads. SCALE re-binds each answer by `(qualname, sig_hash)` and patches it through the same guards.
@@ -91,8 +91,8 @@ No model loads. SCALE re-binds each answer by `(qualname, sig_hash)` and patches
 ## Step 4 — Published descriptions + reword manifest (second local invocation)
 
 ```
-../.llm-venv/Scripts/python.exe scale.py --file-doc -l <LANG> \
-  -m "../models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF/Qwen2.5.1-Coder-7B-Instruct-Q5_K_M.gguf" \
+env/Scripts/python.exe scale.py --file-doc -l <LANG> \
+  -m "models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF/Qwen2.5.1-Coder-7B-Instruct-Q5_K_M.gguf" \
   --emit-reword "<REWORD>" <TARGETS...> -v
 ```
 
@@ -110,7 +110,7 @@ completeness the same way: `--check-manifest "<REWORD>"` must exit 0.
 ## Step 6 — Apply the reword (model-free)
 
 ```
-../.llm-venv/Scripts/python.exe scale.py -l <LANG> --apply-reword "<REWORD>" <TARGETS...> -v
+env/Scripts/python.exe scale.py -l <LANG> --apply-reword "<REWORD>" <TARGETS...> -v
 ```
 
 Each draft is located by exact match and replaced through the preservation guard; a miss is a safe no-op. Clean up

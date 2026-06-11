@@ -2,6 +2,16 @@ __cache__
 __pycache__
 temp/*
 
+# Local dev environment: the venv and GGUF models live inside the project root.
+env/
+models/
+
+# SCALE run artifacts (run-level manifests and logs land in the cwd).
+scale-run.log
+scale-filedoc.log
+scale-manifest.json
+scale-reword.json
+
 # Block-pass eval samples are private/ad-hoc by default; only the intentional fixtures are tracked.
 tests/block_eval/samples/*
 !tests/block_eval/samples/charge.py

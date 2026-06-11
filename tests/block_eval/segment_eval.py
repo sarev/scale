@@ -27,7 +27,7 @@ Breaks are only ever placed at *legal* positions - statement starts, excluding t
 (a blank there reads badly) - exactly as SCALE's block provider allows.
 
 Usage:
-    ../.llm-venv/Scripts/python.exe tests/block_eval/segment_eval.py [PATH ...] [--maps] [--out DIR] [--width N]
+    env/Scripts/python.exe tests/block_eval/segment_eval.py [PATH ...] [--maps] [--out DIR] [--width N]
 """
 
 import argparse

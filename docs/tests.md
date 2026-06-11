@@ -1,7 +1,7 @@
 # Tests: the model-free regression suite
 
 `tests/` holds fast, **model-free** regression tests — the LLM is stubbed and only parsing/patching/caching run, so
-the suite finishes in seconds. Run all with `../.llm-venv/Scripts/python.exe tests/run_all.py`, or any single
+the suite finishes in seconds. Run all with `env/Scripts/python.exe tests/run_all.py`, or any single
 `tests/test_*.py` directly. Each guards a specific past bug; keep them green when touching the relevant area, and
 add one when fixing a new bug.
 

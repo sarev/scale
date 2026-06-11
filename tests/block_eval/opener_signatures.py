@@ -17,7 +17,7 @@ Features come from code lines only (as the segmenter will see a comment-stripped
 human paragraphing in the original source.
 
 Usage:
-    ../.llm-venv/Scripts/python.exe tests/block_eval/opener_signatures.py [PATH ...] [--min-count N] [--top N]
+    env/Scripts/python.exe tests/block_eval/opener_signatures.py [PATH ...] [--min-count N] [--top N]
 """
 
 import argparse

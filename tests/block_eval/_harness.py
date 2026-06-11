@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 DEFAULT_MODEL = os.environ.get("SCALE_MODEL") or str(
-    ROOT.parent / "models" / "bartowski" / "Qwen2.5.1-Coder-7B-Instruct-GGUF"
+    ROOT / "models" / "bartowski" / "Qwen2.5.1-Coder-7B-Instruct-GGUF"
     / "Qwen2.5.1-Coder-7B-Instruct-Q5_K_M.gguf"
 )
 SCALE_CFG = ROOT / "scale-cfg"

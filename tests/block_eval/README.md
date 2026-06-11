@@ -14,13 +14,13 @@ python tests/block_eval/make_wall.py scale_text.py temp/wall.py
 python tests/block_eval/make_wall.py --strip-docstrings scale_text.py temp/wall.py
 
 # See how the segment pass chunks a file (no patching):
-../.llm-venv/Scripts/python.exe tests/block_eval/show_segments.py temp/wall.py
+env/Scripts/python.exe tests/block_eval/show_segments.py temp/wall.py
 
 # See the comment produced per chunk (no patching) - reflects the length note + nudge retry:
-../.llm-venv/Scripts/python.exe tests/block_eval/show_comments.py temp/wall.py
+env/Scripts/python.exe tests/block_eval/show_comments.py temp/wall.py
 
 # Full end-to-end: annotate and diff (note -l python; the wall can defeat language auto-guess):
-../.llm-venv/Scripts/python.exe scale.py --block-comments medium -nc -l python temp/wall.py -o temp/wall.scaled.py
+env/Scripts/python.exe scale.py --block-comments medium -nc -l python temp/wall.py -o temp/wall.scaled.py
 git --no-pager diff --no-index temp/wall.py temp/wall.scaled.py
 ```
 

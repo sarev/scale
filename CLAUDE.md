@@ -18,27 +18,25 @@ A corollary that shapes solutions here: **generic over convention-specific.** Ne
 
 ## This dev environment (use these, not a bare `python`)
 
-The venv and the GGUF models are **siblings of the project root**:
+The venv and the GGUF models live **inside the project root** (both are gitignored):
 
 ```
-<parent>/
-  scale/          <- this project (cwd)
-  .llm-venv/      <- the venv  (Windows interpreter: ../.llm-venv/Scripts/python.exe)
+SCALE/            <- this project (cwd)
+  env/            <- the venv  (Windows interpreter: env/Scripts/python.exe)
   models/         <- GGUF models, e.g. models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF/*.gguf
 ```
 
 ```bash
 # Run the fast, model-free regression suite (seconds; always do this after changes):
-../.llm-venv/Scripts/python.exe tests/run_all.py
+env/Scripts/python.exe tests/run_all.py
 
 # Canonical annotate run (definition docs + block comments):
-../.llm-venv/Scripts/python.exe scale.py -c --block-comments medium -l python \
-  -m "../models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF/Qwen2.5.1-Coder-7B-Instruct-Q5_K_M.gguf" \
+env/Scripts/python.exe scale.py -c --block-comments medium -l python \
   path/to/file.py -o out.py -v
 ```
 
 Two gotchas:
-- **`-m` is effectively required here.** `DEFAULT_MODEL` resolves under `scale/models/...`, but the models live in the sibling `../models/...`.
+- **Run from the project root.** `DEFAULT_MODEL` is the cwd-relative `./models/bartowski/...` path, so it resolves only from the root; `-m` is needed just for non-default models.
 - **Pass `-l python` (etc.) explicitly on stripped/atypical files.** Language is auto-guessed from *content*, not the file extension.
 
 ## Architecture in one screen

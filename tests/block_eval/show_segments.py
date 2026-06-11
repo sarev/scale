@@ -6,7 +6,7 @@ Use this to judge whether range-segmentation is grouping the body sensibly (few 
 fragmenting it line-by-line.
 
 Usage:
-    ../.llm-venv/Scripts/python.exe tests/block_eval/show_segments.py <file.py>
+    env/Scripts/python.exe tests/block_eval/show_segments.py <file.py>
     SCALE_MODEL=/path/model.gguf python tests/block_eval/show_segments.py <file.py>
 """
 import sys

@@ -13,7 +13,7 @@ i.e. empirical evidence for what a "paragraph opener" looks like. That is the re
 segmenter's heuristics against, instead of guessing the rules.
 
 Usage:
-    ../.llm-venv/Scripts/python.exe tests/block_eval/anon_paragraphs.py [PATH ...] [--max-lines N] [--min-count N]
+    env/Scripts/python.exe tests/block_eval/anon_paragraphs.py [PATH ...] [--max-lines N] [--min-count N]
 
 With no PATH, defaults to the repo's `scale*.py` modules. A PATH may be a file or a directory (walked for `*.py`).
 """
