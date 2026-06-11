@@ -95,7 +95,7 @@ def main():
     assert dm == {}, "a parroted-ack reply must not be written as a docstring"
     assert stub_ack.calls == 2, f"expected one attempt + one nudge, got {stub_ack.calls}"
     assert [r["qualname"] for r in esc.requests] == ["helper"], "an uncoaxable docstring must be promoted to the manifest"
-    assert esc.requests[0]["pass"] == "def"
+    assert esc.requests[0].get("def") is not None
 
     # ---- 4. No manifest: a persistent failure falls back to the placeholder ----
     dm2 = _gen(Stub("OK"), iter_defs_with_info(ast.parse(SRC)), None)

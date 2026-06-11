@@ -1,0 +1,5 @@
+A reviewer checked your comment against the code and found claims the code does not support:
+
+{verdict}
+
+Rewrite the comment without those claims - describe only what the code shown actually does - and give the corrected comment.

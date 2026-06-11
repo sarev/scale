@@ -30,6 +30,8 @@ from scale_text import (summarise, fit_snippet, LENGTH_LINE, LENGTH_PARAGRAPH, L
                         MARKER_PYTHON, MARKER_C, MARKER_JS)
 import scale_escalate
 import scale_project
+import scale_reword
+import scale_verify
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import argparse
 import hashlib
@@ -123,6 +125,28 @@ def _file_identity_note(src_path: Path, language: str) -> str:
     if language == "c":
         return f"The file being documented is `{name}`, a C implementation file."
     return f"The file being documented is `{name}`."
+
+
+def _file_role(src_path: Path, language: str) -> str:
+    """
+    Classify a file's role for the header-reword manifest: "header", "implementation", or "other".
+
+    The same suffix rule that drives `_file_identity_note`, reduced to a label the reword manifest can carry so the
+    stronger model words a header's description as a public contract and an implementation's as internal detail.
+
+    Parameters:
+    - `src_path`: The source file.
+    - `language`: The resolved language identifier.
+
+    Returns:
+    - The role label.
+    """
+
+    if src_path.suffix.lower() in _HEADER_SUFFIXES:
+        return "header"
+    if language == "c":
+        return "implementation"
+    return "other"
 
 
 # ---------------------------- CLI harness ----------------------------
@@ -742,6 +766,8 @@ def _generate_file_summary(
     language: str,
     desc_spec: Optional[str] = None,
     seed: Optional[str] = None,
+    skeleton: bool = False,
+    capture: Optional[dict] = None,
 ) -> str:
     """
     Summarise a whole source file as a file-level DESCRIPTION, falling back to chunked map-reduce when it is too large.
@@ -762,6 +788,10 @@ def _generate_file_summary(
     - `language`: The source language identifier (used to phrase the prompts).
     - `desc_spec`: The file-description instruction template (default `SUMMARY_INSTRUCTION`).
     - `seed`: An existing file description to incorporate, or None.
+    - `skeleton`: Whether `source_blob` is a structural skeleton (signatures, docs, header comments - no bodies)
+      rather than the complete file; only the prompt's subject wording changes.
+    - `capture`: Optional dict; when the map-reduce path runs, its pre-shaping thorough summary is recorded under
+      `"thorough"` (richer context for the header-reword manifest than the shaped description).
 
     Returns:
     - The file-description summary text.
@@ -771,15 +801,17 @@ def _generate_file_summary(
     limit = llm.n_ctx - llm.ctx_margin - SUMMARY_MAX_TOKENS
     base_overhead = llm.count_tokens(base_messages) if base_messages else 0
     description_instruction = _fill_summary_instruction(desc_spec, language, seed)
+    what = (f"a structural skeleton of a {language} source file - its header comments, signatures, and existing "
+            f"documentation, with the function bodies omitted") if skeleton else f"a complete {language} source file"
 
-    # Fast path: the whole file fits in a single turn, written straight to the description spec.
+    # Fast path: the whole text fits in a single turn, written straight to the description spec.
     if base_overhead + llm.estimate_tokens(source_blob) + SUMMARY_WRAPPER_TOKENS <= limit:
         result = summarise(llm, summary_cfg, source_blob, LENGTH_PARAGRAPHS, base_messages=base_messages,
-                           subject=f"a complete {language} source file", max_tokens=SUMMARY_MAX_TOKENS,
+                           subject=what, max_tokens=SUMMARY_MAX_TOKENS,
                            instruction=description_instruction)
         return _reflow_if_listy(llm, summary_cfg, base_messages, result, SUMMARY_MAX_TOKENS)
 
-    # Map: summarise the file in context-sized chunks (64 tokens of headroom for the wrapper text). The map/reduce
+    # Map: summarise the text in context-sized chunks (64 tokens of headroom for the wrapper text). The map/reduce
     # steps stay thorough/generic so no detail is lost before the final description-shaping turn.
     chunk_budget = max(1, limit - base_overhead - 64)
     chunks = _split_source(source_blob, chunk_budget, llm.estimate_tokens)
@@ -788,12 +820,14 @@ def _generate_file_summary(
     partials: List[str] = []
     for idx, chunk in enumerate(chunks, start=1):
         partials.append(summarise(llm, summary_cfg, chunk, LENGTH_PARAGRAPH, base_messages=base_messages,
-                                  subject=f"chunk {idx} of {len(chunks)} of a {language} source file",
+                                  subject=f"chunk {idx} of {len(chunks)} of {what}",
                                   max_tokens=SUMMARY_MAX_TOKENS))
         echo(f"Summarised part {idx}/{len(chunks)}")
 
     # Reduce the partials into one overall summary, then reshape it to the file-description spec in a final turn.
     overall = _reduce_summaries(llm, summary_cfg, base_messages, partials, language, limit, base_overhead)
+    if capture is not None:
+        capture["thorough"] = overall
     result = summarise(llm, summary_cfg, overall, LENGTH_PARAGRAPHS, base_messages=base_messages,
                        subject=f"a draft overview of a {language} source file", max_tokens=SUMMARY_MAX_TOKENS,
                        instruction=description_instruction)
@@ -837,24 +871,30 @@ def _get_file_summary(
     base_messages: Messages,
     no_cache: Optional[bool] = False,
     seed: Optional[str] = None,
+    skeleton: bool = False,
+    capture: Optional[dict] = None,
 ) -> str:
     """
     Return the full file-description summary, using the file-backed cache when possible and generating it otherwise.
 
     This is the one piece of prose shared by the `--file-doc` header and the block-pass priming context (the summary
-    is slow to produce). The cache is keyed on the source content, so neither `base_messages` nor `seed` affects cache
-    identity; on a cache hit the `seed` is moot (the description already exists).
+    is slow to produce). `source_blob` is whatever text the description is to be generated from - normally the file's
+    structural skeleton (see `scale_project.render_skeleton`; `skeleton=True`), or the whole file when it has no
+    symbols to skeletonise. The cache is keyed on that content, so a different skeleton (e.g. the re-rendered one
+    after the function passes) regenerates rather than reusing a stale description; neither `base_messages` nor
+    `seed` affects cache identity, and on a cache hit the `seed` is moot (the description already exists).
 
     Parameters:
     - `llm`: The LocalChatModel instance.
     - `cfg`: The base generation configuration.
     - `scale_path`: The SCALE configuration directory (for the optional `summary.txt` instruction override).
     - `src_path`: The source file path (the cache key).
-    - `source_blob`: The complete source text.
+    - `source_blob`: The text to describe (the skeleton, or the complete source).
     - `language`: The source language identifier.
     - `base_messages`: The priming context a freshly generated summary is produced against (typically the system prompt).
     - `no_cache`: When True, regenerate the summary rather than loading a cached one.
     - `seed`: An existing file description to fold into a freshly generated summary, or None.
+    - `skeleton`: Whether `source_blob` is a skeleton (adjusts the prompt's subject wording only).
 
     Returns:
     - The full file-description summary text.
@@ -864,10 +904,11 @@ def _get_file_summary(
     if no_cache is False and summary_cache.summary:
         echo("Loaded full source summary from cache...")
     else:
-        echo("Generating full source summary...")
+        echo("Generating full source summary..." + (" (from the file skeleton)" if skeleton else ""))
         desc_spec = _read_optional(scale_path / "summary.txt") or SUMMARY_INSTRUCTION
         summary_cache.summary = _generate_file_summary(
-            llm, cfg, base_messages, source_blob, language, desc_spec=desc_spec, seed=seed)
+            llm, cfg, base_messages, source_blob, language, desc_spec=desc_spec, seed=seed, skeleton=skeleton,
+            capture=capture)
     return summary_cache.summary
 
 
@@ -880,6 +921,7 @@ def _get_short_summary(
     language: str,
     base_messages: Messages,
     no_cache: Optional[bool] = False,
+    skeleton: bool = False,
 ) -> str:
     """
     Return the squashed file description used to prime the (context-starved) definition pass.
@@ -895,10 +937,11 @@ def _get_short_summary(
     - `cfg`: The base generation configuration.
     - `scale_path`: The SCALE configuration directory (for the optional `summary.short.txt` instruction override).
     - `src_path`: The source file path (the cache key).
-    - `source_blob`: The complete source text.
+    - `source_blob`: The text to describe (the file's skeleton, or the complete source - see `_get_file_summary`).
     - `language`: The source language identifier.
     - `base_messages`: The priming context the condensation is produced against.
     - `no_cache`: When True, regenerate rather than loading from cache.
+    - `skeleton`: Whether `source_blob` is a skeleton (adjusts the prompt's subject wording only).
 
     Returns:
     - The short file-description summary text.
@@ -925,10 +968,12 @@ def _get_short_summary(
                           max_tokens=SHORT_SUMMARY_MAX_TOKENS, instruction=instruction)
     else:
         echo("Summarising the source directly into a one-line description...")
+        what = (f"a structural skeleton (signatures and docs, no bodies) of a {language} source file"
+                if skeleton else f"a {language} source file")
         budget = max(256, llm.n_ctx - llm.ctx_margin - SHORT_SUMMARY_MAX_TOKENS
                      - llm.count_tokens(base_messages) - SUMMARY_WRAPPER_TOKENS)
         short = summarise(llm, short_cfg, _head_crop(source_blob, llm, budget), LENGTH_LINE,
-                          base_messages=base_messages, subject=f"a {language} source file",
+                          base_messages=base_messages, subject=what,
                           max_tokens=SHORT_SUMMARY_MAX_TOKENS, instruction=instruction)
     cache.short = short
     return short
@@ -944,6 +989,7 @@ def prime_llm_for_comments(
     no_cache: Optional[bool] = False,
     template: str = "comment",
     project_context: str = "",
+    skeleton: Optional[str] = None,
 ) -> Messages:
     """
     Prepare the Large Language Model (LLM) for generating comments by priming it with a system prompt and the source file as context.
@@ -962,6 +1008,9 @@ def prime_llm_for_comments(
     - `template`: Which per-language style template to load as the final priming turn: `"comment"` loads
       `comment.<lang>.txt` (the definition/docstring pass) and `"blocks"` loads `blocks.<lang>.txt` (the
       within-function "blob" pass). Only one is ever loaded so the two passes never share each other's guidance.
+    - `skeleton`: Optional structural skeleton of the file (`scale_project.render_skeleton`). When given, the
+      whole-file description is generated from it instead of the full source - a fraction of the tokens, so a single
+      call suffices where map-reduce used to kick in. None (a file with no symbols) keeps the whole-file path.
 
     Returns:
     - A list of messages exchanged between the system and the LLM, including the priming prompts and the generated responses.
@@ -1000,14 +1049,18 @@ def prime_llm_for_comments(
     messages.append({"role": "user", "content": _file_identity_note(src_path, language)})
     messages.append({"role": "assistant", "content": PRIMING_ACK})
 
-    # Now summarise the whole file for context (chunked map-reduce kicks in automatically for large files; see
+    # Now summarise the file for context - from its structural skeleton when one is available (signatures + docs, a
+    # fraction of the tokens), else the whole file (chunked map-reduce kicks in automatically for large files; see
     # _generate_file_summary). The summary is generated against the system prompt alone (the only turn so far). The
     # definition pass is context-starved - the routine body matters more there - so it gets the SHORT (squashed) file
-    # description; the block pass has more room, so it gets the full one (the same prose --file-doc puts in the header).
+    # description; the block pass has more room, so it gets the full one.
+    summary_source = skeleton if skeleton else source_blob
     if template == "comment":
-        summary = _get_short_summary(llm, cfg, scale_path, src_path, source_blob, language, messages, no_cache=no_cache)
+        summary = _get_short_summary(llm, cfg, scale_path, src_path, summary_source, language, messages,
+                                     no_cache=no_cache, skeleton=bool(skeleton))
     else:
-        summary = _get_file_summary(llm, cfg, scale_path, src_path, source_blob, language, messages, no_cache=no_cache)
+        summary = _get_file_summary(llm, cfg, scale_path, src_path, summary_source, language, messages,
+                                    no_cache=no_cache, skeleton=bool(skeleton))
 
     reply_length = 1 + summary.count("\n")
     echo(f"Source file summarised? {reply_length} lines of summary created")
@@ -1039,6 +1092,7 @@ def _def_pass(
     callee_context: Optional[Callable[[str], str]] = None,
     on_doc: Optional[Callable[[str, str], None]] = None,
     doc_plan=None,
+    verifier=None,
 ) -> List[str]:
     """
     Run the definition (docstring/header-comment) pass for the resolved language.
@@ -1055,6 +1109,7 @@ def _def_pass(
       absent, the worker's behaviour is unchanged.
     - `doc_plan`: Optional per-file `--doc-site` plan (C only); redirects docs to header prototypes and skips the
       redirected definitions' docstrings.
+    - `verifier`: Optional `scale_verify.Verifier` (the grounding gate + challenge turns), threaded to every worker.
 
     Returns:
     - The annotated source split into individual lines.
@@ -1062,9 +1117,9 @@ def _def_pass(
 
     if language == "python":
         from scale_python import generate_language_comments
-        # Only the Python worker understands selective escalation for now.
         return generate_language_comments(llm, cfg, messages, source_blob, source_lines, escalation=escalation,
-                                          doc_order=doc_order, callee_context=callee_context, on_doc=on_doc)
+                                          doc_order=doc_order, callee_context=callee_context, on_doc=on_doc,
+                                          verifier=verifier)
     elif language == "js":
         from scale_javascript import generate_language_comments
     elif language == "c":
@@ -1072,11 +1127,12 @@ def _def_pass(
         # Only the C worker has a header/implementation doc-site plan.
         return generate_language_comments(llm, cfg, messages, source_blob, source_lines,
                                           doc_order=doc_order, callee_context=callee_context, on_doc=on_doc,
-                                          doc_plan=doc_plan)
+                                          doc_plan=doc_plan, verifier=verifier, escalation=escalation)
     else:
         raise ValueError(f"Unsupported language '{language}'")
     return generate_language_comments(llm, cfg, messages, source_blob, source_lines,
-                                      doc_order=doc_order, callee_context=callee_context, on_doc=on_doc)
+                                      doc_order=doc_order, callee_context=callee_context, on_doc=on_doc,
+                                      verifier=verifier)
 
 
 def _block_provider_for(language: str):
@@ -1400,6 +1456,7 @@ def _block_pass(
     escalation=None,
     doc_override: Optional[Callable[[str], Optional[str]]] = None,
     callee_annotations: Optional[Dict[str, Dict[int, str]]] = None,
+    verifier=None,
 ) -> List[str]:
     """
     Run the within-function "blob" pass: annotate logical groups of statements inside each routine body.
@@ -1444,6 +1501,7 @@ def _block_pass(
         value_threshold=comment_value,
         escalation=escalation,
         callee_annotations=callee_annotations,
+        verifier=verifier,
     )
 
 
@@ -1486,24 +1544,30 @@ def _file_doc_pass(
     language: str,
     no_cache: Optional[bool] = False,
     project_context: str = "",
+    on_file_doc: Optional[Callable[[str, Optional[str]], None]] = None,
 ) -> List[str]:
     """
     Run the file-level header doccomment pass: add or update the top-of-file description, preserving everything else.
 
-    The local model only classifies which existing header lines are the description; the description prose itself is
-    the whole-file summary (the same prose that primes the block pass), seeded with the existing description so the
-    author's wording is incorporated. The deterministic patcher in `scale_filedoc` preserves shebang/copyright/license/
-    boilerplate byte-for-byte (see that module).
+    This pass runs LAST in the per-file pipeline (after the definition and block passes), because the published
+    description is generated from the file's CURRENT skeleton - now rich with the freshly written docstrings - rather
+    than from the bodies (the two-pass description model: pass 1, the priming-grade description from the original
+    skeleton, fed the function passes; this is pass 2). The local model only classifies which existing header lines
+    are the description; a file with no symbols falls back to summarising its whole text. The deterministic patcher
+    in `scale_filedoc` preserves shebang/copyright/license/boilerplate byte-for-byte (see that module).
 
     Parameters:
     - `llm`: The LocalChatModel instance.
     - `cfg`: The GenerationConfig instance.
     - `scale_path`: The path to the SCALE configuration directory.
     - `src_path`: The source file path (the summary cache key).
-    - `source_blob`: The complete source text.
-    - `source_lines`: The same source split into lines.
+    - `source_blob`: The CURRENT source text (the earlier passes' output).
+    - `source_lines`: The same text split into lines.
     - `language`: The programming language identifier (already validated).
     - `no_cache`: When True, regenerate the summary rather than loading a cached one.
+    - `on_file_doc`: Optional callback `(spliced_description, thorough_or_None)` fired after a successful splice -
+      the header-reword manifest (`--emit-reword`) records these as the file's draft (and its richer map-reduce
+      context, when one was produced).
 
     Returns:
     - The annotated source split into lines (unchanged if the language is unsupported or there is nothing to do).
@@ -1520,6 +1584,20 @@ def _file_doc_pass(
     if target is None:
         echo("file-doc: nothing to annotate.")
         return source_lines
+
+    # The published description's input: the CURRENT text's skeleton (model-free re-render - the def pass's fresh
+    # docstrings are in it), or the whole current text when the file has no symbols (the binary guard).
+    description_source = source_blob
+    is_skeleton = False
+    sym_provider = _symbol_provider_for(language)
+    if sym_provider is not None:
+        try:
+            skel = scale_project.render_skeleton(source_lines, language, sym_provider(source_blob, source_lines))
+        except Exception:
+            skel = None      # an unparseable file simply falls back to the whole-text path
+        if skel:
+            description_source = skel
+            is_skeleton = True
 
     # Minimal priming for the classify turn: the system prompt plus any project blurb (so the file description, which
     # is the whole-file summary, understands the file's place in the wider project). The description prose is fetched
@@ -1538,13 +1616,21 @@ def _file_doc_pass(
         {"role": "assistant", "content": PRIMING_ACK},
     ]
 
+    capture: dict = {}
+
     def summary_provider(seed: Optional[str]) -> str:
         return _get_file_summary(
-            llm, cfg, scale_path, src_path, source_blob, language, base, no_cache=no_cache, seed=seed)
+            llm, cfg, scale_path, src_path, description_source, language, base, no_cache=no_cache, seed=seed,
+            skeleton=is_skeleton, capture=capture)
+
+    on_description = None
+    if on_file_doc is not None:
+        on_description = lambda desc: on_file_doc(desc, capture.get("thorough"))
 
     return annotate_file_doc(
         llm, cfg, base, source_lines, target, summary_provider, language,
         classify_prompt=_read_optional(scale_path / "filedoc.classify.txt"),
+        on_description=on_description,
     )
 
 
@@ -1572,15 +1658,19 @@ def generate_comments(
     doc_plan=None,
     doc_override: Optional[Callable[[str], Optional[str]]] = None,
     block_callee_notes: Optional[Callable[[str, List[str]], Dict[str, Dict[int, str]]]] = None,
+    verifier=None,
+    skeleton: Optional[str] = None,
+    on_file_doc: Optional[Callable[[str, Optional[str]], None]] = None,
 ) -> int:
     """
     Generate comments for the provided (already-loaded) source code using a Large Language Model (LLM).
 
-    Up to two passes run in sequence on the current text. The definition pass (`do_comment`) writes/updates one
+    Up to three passes run in sequence on the current text. The definition pass (`do_comment`) writes/updates one
     docstring or header comment per routine; the block pass (`do_blocks`) annotates logical groups of statements
-    inside routine bodies. Each pass primes its own fresh context with the appropriate style template so the two never
-    share each other's guidance, and the block pass re-parses the (possibly already-annotated) output of the first
-    pass so line spans stay valid. The result is written to the destination path (or stdout).
+    inside routine bodies; the file-doc pass (`do_file_doc`) runs LAST, splicing the published file description -
+    generated from the then-current skeleton, so it draws on the freshly written docstrings. Each pass primes its own
+    fresh context with the appropriate style template so they never share each other's guidance, and each re-parses
+    the previous pass's output so line spans stay valid. The result is written to the destination path (or stdout).
 
     Parameters:
     - `llm`: The LocalChatModel instance used for generating comments.
@@ -1604,6 +1694,13 @@ def generate_comments(
     - `block_callee_notes`: Optional call-graph hook for the block pass: `(current_blob, current_lines) -> {qualname ->
       {line -> "callee: one-liner"}}`. Called on the def pass's output (lines have shifted, so the annotations must be
       derived from the current text) and shown read-side on the paragraphs' call lines. Absent, behaviour is unchanged.
+    - `verifier`: Optional `scale_verify.Verifier` (the grounding gate + challenge turns), threaded to the definition
+      and block passes. Absent, behaviour is unchanged.
+    - `skeleton`: Optional pass-1 (priming-grade) skeleton of the ORIGINAL source (`scale_project.render_skeleton`),
+      used to generate the description that primes the definition and block passes. None falls back to summarising
+      the whole file (a no-symbol file, or a caller that did not pre-render one).
+    - `on_file_doc`: Optional callback `(spliced_description, thorough_or_None)` fired by the file-doc pass after a
+      successful splice (the `--emit-reword` collector; see `_file_doc_pass`).
 
     Returns:
     - 0 if the operation was successful, or an error number.
@@ -1613,26 +1710,19 @@ def generate_comments(
     - If the destination path is not provided, the generated comments will be printed to the console.
     """
 
-    # The summary is primed from the original source for every pass, so the content-hash cache stays warm; only the
-    # worker input advances from one pass to the next.
+    # The priming summary is generated from the original source's skeleton (or the whole original source) for both
+    # function passes, so the content-hash cache stays warm; only the worker input advances from one pass to the next.
     new_lines = source_lines
-
-    # The file-doc pass runs first: a top-of-file comment edit does not disturb routine spans, and the later passes
-    # then see the updated header. It primes its own minimal context (it does not need the def-pass guidelines).
-    if do_file_doc:
-        new_lines = _file_doc_pass(
-            llm, cfg, scale_path, src_path, source_blob, new_lines, language, no_cache=no_cache,
-            project_context=project_context,
-        )
 
     if do_comment:
         messages = prime_llm_for_comments(
             llm, cfg, scale_path, src_path, source_blob, language, no_cache=no_cache, template="comment",
-            project_context=project_context,
+            project_context=project_context, skeleton=skeleton,
         )
         current_blob = line_ending.join(new_lines)
         new_lines = _def_pass(llm, cfg, messages, current_blob, new_lines, language, escalation=escalation,
-                              doc_order=doc_order, callee_context=callee_context, on_doc=on_doc, doc_plan=doc_plan)
+                              doc_order=doc_order, callee_context=callee_context, on_doc=on_doc, doc_plan=doc_plan,
+                              verifier=verifier)
 
     if do_blocks:
         try:
@@ -1643,14 +1733,24 @@ def generate_comments(
         current_blob = line_ending.join(new_lines)
         messages = prime_llm_for_comments(
             llm, cfg, scale_path, src_path, source_blob, language, no_cache=no_cache, template="blocks",
-            project_context=project_context,
+            project_context=project_context, skeleton=skeleton,
         )
         # Derive the read-side call annotations from the CURRENT text (the def pass shifted lines), so each one lands
         # on the calling line the block pass actually reads.
         annotations = block_callee_notes(current_blob, new_lines) if block_callee_notes is not None else None
         new_lines = _block_pass(llm, cfg, scale_path, messages, current_blob, new_lines, language,
                                 comment_style=block_comment_style, comment_value=comment_value, escalation=escalation,
-                                doc_override=doc_override, callee_annotations=annotations)
+                                doc_override=doc_override, callee_annotations=annotations, verifier=verifier)
+
+    # The file-doc pass runs LAST: the published description is generated from the CURRENT text's skeleton, so it
+    # draws on the docstrings the function passes just wrote (the two-pass description model). A top-of-file edit
+    # cannot disturb the earlier passes - they have already run - and the pass primes its own minimal context.
+    if do_file_doc:
+        current_blob = line_ending.join(new_lines)
+        new_lines = _file_doc_pass(
+            llm, cfg, scale_path, src_path, current_blob, new_lines, language, no_cache=no_cache,
+            project_context=project_context, on_file_doc=on_file_doc,
+        )
 
     # Write the output
     if dst_path:
@@ -1680,9 +1780,10 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     formatters = sorted(llm_formatters()) + ['auto']
 
     p = argparse.ArgumentParser(description="SCALE: Source Code Annotation with LLM Engine")
-    p.add_argument("source", nargs="+",
+    p.add_argument("source", nargs="*",
                    help="Source file(s) to annotate - paths, directories (expanded to source files), or globs "
-                        "(e.g. \"src/**/*.c\"). Multiple targets are written in place; -o is only valid for one.")
+                        "(e.g. \"src/**/*.c\"). Multiple targets are written in place; -o is only valid for one. "
+                        "Optional only with --check-manifest.")
     p.add_argument("--model", "-m", default="", help="Optional path to GGUF model file")
     p.add_argument("--output", "-o", default="", help="Optional output filename")
     p.add_argument("--comment", "-c", action="store_true", help="Add and update definition docstrings/header comments")
@@ -1709,6 +1810,10 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="C only: where an extern function is documented. 'auto' (default) documents a target header's "
                         "prototype (prose from the definition's body) and skips the implementation's docstring; 'impl' "
                         "keeps the implementation docstring (legacy) while still documenting target prototypes.")
+    p.add_argument("--no-verify", action="store_true",
+                   help="Skip the post-generation verification (the backtick-grounding gate and the clean-context "
+                        "challenge turns that catch invented identifiers, unsupported claims, and restatement). "
+                        "Faster, but the local model's output is written unchecked.")
     p.add_argument("--verbose", "-v", action="store_true", help="Output progress information to stdout")
     p.add_argument("--very-verbose", "-vv", action="store_true", help="Output LLM debug information to stdout")
     p.add_argument("--no-cache", "-nc", action="store_true", help="Don't load the summary text for this file from cache")
@@ -1722,18 +1827,31 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--n-batch", type=int, default=256, help="Number of batches to process")
     p.add_argument("--n-gpu-layers", "-g", type=int, default=-1, help="Number of GPU layers to use")
 
-    # Selective escalation to a stronger model (Python only for now).
+    # Selective escalation to a stronger model (Python and C).
     p.add_argument("--emit-manifest", default="", metavar="PATH",
-                   help="Emit phase: write deferred comment requests for complex routines to this manifest "
-                        "(local model still annotates the rest of the file).")
+                   help="Emit phase: write deferred comment requests (complex routines, verification failures, and "
+                        "C doc-site prototypes) for ALL targets to this one run-level manifest (the local model "
+                        "still annotates the rest of each file).")
     p.add_argument("--apply-manifest", default="", metavar="PATH",
-                   help="Apply phase: patch a stronger model's answers from this manifest into the source. No model is "
-                        "loaded; the source should be the emit-phase output.")
+                   help="Apply phase: patch a stronger model's answers from this manifest into the targets. No model "
+                        "is loaded; the targets should be the emit-phase outputs.")
+    p.add_argument("--check-manifest", default="", metavar="PATH",
+                   help="Completeness check (model-free): print the manifest's unfilled-answer count and exit "
+                        "nonzero if any answer is missing. Needs no source targets.")
     p.add_argument("--escalate-cognitive", type=int, default=10, metavar="N",
                    help="Escalate any routine whose cognitive complexity exceeds N to the manifest (default 10).")
     p.add_argument("--codestats-json", default="", metavar="PATH",
                    help="Optional precomputed codestats JSON report; its cognitive scores override the native ones "
                         "when deciding what to escalate.")
+
+    # The header-reword manifest (prose-only escalation of the file descriptions; requires --file-doc to emit).
+    p.add_argument("--emit-reword", default="", metavar="PATH",
+                   help="With --file-doc: also write a run-level header-reword manifest carrying the project blurb "
+                        "and each file's role + freshly spliced draft description, for a stronger model to reword "
+                        "with cross-file consistency. Prose only - no licence/boilerplate text is included.")
+    p.add_argument("--apply-reword", default="", metavar="PATH",
+                   help="Model-free: replace each target's draft header description with the reworded answer from "
+                        "this manifest. The draft is located by exact match; a miss is a safe no-op.")
 
     return p.parse_args(argv)
 
@@ -1750,8 +1868,8 @@ def _apply_manifest_file(
     """
     Patch a stronger model's manifest answers into the source and write the result (the apply phase entry point).
 
-    No model is loaded: the answers are inserted through the same insertion-only patchers as the local passes. Only
-    Python is supported for now (the only language with a block provider and manifest applier).
+    No model is loaded: the answers are inserted through the same insertion-only patchers as the local passes.
+    Python and C have manifest appliers (the escalation-capable languages).
 
     Parameters:
     - `src_path`: The source file (the emit-phase output) being patched.
@@ -1760,17 +1878,20 @@ def _apply_manifest_file(
     - `source_blob`: The source as a single string.
     - `source_lines`: The source split into individual lines.
     - `line_ending`: The detected line ending used to re-join the output.
-    - `manifest`: The parsed manifest dictionary with answers filled in.
+    - `manifest`: The parsed manifest dictionary with answers filled in (its `requests` already filtered to this file).
 
     Returns:
     - 0 on success, or an error number.
     """
 
-    if language != "python":
-        error(f"--apply-manifest currently supports Python only (got '{language}').")
+    if language == "python":
+        from scale_python import apply_manifest
+    elif language == "c":
+        from scale_c import apply_manifest_c as apply_manifest
+    else:
+        error(f"--apply-manifest supports Python and C only (got '{language}').")
         return 1
 
-    from scale_python import apply_manifest
     new_lines = apply_manifest(source_blob, source_lines, manifest)
 
     if dst_path:
@@ -1804,25 +1925,96 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     model = Path(args.model) if args.model else root / DEFAULT_MODEL
     dst_path = Path(args.output) if args.output else None
 
+    # ---- Check phase: model-free completeness counter over a manifest (needs no targets, loads no model). ----
+    if args.check_manifest:
+        import json as _json
+        raw = _json.loads(Path(args.check_manifest).read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and raw.get("tool") == scale_reword.REWORD_TOOL:
+            manifest = scale_reword.read_reword_manifest(Path(args.check_manifest))
+            missing = scale_reword.unfilled_rewords(manifest)
+            total = len(manifest.get("files", []))
+        else:
+            manifest = scale_escalate.read_manifest(Path(args.check_manifest))
+            missing = scale_escalate.unfilled_answers(manifest)
+            total = len(manifest.get("requests", []))
+        for slot in missing:
+            print(f"unfilled: {slot}")
+        print(f"{len(missing)} unfilled answer(s) in {args.check_manifest} ({total} request(s))")
+        return 1 if missing else 0
+
     # Expand the target patterns (files / directories / globs) into a concrete, deduplicated, ordered file list.
     targets = scale_project.gather_files(args.source)
     if not targets:
         error(f"No source files matched: {' '.join(args.source)}")
         return 1
 
-    # ---- Apply phase: model-free, single target. Patch a stronger model's manifest answers into the emit output. ----
+    # ---- Apply phase: model-free. Patch a stronger model's manifest answers into each target (the emit output). ----
     if args.apply_manifest:
-        if len(targets) != 1:
-            error("--apply-manifest operates on a single source file.")
+        if dst_path is not None and len(targets) > 1:
+            error("-o/--output cannot be used with multiple targets; multiple targets are patched in place.")
             return 1
-        src_path = targets[0]
         manifest = scale_escalate.read_manifest(Path(args.apply_manifest))
-        language = args.language.lower() if args.language else manifest.get("language")
-        source_blob, source_lines, line_ending, language = load_source(src_path, language)
-        if language not in SUPPORTED_LANGUAGES:
-            error(f"Unsupported language '{language}'. SCALE supports: {', '.join(SUPPORTED_LANGUAGES)}")
+        file_entries = {str(Path(f.get("path", "")).resolve()): f for f in manifest.get("files", [])}
+        by_file: Dict[str, list] = {}
+        for r in manifest.get("requests", []):
+            by_file.setdefault(str(Path(r.get("file", "")).resolve()), []).append(r)
+
+        rc = 0
+        for target in targets:
+            key = str(target.resolve())
+            requests = by_file.get(key, [])
+            if not requests:
+                echo(f"No manifest requests for {target}; leaving it unchanged.")
+                continue
+            entry = file_entries.get(key, {})
+            language = args.language.lower() if args.language else entry.get("language")
+            source_blob, source_lines, line_ending, language = load_source(target, language)
+            if language not in SUPPORTED_LANGUAGES:
+                error(f"Unsupported language '{language}'. SCALE supports: {', '.join(SUPPORTED_LANGUAGES)}")
+                rc = 1
+                continue
+            sub_manifest = dict(manifest)
+            sub_manifest["requests"] = requests
+            out = dst_path if len(targets) == 1 else target
+            frc = _apply_manifest_file(target, out, language, source_blob, source_lines, line_ending, sub_manifest)
+            if frc != 0:
+                rc = frc
+        return rc
+
+    # ---- Reword-apply phase: model-free. Re-splice each target's header description from the reword manifest. ----
+    if args.apply_reword:
+        if dst_path is not None and len(targets) > 1:
+            error("-o/--output cannot be used with multiple targets; multiple targets are patched in place.")
             return 1
-        return _apply_manifest_file(src_path, dst_path, language, source_blob, source_lines, line_ending, manifest)
+        manifest = scale_reword.read_reword_manifest(Path(args.apply_reword))
+        entries = {str(Path(f.get("path", "")).resolve()): f for f in manifest.get("files", [])}
+        rc = 0
+        for target in targets:
+            entry = entries.get(str(target.resolve()))
+            if entry is None or not str(entry.get("answer") or "").strip():
+                echo(f"No reword answer for {target}; leaving it unchanged.")
+                continue
+            language = args.language.lower() if args.language else entry.get("language")
+            source_blob, source_lines, line_ending, language = load_source(target, language)
+            try:
+                provider = _file_doc_target_for(language)
+            except NotImplementedError as exc:
+                error(str(exc))
+                rc = 1
+                continue
+            zone = provider(source_blob, source_lines)
+            if zone is None:
+                echo(f"reword: {target} has no header zone; leaving it unchanged.")
+                continue
+            new_lines, changed = scale_reword.apply_reword(
+                source_lines, zone, entry.get("draft", ""), entry.get("answer", ""))
+            out = dst_path if len(targets) == 1 else target
+            if out:
+                out.write_bytes(line_ending.join(new_lines).encode("utf-8", errors="surrogateescape"))
+                echo(f"{'Reworded' if changed else 'Unchanged'}: written to {out}")
+            else:
+                print("\n".join(new_lines))
+        return rc
 
     # The block pass runs when spacing is requested or comments are requested (comments imply the pass). The comment
     # density maps to the 1-3 value threshold; with spacing only, 4 disables the comment turns (paragraph only).
@@ -1836,8 +2028,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if dst_path is not None and len(targets) > 1:
         error("-o/--output cannot be used with multiple targets; multiple targets are annotated in place.")
         return 1
-    if args.emit_manifest and len(targets) != 1:
-        error("--emit-manifest operates on a single source file.")
+    if args.emit_reword and not args.file_doc:
+        error("--emit-reword requires --file-doc (the manifest carries the freshly spliced descriptions).")
         return 1
 
     # Read-only reference files (consulted for context, never edited); a file that is also a target is not a reference.
@@ -1885,6 +2077,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.comment or do_blocks:
         run_files = _scan_run_files(targets, references, language_arg)
         graph, store = _build_call_graph(run_files)
+
+    # The verification harness (the grounding gate + challenge turns): built over the run's source text so a
+    # backticked identifier in a generated comment can be checked against everything the run can see. Default-on for
+    # any pass that generates comments; --no-verify opts out.
+    verifier = None
+    if run_files and not args.no_verify:
+        verifier = scale_verify.Verifier(
+            llm, cfg,
+            corpus="\n".join(rf.source_blob for rf in run_files.values()),
+            gate_nudge=_read_optional(scale_path / "verify.gate.txt"),
+            grounding_prompt=_read_optional(scale_path / "verify.grounding.txt"),
+            grounding_feedback=_read_optional(scale_path / "verify.grounding.feedback.txt"),
+            obvious_prompt=_read_optional(scale_path / "verify.obvious.txt"),
+            obvious_feedback=_read_optional(scale_path / "verify.obvious.feedback.txt"),
+            story_prompt=_read_optional(scale_path / "verify.story.txt"),
+            story_feedback=_read_optional(scale_path / "verify.story.feedback.txt"),
+        )
     if graph is not None and store is not None:
         callee_oneliners = _make_callee_oneliner_context(llm, cfg, run_files, graph, store)
         if args.comment:
@@ -1901,6 +2110,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             targets = _order_header_before_impl(targets, c_plan.pairs)
 
     # Annotate each target in turn (single target -> -o or stdout; multiple targets -> in place).
+    # The run-level emit machinery: one codestats override and one doc_style for the run (the style block covers
+    # every escalation-capable language among the targets), a per-target collector, and one manifest at the end.
+    emit_override = emit_doc_style = None
+    emit_parts: List[Tuple[str, str, str, "scale_escalate.Escalation"]] = []
+    reword_entries: List[dict] = []
+    if args.emit_manifest:
+        emit_override = scale_escalate.load_codestats_json(Path(args.codestats_json)) if args.codestats_json else None
+        langs = sorted({rf.language for rf in run_files.values() if rf.is_target and rf.language in ("python", "c")})
+        pieces = [t for t in (_read_optional(scale_path / "guidelines.md"),) if t]
+        pieces += [t for lang in langs for t in (_read_optional(scale_path / f"comment.{lang}.txt"),) if t]
+        emit_doc_style = "\n\n".join(pieces)
+
     rc = 0
     for target in targets:
         language = args.language.lower() if args.language else None
@@ -1910,19 +2131,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   f"{', '.join(SUPPORTED_LANGUAGES)}).")
             continue
 
-        # ---- Emit phase: a per-target selective-escalation policy (single target only, guarded above). ----
+        # ---- Emit phase: a per-target escalation collector, merged into one run-level manifest after the loop. ----
         escalation = None
         if args.emit_manifest:
-            if language != "python":
-                error("--emit-manifest currently supports Python only.")
-                return 1
-            override = scale_escalate.load_codestats_json(Path(args.codestats_json)) if args.codestats_json else None
-            doc_style = "\n\n".join(
-                t for t in (_read_optional(scale_path / "guidelines.md"),
-                            _read_optional(scale_path / f"comment.{language}.txt")) if t
-            )
-            escalation = scale_escalate.Escalation(
-                threshold=args.escalate_cognitive, override=override, doc_style=doc_style)
+            if language in ("python", "c"):
+                escalation = scale_escalate.Escalation(
+                    threshold=args.escalate_cognitive, override=emit_override, doc_style=emit_doc_style or "")
+            else:
+                error(f"--emit-manifest does not support '{language}' yet; {target} is annotated locally only.")
 
         # Bind the call-graph hooks for this file over the shared store (closing the file key into each closure). The
         # store accumulates across files, so a callee documented in an earlier-ordered target informs a later caller;
@@ -1947,6 +2163,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             doc_plan = c_plan.for_file(str(target.resolve()))
             doc_override = lambda name, p=c_plan: p.header_doc(name)
 
+        # The pass-1 (priming-grade) skeleton, rendered model-free from the retained store's parse of the original
+        # text. None (no symbols, or a file the store skipped) keeps the whole-file summary path.
+        skeleton = None
+        rf = run_files.get(str(target.resolve()))
+        if rf is not None:
+            skeleton = scale_project.render_skeleton(rf.source_lines, rf.language, rf.symbols)
+
+        # The header-reword collector: each successful --file-doc splice records this file's draft description (and
+        # any richer map-reduce context) so the run-level reword manifest can be written after the loop.
+        on_file_doc = None
+        if args.emit_reword:
+            on_file_doc = (lambda desc, thorough, t=target, lang=language:
+                           reword_entries.append({
+                               "path": str(t), "language": lang, "role": _file_role(t, lang),
+                               "draft": desc, "context": thorough, "answer": None}))
+
         out = dst_path if len(targets) == 1 else target
         echo(f"Annotating {target}...")
         frc = generate_comments(
@@ -1966,6 +2198,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             doc_plan=doc_plan,
             doc_override=doc_override,
             block_callee_notes=block_notes,
+            verifier=verifier,
+            skeleton=skeleton,
+            on_file_doc=on_file_doc,
         )
         if frc != 0:
             rc = frc
@@ -1978,11 +2213,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if ik:
                     store.update(ik, nm, doc)
 
-        # Serialise the deferred requests so a stronger model can answer them (then re-run with --apply-manifest).
+        # Collect this target's deferred requests for the run-level manifest (written once, after every target).
         if frc == 0 and escalation is not None:
-            manifest = escalation.to_manifest(str(target), language, line_ending)
-            scale_escalate.write_manifest(Path(args.emit_manifest), manifest)
-            echo(f"Wrote {len(escalation.requests)} escalation request(s) to {args.emit_manifest}")
+            emit_parts.append((str(target), language, line_ending, escalation))
+
+    # Serialise the run's deferred requests so a stronger model can answer them (then re-run with --apply-manifest).
+    if args.emit_manifest:
+        manifest = scale_escalate.run_manifest(emit_parts, args.escalate_cognitive, emit_doc_style or "")
+        scale_escalate.write_manifest(Path(args.emit_manifest), manifest)
+        echo(f"Wrote {len(manifest['requests'])} escalation request(s) to {args.emit_manifest}")
+
+    # Serialise the header-reword manifest (the freshly spliced descriptions, for a cross-file consistency reword).
+    if args.emit_reword:
+        reword = scale_reword.reword_manifest(project_blurb, reword_entries)
+        scale_reword.write_reword_manifest(Path(args.emit_reword), reword)
+        echo(f"Wrote {len(reword_entries)} description draft(s) to {args.emit_reword}")
 
     return rc
 

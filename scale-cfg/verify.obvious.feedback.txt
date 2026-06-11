@@ -1,0 +1,1 @@
+A reviewer judged that note as adding nothing a reader of the code would not already see. Give the paragraph's POINT instead - the reason it is here, a gotcha, or what it accomplishes for the routine - in one short line. Bare sentence. No #, no quotes, no list.

@@ -1,0 +1,1 @@
+A reviewer judged the notes written for this routine's paragraphs as restating the code rather than telling its story. For this paragraph, capture WHY it is here and what it contributes to the routine - intent, a reason, a gotcha - not what the lines plainly say.

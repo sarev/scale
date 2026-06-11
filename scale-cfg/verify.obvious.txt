@@ -1,0 +1,9 @@
+Here is a paragraph of code, and a comment written to sit above it.
+
+The code:
+
+{block}
+
+The comment: {comment}
+
+Does the comment tell the reader anything that is not already evident from reading the code itself? Reply with the single word YES or NO.

@@ -116,6 +116,8 @@ SCORE_PROMPT = (
     "nothing else."
 )
 VALUE_FLAG = "{@X@}"        # magic marker tagging a low-value note: kept for context, skipped at output
+CHALLENGE_FLAG = "{@F@}"    # marker tagging a note that failed verification twice: kept for context, never written,
+                            # and (when a manifest is active) the signal to promote the routine to the stronger model
 COMMENT_VALUE_THRESHOLD = 2  # minimum 1-3 value score for a note to be written into the code (drop bare restatements)
 
 # A routine with at most this many chunks is "short": its docstring plus the visible code already walk a reader
@@ -714,7 +716,7 @@ def _parse_summary(reply: str, style: CommentStyle) -> str:
         if d and first.startswith(d):
             first = first[len(d):].strip()
             break
-    first = first.replace(VALUE_FLAG, "").strip("`\"'* ").strip()
+    first = first.replace(VALUE_FLAG, "").replace(CHALLENGE_FLAG, "").strip("`\"'* ").strip()
     if first.upper() in ("", "NONE", "SKIP", "N/A", "TRIVIAL"):
         return ""
     return first
@@ -732,10 +734,18 @@ def _parse_score(reply: str, default: int = COMMENT_VALUE_THRESHOLD) -> int:
 
 
 def _comment_to_insert(comment: Optional[str]) -> Optional[str]:
-    """Return the comment to write into the code: None when it carries the low-value `VALUE_FLAG`, else unchanged."""
-    if comment and comment.rstrip().endswith(VALUE_FLAG):
+    """Return the comment to write into the code: None when it carries `VALUE_FLAG` or `CHALLENGE_FLAG`, else unchanged."""
+    if comment and comment.rstrip().endswith((VALUE_FLAG, CHALLENGE_FLAG)):
         return None
     return comment
+
+
+def _strip_note_flags(comment: Optional[str]) -> str:
+    """Return a note's bare text, with any trailing `VALUE_FLAG`/`CHALLENGE_FLAG` marker removed."""
+    out = comment or ""
+    for flag in (VALUE_FLAG, CHALLENGE_FLAG):
+        out = out.replace(flag, "")
+    return out.strip()
 
 
 def request_block_comment(
@@ -754,6 +764,8 @@ def request_block_comment(
     score_template: Optional[str] = None,
     value_threshold: int = COMMENT_VALUE_THRESHOLD,
     line_notes: Optional[Dict[int, str]] = None,
+    verifier=None,
+    feedback: Optional[str] = None,
 ) -> Optional[str]:
     """
     Summarise one paragraph of a routine and score how much that summary is worth as a code comment.
@@ -788,9 +800,17 @@ def request_block_comment(
       noted line *within this paragraph* is shown to the model with the note appended as a trailing comment, so the
       summary can draw on what the called routine does. READ-SIDE ONLY: the annotation enriches what the model sees
       and is never written to the output (the patcher works from the real source lines).
+    - `verifier`: Optional `scale_verify.Verifier`. When supplied, an insertable summary additionally faces the
+      deterministic grounding gate (backticked identifiers must exist in the run's source; one corrective nudge) and
+      the clean-context obviousness challenge (one regeneration with the verdict as feedback). A summary that fails
+      either twice is tagged with `CHALLENGE_FLAG`: kept as context, never written, and - when a manifest is active -
+      the caller's signal to promote the routine to the stronger model.
+    - `feedback`: Optional reviewer feedback appended to the summary turn (the story-challenge retry), steering the
+      regenerated note towards intent rather than restatement.
 
     Returns:
-    - The one-line summary (suffixed with `VALUE_FLAG` when low-value), or None if the model gave nothing usable.
+    - The one-line summary (suffixed with `VALUE_FLAG` when low-value, or `CHALLENGE_FLAG` when it failed
+      verification twice), or None if the model gave nothing usable.
     """
 
     raw_lines = source_lines[blob_start - 1:blob_end]
@@ -812,6 +832,8 @@ def request_block_comment(
         kind=target.kind, qualname=target.qualname, doc=_doc_summary(target.doc),
         priors=priors, block=block_text,
     )
+    if feedback:
+        prompt += "\n\n" + feedback
     turn_cfg = replace(cfg, temperature=COMMENT_TEMPERATURE, max_new_tokens=min(cfg.max_new_tokens, COMMENT_REPLY_TOKENS))
 
     # Turn 1: a one-line description, always. Nudge once if the first reply is unusable.
@@ -829,7 +851,26 @@ def request_block_comment(
             messages.pop()
         return None
 
-    # Turn 2: score the summary's value as a code comment (1-5).
+    # The grounding gate (deterministic, model-free check; one corrective nudge): a note naming an identifier that
+    # exists nowhere in the run's source is nudged to correct it, and tagged CHALLENGE_FLAG if it still does not -
+    # kept as context (the running record must not starve later paragraphs) but never written.
+    if verifier is not None:
+        tokens = verifier.ungrounded(summary)
+        if tokens:
+            echo(f"[verify] '{target.qualname}' L{blob_start}-{blob_end}: ungrounded identifiers {tokens}; nudging")
+            messages.append({"role": "assistant", "content": summary})
+            messages.append({"role": "user", "content": verifier.gate_feedback(tokens)})
+            appended += 2
+            new = _parse_summary(llm.generate(messages, cfg=turn_cfg), style)
+            if new:
+                summary = new
+            if verifier.ungrounded(summary):
+                for _ in range(appended):
+                    messages.pop()
+                echo(f"[verify] '{target.qualname}' L{blob_start}-{blob_end}: still ungrounded; comment dropped")
+                return f"{summary} {CHALLENGE_FLAG}"
+
+    # Turn 2: score the summary's value as a code comment (1-3).
     messages.append({"role": "assistant", "content": summary})
     score_prompt = _fill(score_template or SCORE_PROMPT, kind=target.kind, qualname=target.qualname,
                          length_note=length_note, block=block_text)
@@ -837,11 +878,39 @@ def request_block_comment(
     appended += 2
     score_cfg = replace(cfg, temperature=SCORE_TEMPERATURE, max_new_tokens=min(cfg.max_new_tokens, SCORE_REPLY_TOKENS))
     score = _parse_score(llm.generate(messages, cfg=score_cfg))
+    kept = score >= value_threshold
+
+    # The obviousness challenge (clean context - just the pristine paragraph, the note, one YES/NO question) on a
+    # note that would be written: a NO regenerates the note once with the verdict as feedback (re-scored, then
+    # re-challenged); a second NO tags it CHALLENGE_FLAG - dropped from the output, kept as context, and the
+    # promote-to-manifest signal when escalation is active. This kills restatement and purpose-clause score-gaming
+    # that the (same-context) score turn lets through.
+    challenge_failed = False
+    if kept and verifier is not None:
+        pristine = "\n".join(source_lines[blob_start - 1:blob_end])
+        if not verifier.challenge_obvious(pristine, summary):
+            echo(f"[verify] '{target.qualname}' L{blob_start}-{blob_end}: obviousness challenge failed; regenerating")
+            messages.pop()                                   # retract the score turn; the note turn is still open
+            appended -= 1
+            messages.append({"role": "user", "content": verifier.obvious_feedback_for()})
+            appended += 1
+            new = _parse_summary(llm.generate(messages, cfg=turn_cfg), style)
+            if new:
+                summary = new
+            messages.append({"role": "assistant", "content": summary})
+            messages.append({"role": "user", "content": score_prompt})
+            appended += 2
+            score = _parse_score(llm.generate(messages, cfg=score_cfg))
+            kept = score >= value_threshold
+            if kept and not verifier.challenge_obvious(pristine, summary):
+                echo(f"[verify] '{target.qualname}' L{blob_start}-{blob_end}: failed twice; comment dropped")
+                challenge_failed = True
 
     for _ in range(appended):
         messages.pop()
 
-    kept = score >= value_threshold
+    if challenge_failed:
+        return f"{summary} {CHALLENGE_FLAG}"
     echo(f"[block] {target.qualname} L{blob_start}-{blob_end} score={score}/{value_threshold} "
          f"{'KEEP' if kept else 'drop'}: {summary}")
     return summary if kept else f"{summary} {VALUE_FLAG}"
@@ -1021,6 +1090,7 @@ def annotate_blocks(
     value_threshold: Optional[int] = None,
     escalation=None,
     callee_annotations: Optional[Dict[str, Dict[int, str]]] = None,
+    verifier=None,
 ) -> Chunk:
     """
     Run the full block pass over every routine and return the annotated source.
@@ -1054,6 +1124,14 @@ def annotate_blocks(
     - `callee_annotations`: Optional `{qualname -> {line -> "callee: one-liner"}}` call-graph context. Each routine's
       map annotates its call lines (read-side only) in the comment turn, so a paragraph that calls a known routine is
       summarised knowing what that routine does. Absent (or for an unlisted routine), behaviour is unchanged.
+    - `verifier`: Optional `scale_verify.Verifier`. Per comment it adds the grounding gate and the obviousness
+      challenge (see `request_block_comment`); per routine - when the routine is long enough (more than
+      `SHORT_FUNCTION_CHUNKS` chunks) and at least one note would be written - the **story challenge** judges the
+      full note set in a clean context. A failed set is regenerated once with the verdict as per-paragraph feedback;
+      a second failure (or any note tagged `CHALLENGE_FLAG`) promotes the routine to the manifest when escalation is
+      active - the chunk recipe is recorded and the routine is left byte-for-byte untouched, so the apply phase
+      delivers spacing and comments together - else the routine's comments are dropped (the paragraphing blanks stay;
+      wrongness is worse than absence).
 
     Returns:
     - The annotated source split into lines.
@@ -1083,39 +1161,82 @@ def annotate_blocks(
         else:
             length_note = note_long or COMMENT_NOTE_LONG
 
-        # Selective escalation: a complex routine's comment text is deferred to a stronger model. Segmentation has
-        # already run locally (it is structural), so we record the chunk recipe - each chunk's boundary index and its
-        # code - and skip the local comment turns, leaving this routine untouched for the apply phase.
-        if escalation is not None and escalation.should_escalate(target.qualname, target.cognitive):
+        def defer_to_manifest(reason: str) -> None:
+            """Record this routine's chunk recipe on the manifest (it is left byte-for-byte untouched here)."""
+            # The routine's code rides the manifest ONCE, as its verbatim span; each chunk carries its boundary index
+            # (placement at apply) and its 1-based line range INTO that span (what the stronger model reads).
+            span = "\n".join(source_lines[target.header_start - 1:target.body_end])
             chunks = [
-                {"bidx": target.boundary_lines.index(s), "text": "\n".join(source_lines[s - 1:e])}
+                {"bidx": target.boundary_lines.index(s),
+                 "lines": [s - target.header_start + 1, e - target.header_start + 1]}
                 for s, e in segments
             ]
             escalation.record_block(
                 qualname=target.qualname, kind=target.kind, sig_hash=target.sig,
                 cognitive=target.cognitive, doc_summary=_doc_summary(target.doc),
-                length_note=length_note, chunks=chunks,
+                length_note=length_note, chunks=chunks, snippet=span,
             )
-            echo(f"[blocks] Escalated '{target.qualname}' (cognitive {target.cognitive}); {len(chunks)} chunk(s) deferred")
+            echo(f"[blocks] Escalated '{target.qualname}' ({reason}); {len(chunks)} chunk(s) deferred")
+
+        # Selective escalation: a complex routine's comment text is deferred to a stronger model. Segmentation has
+        # already run locally (it is structural), so we record the chunk recipe - each chunk's boundary index and its
+        # code - and skip the local comment turns, leaving this routine untouched for the apply phase.
+        if escalation is not None and escalation.should_escalate(target.qualname, target.cognitive):
+            defer_to_manifest(f"cognitive {target.cognitive}")
             continue
 
         # One comment turn per chunk, in body order, feeding earlier comments forward as narrative context.
         line_notes = (callee_annotations or {}).get(target.qualname)
-        edits: List[Tuple[int, Optional[str], str]] = []
-        prior_comments: List[str] = []
-        for blob_start, blob_end in segments:
-            if comments_off:
-                comment = None                   # threshold > 5: paragraph only, no model work
-            else:
-                comment = request_block_comment(
-                    llm, cfg, messages, source_lines, target, blob_start, blob_end, style,
-                    prior_comments=prior_comments, length_note=length_note,
-                    prompt_template=comment_prompt, nudge_template=comment_nudge, score_template=score_prompt,
-                    value_threshold=threshold, line_notes=line_notes,
-                )
-                if comment:
-                    prior_comments.append(comment)  # keep every summary (incl. low-value, flag and all) as context
-            edits.append((blob_start, _comment_to_insert(comment), target.indent_of.get(blob_start, "")))
+
+        def run_chunks(feedback: Optional[str] = None) -> Tuple[List[Tuple[int, Optional[str], str]], List[str]]:
+            """One comment turn per chunk; returns the routine's edits and the full set of turn-1 notes."""
+            edits: List[Tuple[int, Optional[str], str]] = []
+            prior_comments: List[str] = []
+            for blob_start, blob_end in segments:
+                if comments_off:
+                    comment = None               # threshold > 3: paragraph only, no model work
+                else:
+                    comment = request_block_comment(
+                        llm, cfg, messages, source_lines, target, blob_start, blob_end, style,
+                        prior_comments=prior_comments, length_note=length_note,
+                        prompt_template=comment_prompt, nudge_template=comment_nudge, score_template=score_prompt,
+                        value_threshold=threshold, line_notes=line_notes, verifier=verifier, feedback=feedback,
+                    )
+                    if comment:
+                        prior_comments.append(comment)  # keep every summary (incl. flagged ones) as context
+                edits.append((blob_start, _comment_to_insert(comment), target.indent_of.get(blob_start, "")))
+            return edits, prior_comments
+
+        edits, notes = run_chunks()
+
+        # The story challenge (clean context): do the routine's notes, as a set, tell its story or just restate it?
+        # Length-guarded - a short routine's docstring plus visible code already walk a reader through it, so it never
+        # triggers - and skipped when nothing would be written anyway. A failed set is regenerated once with the
+        # verdict as per-paragraph feedback, then re-challenged.
+        story_failed = False
+        if (verifier is not None and not comments_off and len(segments) > SHORT_FUNCTION_CHUNKS
+                and any(_comment_to_insert(n) for n in notes)):
+            signature = "\n".join(source_lines[target.header_start - 1:target.header_end])
+            if not verifier.challenge_story(signature, _doc_summary(target.doc), [_strip_note_flags(n) for n in notes]):
+                echo(f"[verify] '{target.qualname}': story challenge failed; regenerating the routine's notes once")
+                edits, notes = run_chunks(verifier.story_feedback_for())
+                if (any(_comment_to_insert(n) for n in notes)
+                        and not verifier.challenge_story(signature, _doc_summary(target.doc),
+                                                         [_strip_note_flags(n) for n in notes])):
+                    story_failed = True
+
+        # Shared failure routing: a twice-failed routine (story challenge, or any note that failed its own
+        # gate/obviousness challenge twice) is promoted whole to the manifest when one is active - the local attempt
+        # is discarded and the routine left byte-for-byte untouched, so the apply phase delivers spacing and comments
+        # together. Without a manifest, a story failure drops the routine's comments (the paragraphing blanks stay);
+        # individually-flagged notes are already excluded from the edits.
+        challenged = story_failed or any((n or "").rstrip().endswith(CHALLENGE_FLAG) for n in notes)
+        if challenged and escalation is not None:
+            defer_to_manifest("failed verification")
+            continue
+        if story_failed:
+            echo(f"[verify] '{target.qualname}': story challenge failed twice; dropping its comments")
+            edits = [(b, None, indent) for b, _comment, indent in edits]
 
         # Per-routine guard: simulate this routine's edits on the pristine source and keep them only if code is intact.
         trial = _apply_edits(source_lines, edits, style)

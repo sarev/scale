@@ -248,6 +248,7 @@ def annotate_file_doc(
     language: str,
     *,
     classify_prompt: Optional[str] = None,
+    on_description: Optional[Callable[[str], None]] = None,
 ) -> Chunk:
     """
     Run the file-doc pass: classify the existing description (if any), then splice the file summary in as the header.
@@ -268,6 +269,9 @@ def annotate_file_doc(
       prose to insert. This is where the whole-file summary is produced/fetched.
     - `language`: The language identifier, woven into the classify prompt.
     - `classify_prompt`: Optional classify-prompt override (defaults to the built-in constant).
+    - `on_description`: Optional callback invoked with the (sanitised) description text after a SUCCESSFUL splice -
+      i.e. the exact prose now sitting in the header. The header-reword manifest records it as each file's draft,
+      which its model-free apply later re-finds by exact match.
 
     Returns:
     - The annotated source split into lines (unchanged if there was nothing to do or the guard failed).
@@ -357,6 +361,8 @@ def annotate_file_doc(
 
     echo("file-doc: " + ("updated the existing file description."
                          if desc_range is not None else "inserted a file description."))
+    if on_description is not None:
+        on_description(description)
     return out_lines
 
 

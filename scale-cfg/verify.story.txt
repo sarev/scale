@@ -1,0 +1,12 @@
+Here is a routine's signature, what it does, and the comments written above the paragraphs of its body, in order.
+
+The signature:
+
+{signature}
+
+It does: {doc}
+
+The paragraph comments:
+{notes}
+
+Taken together, do these comments tell the story of how the routine achieves what it does, or do they merely restate the code and pad it with boilerplate? Reply with the single word STORY or RESTATE.

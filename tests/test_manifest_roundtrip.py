@@ -93,12 +93,22 @@ def main():
     esc = Escalation(threshold=10)
     emit = scale_blocks.annotate_blocks(stub, cfg, msgs, lines, targets, PYTHON_STYLE, escalation=esc)
 
-    block_reqs = [r for r in esc.requests if r["pass"] == "block"]
+    block_reqs = [r for r in esc.requests if r.get("blocks") is not None]
     assert [r["qualname"] for r in block_reqs] == ["heavy"], \
         f"only 'heavy' should be escalated for blocks, got {[r['qualname'] for r in block_reqs]}"
-    assert block_reqs[0]["chunks"], "the escalated routine must carry its (locally segmented) chunk recipe"
+    chunks = block_reqs[0]["blocks"]["chunks"]
+    assert chunks, "the escalated routine must carry its (locally segmented) chunk recipe"
     assert any("# stub block note" in ln for ln in emit), "the simple routine should have been annotated locally"
     assert code_preserved(lines, emit, PYTHON_STYLE), "emit must not alter any code"
+
+    # SLIM: the routine's code rides the manifest once, as its verbatim span; each chunk references line ranges INTO
+    # that snippet rather than duplicating the text.
+    snippet_lines = block_reqs[0]["snippet"].split("\n")
+    assert snippet_lines[0] == "def heavy(x):", "the snippet must be the routine's verbatim span"
+    for chunk in chunks:
+        a, b = chunk["lines"]
+        assert "\n".join(snippet_lines[a - 1:b]).strip(), "each chunk's line range must index into the snippet"
+        assert "text" not in chunk, "a chunk must not duplicate the snippet text"
 
     # heavy's body lines must be byte-identical in the emit output (only simple was touched, above it).
     assert "# stub block note" not in "\n".join(emit[emit.index("def heavy(x):"):]), \
@@ -107,7 +117,7 @@ def main():
     # ---- APPLY: fill the manifest with a stronger model's answers and patch them in (model-free) ----
     manifest = esc.to_manifest("test.py", "python", "\n")
     for req in manifest["requests"]:
-        for ci, chunk in enumerate(req["chunks"]):
+        for ci, chunk in enumerate(req["blocks"]["chunks"]):
             chunk["answer"] = "NONE" if ci == 0 else f"heavy step {ci}"   # exercise NONE on the first chunk
 
     final = scale_python.apply_manifest("\n".join(emit), emit, manifest)
@@ -117,7 +127,7 @@ def main():
     assert code_preserved(lines, final, PYTHON_STYLE), "the whole round-trip must preserve the original code"
     # The NONE chunk must paragraph (blank) without inventing a comment for that specific block.
     n_heavy_comments = sum(1 for ln in final if ln.strip().startswith("# heavy step"))
-    assert n_heavy_comments == len(block_reqs[0]["chunks"]) - 1, "the NONE answer must not produce a comment"
+    assert n_heavy_comments == len(chunks) - 1, "the NONE answer must not produce a comment"
 
     # ============ DEFINITION PASS ============
 
@@ -127,7 +137,7 @@ def main():
     esc_d = Escalation(threshold=10)
     doc_map = scale_python.generate_docstrings(stub, cfg, msgs, defs, SRC, lines, escalation=esc_d)
 
-    def_reqs = [r for r in esc_d.requests if r["pass"] == "def"]
+    def_reqs = [r for r in esc_d.requests if r.get("def") is not None]
     assert [r["qualname"] for r in def_reqs] == ["heavy"], "only 'heavy' should be escalated for the def pass"
     qn_in_map = {info.qualname for info in defs if id(info.node) in doc_map}
     assert qn_in_map == {"simple"}, f"only 'simple' should be commented locally, got {qn_in_map}"
@@ -138,7 +148,7 @@ def main():
     # ---- APPLY: patch heavy's docstring from the manifest ----
     manifest_d = esc_d.to_manifest("test.py", "python", "\n")
     for req in manifest_d["requests"]:
-        req["answer"] = "Heavy routine docstring written by the stronger model."
+        req["def"]["answer"] = "Heavy routine docstring written by the stronger model."
 
     final_d = scale_python.apply_manifest("\n".join(patched), patched, manifest_d)
     assert any("Heavy routine docstring" in ln for ln in final_d), "heavy's deferred docstring must be applied"
@@ -146,6 +156,31 @@ def main():
     # guarantee is that no original code line is dropped or mutated - every one must still be present.
     for ln in (l for l in lines if l.strip()):
         assert ln in final_d, f"the def round-trip dropped or altered an original line: {ln!r}"
+
+    # ============ MERGED REQUEST (slimming across passes) ============
+
+    # When BOTH passes defer the same routine, the manifest carries ONE request with ONE snippet (def slot + block
+    # recipe together), and the apply phase delivers docstring + spacing + comments from it in one go.
+    esc_m = Escalation(threshold=10)
+    doc_map_m = scale_python.generate_docstrings(stub, cfg, msgs, defs, SRC, lines, escalation=esc_m)
+    emit_m = scale_blocks.annotate_blocks(stub, cfg, msgs,
+                                          scale_python.patch_docstrings_textually(lines, defs, doc_map_m),
+                                          targets, PYTHON_STYLE, escalation=esc_m)
+    merged = [r for r in esc_m.requests if r["qualname"] == "heavy"]
+    assert len(merged) == 1, "both passes must record into ONE per-routine request"
+    assert merged[0].get("def") is not None and merged[0].get("blocks") is not None
+    assert merged[0]["snippet"].startswith("def heavy(x):"), "the merged request carries the snippet once"
+
+    manifest_m = esc_m.to_manifest("test.py", "python", "\n")
+    for req in manifest_m["requests"]:
+        if req.get("def") is not None:
+            req["def"]["answer"] = "Merged docstring."
+        if req.get("blocks") is not None:
+            for chunk in req["blocks"]["chunks"]:
+                chunk["answer"] = "merged note"
+    final_m = scale_python.apply_manifest("\n".join(emit_m), emit_m, manifest_m)
+    assert any("Merged docstring." in ln for ln in final_m) and any("# merged note" in ln for ln in final_m), \
+        "one merged request must deliver both the docstring and the block comments"
 
     print("PASS: emit defers complex routines untouched; apply patches the stronger model's answers, code preserved")
     return 0

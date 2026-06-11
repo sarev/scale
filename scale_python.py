@@ -46,7 +46,7 @@ from dataclasses import dataclass, field, replace
 from scale_blocks import BlockTarget, SegStatement, structural_breaks
 from scale_filedoc import FileDocTarget, PYTHON_DOC_STYLE
 from scale_llm import LocalChatModel, GenerationConfig, Messages, Chunk
-from scale_log import echo
+from scale_log import echo, error
 from scale_project import Symbol, apply_doc_order
 from scale_text import fit_snippet, summarise, LENGTH_LINE, MARKER_PYTHON, PRIMING_ACK
 from typing import Callable, Dict, List, Optional, Tuple
@@ -986,6 +986,7 @@ def generate_docstrings(
     doc_order: Optional[List[str]] = None,
     callee_context: Optional[Callable[[str], str]] = None,
     on_doc: Optional[Callable[[str, str], None]] = None,
+    verifier=None,
 ) -> Dict[int, str]:
     """
     Generate or update docstrings for definitions in a Python source code AST.
@@ -1012,6 +1013,10 @@ def generate_docstrings(
       routines (their snippet goes verbatim to the stronger model).
     - `on_doc`: Optional callback `(qualname, docstring)` invoked after each locally-generated docstring, so the shared
       `ContractStore` can update the routine's contract for later callers. Escalated/deferred routines do not call it.
+    - `verifier`: Optional `scale_verify.Verifier`. When supplied, each generated docstring faces the deterministic
+      backtick-grounding gate and the clean-context grounding challenge (one corrective regeneration each); a
+      docstring that fails twice is promoted to the manifest when escalation is active (the local attempt is
+      discarded), else written under a prominent warning so the doubt is visible rather than silent.
 
     Returns:
     - A dictionary mapping qualified names to generated or updated docstrings.
@@ -1210,11 +1215,14 @@ def generate_docstrings(
     else:
         defs_deepest_first = sorted(defs, key=lambda d: (d.depth, d.start, -d.end), reverse=True)
 
-    def record_escalation(info: DefInfo, score: int, snippet: str) -> None:
+    def record_escalation(info: DefInfo, score: int) -> None:
         """Record a deferred docstring request for `info` on the active manifest."""
+        # The manifest carries the routine's VERBATIM source span (not the child-stubbed local snippet): the stronger
+        # model wants full fidelity, and one span per routine is what lets the block recipe reference into it.
+        span = "\n".join(source_lines[info.header_start - 1:info.end])
         escalation.record_def(
             qualname=info.qualname, kind=info.kind, sig_hash=node_sig(info.node),
-            cognitive=escalation.score_for(info.qualname, score), snippet=snippet,
+            cognitive=escalation.score_for(info.qualname, score), snippet=span,
         )
 
     for info in defs_deepest_first:
@@ -1225,7 +1233,7 @@ def generate_docstrings(
         # Complexity-driven escalation: defer a complex routine's docstring to the stronger model. Record the assembled
         # snippet and leave the routine out of the doc map, so the patcher leaves it untouched here.
         if escalation is not None and escalation.should_escalate(info.qualname, score):
-            record_escalation(info, score, full_snippet)
+            record_escalation(info, score)
             echo(f"[Python] Escalated docstring for '{info.qualname}' (cognitive {score}); deferred")
             continue
 
@@ -1283,10 +1291,39 @@ def generate_docstrings(
         # stronger model (when a manifest is active) rather than writing a useless placeholder.
         if _is_unusable_docstring(reply, docstring):
             if escalation is not None:
-                record_escalation(info, score, full_snippet)
+                record_escalation(info, score)
                 echo(f"[Python] Promoted '{info.qualname}' to the stronger model (local docstring was unusable)")
                 continue
             docstring = f"{info.kind} `{info.qualname}` - comment generation failed."
+        elif verifier is not None:
+            # Verification (the quality floor): the grounding gate + grounding challenge, each allowing one
+            # corrective regeneration in this routine's own context (snippet -> previous answer -> feedback).
+            last_reply = [reply]
+
+            def regenerate(feedback: str, _prompt: str = prompt) -> str:
+                """Regenerate the docstring with reviewer feedback; '' when the retry is unusable."""
+                messages.append({"role": "user", "content": _prompt})
+                messages.append({"role": "assistant", "content": last_reply[0]})
+                messages.append({"role": "user", "content": feedback})
+                retry = llm.generate(messages, cfg=cfg)
+                for _ in range(3):
+                    messages.pop()
+                doc = extract_first_docstring(retry)
+                if _is_unusable_docstring(retry, doc):
+                    return ""
+                last_reply[0] = retry
+                return doc
+
+            docstring, ok = verifier.verify_def(local_snippet, docstring, regenerate, label=info.qualname)
+            if not ok:
+                # Shared failure routing: promote to the manifest (discarding the local attempt) when one is
+                # active; else write the doc under a prominent warning - a visible contract beats a silent gap.
+                if escalation is not None:
+                    record_escalation(info, score)
+                    echo(f"[Python] Promoted '{info.qualname}' to the stronger model (failed verification)")
+                    continue
+                error(f"[verify] '{info.qualname}': docstring failed verification twice; writing it anyway - "
+                      f"review this docstring")
 
         docs_by_node_id[node_id] = docstring
         # Publish this routine's freshly-generated contract so later callers (in this file or a later target) see it.
@@ -1700,6 +1737,7 @@ def generate_language_comments(
     doc_order: Optional[List[str]] = None,
     callee_context: Optional[Callable[[str], str]] = None,
     on_doc: Optional[Callable[[str, str], None]] = None,
+    verifier=None,
 ) -> Chunk:
     """
     Process Python source code and generate new/updated docstrings for each definition.
@@ -1717,6 +1755,7 @@ def generate_language_comments(
       rather than commented locally (see `generate_docstrings`).
     - doc_order/callee_context/on_doc: Optional call-graph hooks (see `generate_docstrings`); absent, behaviour is
       unchanged.
+    - verifier: Optional `scale_verify.Verifier` (the grounding gate + challenge turns; see `generate_docstrings`).
 
     Returns:
     - A patched source file text, containing the new docstrings, split into individual lines.
@@ -1742,7 +1781,8 @@ def generate_language_comments(
 
     echo("Generating docstrings...\n")
     doc_map = generate_docstrings(llm, cfg, messages, defs, source_blob, source_lines, escalation=escalation,
-                                  doc_order=doc_order, callee_context=callee_context, on_doc=on_doc)
+                                  doc_order=doc_order, callee_context=callee_context, on_doc=on_doc,
+                                  verifier=verifier)
 
     echo("Applying Python patches...\n")
     return patch_docstrings_textually(source_lines, defs, doc_map)
@@ -1800,8 +1840,8 @@ def apply_manifest(source_blob: str, source_lines: Chunk, manifest: dict) -> Chu
     from scale_blocks import PYTHON_STYLE, _apply_edits, code_preserved, _parse_comment_reply
 
     requests = manifest.get("requests", [])
-    def_reqs = [r for r in requests if r.get("pass") == "def"]
-    block_reqs = [r for r in requests if r.get("pass") == "block"]
+    def_reqs = [r for r in requests if r.get("def") is not None]
+    block_reqs = [r for r in requests if r.get("blocks") is not None]
 
     out_lines = source_lines
 
@@ -1816,7 +1856,7 @@ def apply_manifest(source_blob: str, source_lines: Chunk, manifest: dict) -> Chu
             req = wanted.get(key)
             if req is None or key in used:
                 continue
-            answer = req.get("answer")
+            answer = req["def"].get("answer")
             if not answer or not answer.strip():
                 echo(f"[apply] Def request '{req['id']}' has no answer; leaving docstring untouched")
                 continue
@@ -1834,15 +1874,16 @@ def apply_manifest(source_blob: str, source_lines: Chunk, manifest: dict) -> Chu
         all_edits: List[Tuple[int, Optional[str], str]] = []
         for req in block_reqs:
             target = by_key.get((req["qualname"], req["sig_hash"]))
+            chunks = req["blocks"].get("chunks", [])
             if target is None:
                 echo(f"[apply] No match for block request '{req['id']}'; skipping")
                 continue
-            if all(c.get("answer") is None for c in req["chunks"]):
+            if all(c.get("answer") is None for c in chunks):
                 echo(f"[apply] Block request '{req['id']}' has no answers; leaving routine untouched")
                 continue
 
             edits: List[Tuple[int, Optional[str], str]] = []
-            for chunk in req["chunks"]:
+            for chunk in chunks:
                 bidx = chunk["bidx"]
                 if not (0 <= bidx < len(target.boundary_lines)):
                     continue

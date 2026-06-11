@@ -3,10 +3,12 @@
 The multi-file run model: positional targets accept files/directories/globs (expanded to a deduped, ordered source
 list); a `--reference` set is captured read-only; `scan_run_files` loads and parses each run file exactly once into
 the retained store the pre-passes share (references are parsed, never summarised). Also guards the CLI rules that
-fail fast (before the model loads): no matches, -o with multiple targets, and single-target-only manifest phases.
+fail fast (before the model loads): no matches, -o with multiple targets (annotate and apply alike), and the
+model-free `--check-manifest` completeness counter (exit 1 with unfilled answers, 0 when complete; no targets needed).
 
 Model-free: the helper tests are pure, and the main() guard tests return before any LLM is loaded.
 """
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -94,9 +96,27 @@ def test_main_guards_fail_fast():
         # -o with multiple targets is rejected.
         assert main([str(f1), str(f2), "-c", "-o", str(root / "out.py")]) == 1
 
-        # Manifest phases are single-target only.
-        assert main([str(f1), str(f2), "-c", "--emit-manifest", str(root / "m.json")]) == 1
-        assert main([str(f1), str(f2), "--apply-manifest", str(root / "m.json")]) == 1
+        # Apply with -o and multiple targets is rejected (multi-target apply patches in place).
+        (root / "m.json").write_text(
+            '{"version": 2, "tool": "scale", "files": [], "requests": []}', encoding="utf-8")
+        assert main([str(f1), str(f2), "--apply-manifest", str(root / "m.json"),
+                     "-o", str(root / "out.py")]) == 1
+
+        # The completeness checker needs no targets: an unfilled manifest exits 1, a filled one 0.
+        (root / "m2.json").write_text(json.dumps({
+            "version": 2, "tool": "scale", "files": [],
+            "requests": [{"id": "fn:f:abc", "qualname": "f", "sig_hash": "abc",
+                          "def": {"answer": None},
+                          "blocks": {"chunks": [{"bidx": 0, "lines": [1, 2], "answer": "NONE"}]}}],
+        }), encoding="utf-8")
+        assert main(["--check-manifest", str(root / "m2.json")]) == 1
+        (root / "m3.json").write_text(json.dumps({
+            "version": 2, "tool": "scale", "files": [],
+            "requests": [{"id": "fn:f:abc", "qualname": "f", "sig_hash": "abc",
+                          "def": {"answer": "A doc."},
+                          "blocks": {"chunks": [{"bidx": 0, "lines": [1, 2], "answer": "NONE"}]}}],
+        }), encoding="utf-8")
+        assert main(["--check-manifest", str(root / "m3.json")]) == 0
 
 
 def test_build_call_graph():

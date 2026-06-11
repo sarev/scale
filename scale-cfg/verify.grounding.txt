@@ -1,0 +1,11 @@
+Here is a routine, and a documentation comment written for it.
+
+The code:
+
+{code}
+
+The comment:
+
+{doc}
+
+List anything this comment claims that the code shown does not do. Judge only against the code shown. If the comment claims nothing the code does not do, reply with the single word NONE. Reply with NONE or the list only - no other commentary.

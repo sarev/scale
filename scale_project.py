@@ -34,6 +34,7 @@ import heapq
 
 from scale_text import summarise, LENGTH_PARAGRAPH
 from scale_log import echo
+import re
 
 
 # Source extensions used when a target/reference path is a directory (so a directory expands to just its source files,
@@ -322,6 +323,174 @@ def scan_run_files(
         out[key] = RunFile(path=f, key=key, is_target=key in target_keys,
                            source_blob=blob, source_lines=lines, language=lang, symbols=provider(blob, lines))
     return out
+
+
+# ============================================================================
+# The file skeleton (model-free distillation for the whole-file description)
+#
+# Summarising a whole source file pays for every body line, yet a file DESCRIPTION draws almost entirely on its
+# signatures, its existing docs, and its header comments. The skeleton renderer distils a file to exactly that -
+# leading comments, function/method signatures, class headers with their method prototypes, C declarations and
+# top-level #defines, and each symbol's existing doc; NO bodies - typically a small fraction of the file, so the
+# description is generated in a single call and map-reduce becomes rare. The guard is binary: a file with no symbols
+# at all (no functions or classes - e.g. a data table or a config) keeps today's whole-file path, map-reduce included.
+# ============================================================================
+
+
+# A C top-level #define (the macro's first line carries its name and intent; a multi-line body is elided).
+_C_DEFINE_RE = re.compile(r"^\s*#\s*define\b")
+
+
+def _leading_zone(source_lines: List[str], language: str) -> List[str]:
+    """
+    Return the file's leading comment zone (shebang, header comments, a Python module docstring) verbatim.
+
+    A line-based scan that stops at the first real code line: it keeps an optional shebang, blank lines, comment lines
+    (`#` for Python; `//` and `/* ... */` blocks for brace languages), and - for Python - a leading triple-quoted
+    module docstring. Trailing blanks are trimmed. This is read-only context for the skeleton; nothing is patched.
+
+    Parameters:
+    - `source_lines`: The source split into lines.
+    - `language`: The resolved language identifier.
+
+    Returns:
+    - The leading-zone lines (possibly empty).
+    """
+
+    out: List[str] = []
+    n = len(source_lines)
+    i = 0
+    if i < n and source_lines[i].lstrip().startswith("#!"):
+        out.append(source_lines[i])
+        i += 1
+
+    closer = None       # the token that ends the comment/docstring block we are inside, or None
+    while i < n:
+        line = source_lines[i]
+        s = line.strip()
+        if closer is not None:
+            out.append(line)
+            if closer in s:
+                closer = None
+            i += 1
+            continue
+        if not s:
+            out.append(line)
+            i += 1
+            continue
+        if language == "python" and (s.startswith('"""') or s.startswith("'''")):
+            quote = s[:3]
+            out.append(line)
+            if not (s.count(quote) >= 2):      # an opening delimiter without its close on the same line
+                closer = quote
+            i += 1
+            continue
+        if language == "python" and s.startswith("#"):
+            out.append(line)
+            i += 1
+            continue
+        if language in ("c", "js") and s.startswith("//"):
+            out.append(line)
+            i += 1
+            continue
+        if language in ("c", "js") and s.startswith("/*"):
+            out.append(line)
+            if "*/" not in s[2:]:
+                closer = "*/"
+            i += 1
+            continue
+        break                                  # the first real code line ends the zone
+
+    while out and not out[-1].strip():
+        out.pop()
+    return out
+
+
+def _skeleton_doc_lines(doc: str, indent: str, language: str) -> List[str]:
+    """
+    Render a symbol's existing documentation for the skeleton, in the language's own doc form.
+
+    Parameters:
+    - `doc`: The (delimiter-stripped) documentation text.
+    - `indent`: The symbol's indentation.
+    - `language`: The resolved language identifier.
+
+    Returns:
+    - The rendered doc lines (Python: a docstring placed under the signature; C/JS: a block comment above it).
+    """
+
+    lines = [ln.rstrip() for ln in (doc or "").splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    if not lines:
+        return []
+    if language == "python":
+        inner = indent + "    "
+        return [f'{inner}"""'] + [f"{inner}{ln}".rstrip() for ln in lines] + [f'{inner}"""']
+    return [f"{indent}/*"] + [f"{indent} * {ln}".rstrip() for ln in lines] + [f"{indent} */"]
+
+
+def render_skeleton(source_lines: List[str], language: str, symbols: List["Symbol"]) -> Optional[str]:
+    """
+    Render a file's model-free skeleton: leading comments, signatures, existing docs, C #defines - no bodies.
+
+    The skeleton is the input to the whole-file description (both the priming-grade pass over the original text and
+    the published pass over the annotated text - the caller picks which text's symbols to render). Symbols appear in
+    source order at their nesting indentation, so a class header is followed by its method prototypes; a C prototype
+    whose definition is in the same file is skipped (the definition's signature already shows it).
+
+    Parameters:
+    - `source_lines`: The source split into lines (signatures and the leading zone are sliced from it).
+    - `language`: The resolved language identifier.
+    - `symbols`: The file's `iter_symbols` records for this same text.
+
+    Returns:
+    - The skeleton text, or None when the file has no symbols at all (the binary guard: such a file - a data table,
+      a script of straight-line code - is summarised whole, by today's path).
+    """
+
+    if not symbols:
+        return None
+
+    parts: List[str] = []
+    zone = _leading_zone(source_lines, language)
+    if zone:
+        parts.extend(zone)
+        parts.append("")
+
+    # C top-level #defines: the macro names and values carry real intent (error codes, limits, feature switches).
+    # Only the first line of a multi-line macro is kept - the name is the signal, not the body.
+    if language == "c":
+        defines = []
+        for ln in source_lines:
+            if _C_DEFINE_RE.match(ln):
+                text = ln.rstrip()
+                if text.endswith("\\"):
+                    text = text.rstrip("\\").rstrip() + " ..."
+                defines.append(text)
+        if defines:
+            parts.extend(defines)
+            parts.append("")
+
+    defined = {s.qualname for s in symbols if s.kind != "declaration"}
+    for sym in sorted(symbols, key=lambda s: s.start):
+        if sym.kind == "declaration" and sym.qualname in defined:
+            continue                            # the definition's signature already shows this prototype
+        indent = "    " * max(0, sym.depth)
+        signature = "\n".join(f"{indent}{ln.strip()}" if i else f"{indent}{ln.rstrip()}"
+                              for i, ln in enumerate((sym.signature or "").splitlines()))
+        doc = _skeleton_doc_lines(sym.existing_doc, indent, language)
+        if language == "python":
+            parts.append(signature)        # a Python doc reads as a docstring under its signature
+            parts.extend(doc)
+        else:
+            parts.extend(doc)              # a C/JS doc comment sits above its signature
+            parts.append(signature)
+        parts.append("")
+
+    while parts and not parts[-1].strip():
+        parts.pop()
+    return "\n".join(parts)
 
 
 def resolve_project_doc(project_doc_arg: str, start: Path) -> Optional[Path]:
