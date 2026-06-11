@@ -798,6 +798,33 @@ def _generate_file_summary(
     return _reflow_if_listy(llm, summary_cfg, base_messages, result, SUMMARY_MAX_TOKENS)
 
 
+def _head_crop(text: str, llm: LocalChatModel, budget_tokens: int) -> str:
+    """
+    Keep the leading lines of `text` that fit a token budget (a cheap head crop for a one-line direct summary).
+
+    A file's top - includes/imports and the first definitions - carries enough to say what the file is, so the head
+    is kept and the tail dropped when the whole file would not fit. Returned unchanged if it already fits.
+
+    Parameters:
+    - `text`: The source text.
+    - `llm`: A model exposing `estimate_tokens`.
+    - `budget_tokens`: The maximum estimated tokens to keep.
+
+    Returns:
+    - The text, or its leading lines up to the budget.
+    """
+
+    if llm.estimate_tokens(text) <= budget_tokens:
+        return text
+    kept: List[str] = []
+    for line in text.splitlines():
+        kept.append(line)
+        if llm.estimate_tokens("\n".join(kept)) > budget_tokens:
+            kept.pop()
+            break
+    return "\n".join(kept)
+
+
 def _get_file_summary(
     llm: LocalChatModel,
     cfg: GenerationConfig,
@@ -855,9 +882,11 @@ def _get_short_summary(
     """
     Return the squashed file description used to prime the (context-starved) definition pass.
 
-    The short summary is a one/two-sentence condensation of the full file description, so it stays consistent with it
-    while spending almost no context - the definition pass cares far more about the routine body than a detailed file
-    overview. It is cached alongside the full summary (same content-hash invalidation).
+    The short summary is a one/two-sentence note giving quick context while spending almost no window - the definition
+    pass cares far more about the routine body than a detailed file overview. When a full description already exists
+    (this file is a target whose file-doc/block pass produced one) it is condensed from that, so the two stay
+    consistent; otherwise (a reference file, or a `-c`-only run) it is generated straight from the source, so we never
+    pay for a full map-reduced description only to squash it. Cached alongside the full summary (same content-hash key).
 
     Parameters:
     - `llm`: The LocalChatModel instance.
@@ -878,15 +907,27 @@ def _get_short_summary(
         echo("Loaded short source summary from cache...")
         return cache.short
 
-    # Condense the full description (generated/cached on demand) into a quick one/two-sentence note.
-    full = _get_file_summary(llm, cfg, scale_path, src_path, source_blob, language, base_messages, no_cache=no_cache)
-    echo("Condensing the file description for the definition pass...")
     instruction = (_read_optional(scale_path / "summary.short.txt") or SHORT_SUMMARY_INSTRUCTION).replace(
         "{language}", language)
     short_cfg = replace(cfg, max_new_tokens=SHORT_SUMMARY_MAX_TOKENS)
-    short = summarise(llm, short_cfg, full, LENGTH_LINE, base_messages=base_messages,
-                      subject=f"a fuller description of a {language} source file",
-                      max_tokens=SHORT_SUMMARY_MAX_TOKENS, instruction=instruction)
+
+    # Lazy: if a full file description already exists (a target whose file-doc/block pass produced it), condense that
+    # so the short stays consistent with the header. Otherwise - a read-only reference, or a definition-only (`-c`)
+    # run that never needs the full - summarise the source DIRECTLY into one line, rather than generating a full
+    # (possibly map-reduced) description only to squash it and throw it away.
+    full = cache.summary if (no_cache is False and cache.summary) else None
+    if full:
+        echo("Condensing the file description for the definition pass...")
+        short = summarise(llm, short_cfg, full, LENGTH_LINE, base_messages=base_messages,
+                          subject=f"a fuller description of a {language} source file",
+                          max_tokens=SHORT_SUMMARY_MAX_TOKENS, instruction=instruction)
+    else:
+        echo("Summarising the source directly into a one-line description...")
+        budget = max(256, llm.n_ctx - llm.ctx_margin - SHORT_SUMMARY_MAX_TOKENS
+                     - llm.count_tokens(base_messages) - SUMMARY_WRAPPER_TOKENS)
+        short = summarise(llm, short_cfg, _head_crop(source_blob, llm, budget), LENGTH_LINE,
+                          base_messages=base_messages, subject=f"a {language} source file",
+                          max_tokens=SHORT_SUMMARY_MAX_TOKENS, instruction=instruction)
     cache.short = short
     return short
 

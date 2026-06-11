@@ -26,7 +26,7 @@ from scale_filedoc import FileDocTarget, scan_brace_leading_zone
 from scale_llm import LocalChatModel, GenerationConfig, Messages, Chunk
 from scale_log import echo
 from scale_project import Symbol, apply_doc_order
-from scale_text import fit_snippet, MARKER_C
+from scale_text import fit_snippet, MARKER_C, PRIMING_ACK
 from tree_sitter import Parser, Language  # type: ignore
 from tree_sitter_c import language as c_language
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -432,19 +432,19 @@ def describe_includes_c(
     """
     Build a list of #includes from the source code and feed it to the LLM as extra context.
 
-    This method mirrors the Python/JS flow by echoing the includes, then pushing a short 'OK' acknowledgement prompt.
-    It collects the includes using `_collect_includes_c`, formats them into a payload, and appends a prompt to the message list.
-    The LLM is then asked to generate a response based on the updated message list, which is echoed back to the user.
+    The includes are echoed and pushed as a context turn followed by a **fixed acknowledgement we supply ourselves**
+    (`PRIMING_ACK`) - the model is not asked to generate an "OK". Making a small model parrot "OK" during priming
+    conditions it to answer the first real request with "OK" too, and the round trip is a wasted generation call.
 
     Parameters:
-    - `llm`: The LocalChatModel instance used for LLM interactions.
-    - `cfg`: The GenerationConfig instance used for LLM generation.
+    - `llm`: The LocalChatModel instance (unused now the acknowledgement is supplied, kept for signature symmetry).
+    - `cfg`: The GenerationConfig instance (unused; kept for signature symmetry).
     - `messages`: The Messages instance used for storing and sending messages.
     - `tree`: The parsed Tree-sitter tree for the source.
     - `source_bytes`: The (normalised) source bytes the tree was parsed from.
 
     Notes:
-    This method does not return any value, as it is designed to update the message list and prompt the LLM for a response.
+    This method does not return any value, as it is designed to update the message list in place.
     """
 
     items = _collect_includes_c(tree, source_bytes)
@@ -456,14 +456,10 @@ def describe_includes_c(
     echo(f"\n[C] Includes...\n{payload}")
     prompt = (
         "For additional context, here is a list of includes within this program:\n\n"
-        f"{payload}\n\n"
-        "Please respond by saying 'OK'. No other commentary is required at this time."
+        f"{payload}"
     )
     messages.append({"role": "user", "content": prompt})
-
-    reply = llm.generate(messages, cfg=cfg)
-    echo(f"\n[C] LLM output: {reply}")
-    messages.append({"role": "assistant", "content": reply})
+    messages.append({"role": "assistant", "content": PRIMING_ACK})
 
 
 # ---------------- Collect function definitions (ignores forward declarations)

@@ -71,9 +71,10 @@ def main():
         msgs = prime_llm_for_comments(stub, GenerationConfig(), SCALE_CFG, Path("x.py"),
                                       source_blob=SRC, language="python", no_cache=True)
 
-    # The definition pass primes with the SHORT file description, which is a squash of the full one: two summary
-    # generations (full, then condensation), and no ack turns.
-    assert stub.calls == 2, f"priming should generate the full + short summary only, not acks; made {stub.calls} calls"
+    # The definition pass primes with the SHORT file description. With no full description cached and no file-doc/block
+    # pass to need one, the short is generated DIRECTLY from the source - one summary call, not a full-then-condense
+    # pair - and no ack turns are generated (they are supplied).
+    assert stub.calls == 1, f"priming should generate the short summary directly (one call), not acks; made {stub.calls}"
     assert not any(m["role"] == "assistant" and m["content"].strip().upper() == "OK" for m in msgs), \
         "no priming turn may be a bare 'OK' (that conditions the model to reply OK to the first real task)"
     assert any(m["role"] == "assistant" and m["content"] == PRIMING_ACK for m in msgs), \

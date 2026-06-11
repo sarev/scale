@@ -44,7 +44,7 @@ from scale_filedoc import FileDocTarget, scan_brace_leading_zone
 from scale_llm import LocalChatModel, GenerationConfig, Messages, Chunk
 from scale_log import echo
 from scale_project import Symbol, apply_doc_order
-from scale_text import fit_snippet, MARKER_JS
+from scale_text import fit_snippet, MARKER_JS, PRIMING_ACK
 from tree_sitter import Parser, Language
 from tree_sitter_javascript import language as js_language
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -486,14 +486,12 @@ def describe_imports_js(
     echo(f"\n[JS] Imports...\n{payload}")
     prompt = (
         "For additional context, here is a list of imports within this program:\n\n"
-        f"{payload}\n\n"
-        "Please respond by saying 'OK'. No other commentary is required at this time."
+        f"{payload}"
     )
     messages.append({"role": "user", "content": prompt})
-
-    reply = llm.generate(messages, cfg=cfg)
-    echo(f"\n[JS] LLM output:\n\n{reply}")
-    messages.append({"role": "assistant", "content": reply})
+    # A fixed acknowledgement we supply ourselves (not a model-generated "OK") - saves a generation call and avoids
+    # conditioning a small model to answer the first real request with "OK" too (see PRIMING_ACK).
+    messages.append({"role": "assistant", "content": PRIMING_ACK})
 
 
 # ---- Qualname extraction ----------------------------------------------------
