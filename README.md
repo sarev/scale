@@ -1,290 +1,211 @@
 # SCALE — Source Code Annotation with LLM Engine
 
-SCALE is a local, scriptable tool that adds or updates code comments and docstrings using an on-device LLM loaded via `llama.cpp`. It is designed to slot into existing build or CI pipelines and to operate deterministically with tight output control.
+SCALE writes and updates code comments using a local LLM. Point it at Python, C, or JavaScript source and it adds docstrings and header comments to every routine, paragraphs and comments the insides of long functions, and writes a top-of-file description — while guaranteeing that the code itself is untouched.
 
-While SCALE can take a lot of the pain out of creating and maintaining comments on a codebase, you should still review its output and potentially make an editorial pass - just like you would in a code review of a team mate's work.
+That guarantee is structural, not a promise about model behaviour: SCALE parses your source, asks the model only for comment text, and patches that text into the original file. The model never re-emits your code, so executable code, indentation, blank lines, and comments it wasn't asked to touch are preserved byte-for-byte. If a generated comment can't be placed safely, it is dropped rather than risked.
+
+Everything runs on your own machine via `llama.cpp` and a GGUF model — no code leaves your system unless you opt into the Claude Code integration described below. You should still review the output, as you would a teammate's pull request, but you'll be editing prose, not untangling broken code.
 
 ![Illustration](./scale.png)
 
-## What it Does
+## What it writes
 
-SCALE will ingest a source file, parse it to find routines (functions, methods, classes) and will create one
-comment per routine, following the comment style template (as defined in "scale-cfg"). The output will include these comments but aims to avoid touching the code itself, thus there should be no functional/behaviour change to the program, only the main comments on each routine are touched.
+Each kind of comment is a separate pass; enable any combination in one run.
 
-You are encouraged to look at the templates in "scale-cfg" and to adjust them to suit your needs (style guides, etc.) and your specific codebase. The more the examples provided in these files align with the code you are likely to process, the more effective SCALE will be in useful comment generation. There is one template per supported language.
+| Pass | Flag | What you get |
+| --- | --- | --- |
+| Definition docs | `-c` | A docstring (Python) or header comment (C/JS) for every function, method, and class |
+| Block comments | `--block-comments low\|medium\|high` | Long function bodies split into logical paragraphs, with a comment on each group that earns one (`--block-spacing` for paragraphing only) |
+| File description | `--file-doc` | A top-of-file summary of what the file is for — shebangs, copyright, and licence blocks preserved exactly |
+| C doc-sites | `--doc-site auto` | When C headers and sources are annotated together, public functions are documented on their header prototype — where API users actually read |
 
-The "scale-cfg/comment.txt" file is the main 'system prompt' which SCALE passes into the LLM to guide its behaviour. You may also want to edit this, but in general this shouldn't be necessary.
+Existing documentation is an input, not an obstacle: SCALE reads what's already there and updates it, so hand-written rationale ("we retry because the vendor API is flaky") is carried forward rather than flattened into a description of the code.
 
-## How it Works
+## Quality controls
 
-Using Python as an example, SCALE will find every "class", "def", and "async def" in the input file and process
-them from the most deeply-nested up. For example:
+A small local model writes plausible prose; left unchecked, some of it would be wrong or worthless. SCALE doesn't trust it:
 
-```python
-class Foo:
-  ...some class attributes...
-  def __init__():
-    ...some of __init__ body...
-    def bah():
-      def mad():
-        ...more deeply nested function...
-      ...nested function...
-    ...remainder of __init__ body...
-```
+- **Claims are verified against the code.** Every generated comment is challenged in a fresh model context — do the things it names actually appear in the source? Is it telling the reader something the code doesn't already say? Failures are regenerated once, then dropped, flagged in the run output, or set aside for a stronger model.
+- **Restatements are filtered.** A comment that just narrates the line below it ("increment the counter") is rejected. The density knob (`low`/`medium`/`high`) sets how strict this is.
+- **Completion is counted, not assumed.** Multi-file runs track every routine; nothing is silently skipped.
 
-The commenting process will start by ingesting the whole source file and asking the LLM to create a summary description of it. This summary is provided to the LLM for each subsequent comment-generation turn. It is useful to give SCALE some understanding of the whole file, because it helps with comprehension of each function, class, and method as it is processing, but we just use the summary to help keep the context window small (i.e. to help performance).
+The prompt templates live in `scale-cfg/` as plain text files. Edit them to match your house style — comment format, tone, what a good comment looks like in your codebase. No code changes needed.
 
-Then, the parser looks for all imports in the program (if any) and outputs that list for the LLM, because this can provide critical contextual information (e.g. `import numpy as np` is important for knowing what `np` means when encountered in the code).
+## Project awareness
 
-The 'conversation' that is maintained during this process is between the 'user' (the tool) and the 'assistant'
-(the LLM). On each turn, the user asks the assistant to generate a comment for the block of code they have
-supplied (a function, method, or class). These turns are not recorded, so the LLM isn't building an
-ever-increasing context window - we discard each chunk once it's done. All the LLM has to go on is:
+Annotating a file in isolation produces isolated-sounding docs. SCALE can do better:
 
-1. The system prompt
-2. The summary of the program as a whole
-3. The comment template prompt
-4. A list of any imports/includes (or similar) found in the program
-5. The function/method/class it's been asked to generate a comment for
+- **Multi-file runs.** Targets accept files, directories, and globs; multiple targets are annotated in place in one model load.
+- **Call-graph ordering.** Within a run, callees are documented before their callers, and each routine's prompt includes one-line contracts for the functions it calls — so a caller's docs can say *why* it delegates, not just that it does.
+- **Read-only references.** `--reference include/` parses extra files (e.g. your headers) for context without ever editing them.
+- **Project blurb.** `--project-doc` feeds every pass a short description of the wider project (auto-detected from a nearby `README`/`CLAUDE.md`), so file descriptions know their place in the system.
 
-In the Python example above, SCALE will extract the `mad()` function - its signature, any preceding decorators, and the body code - and write the docstring for it. If there was already a docstring following the signature, that will be updated/replaced.
+## Claude Code integration — and why
 
-Next, SCALE will move to `bah()`. It will keep the signature of `mad()` but just include the (new) docstring. The body code for `mad()` is discarded, as it is a potential distraction. In a way, the LLM is 'remembering' the nested function `mad()` because it has been given the docstring (it generated earlier) for it.
+A local 7B model is fast, free, and private, and for most routines it writes perfectly serviceable documentation. But some routines are genuinely hard — dense logic, subtle contracts — and that's exactly where a weak model's prose stops being trustworthy. Sending the *whole* codebase to a frontier model would fix quality but costs money and privacy on the 95% that didn't need it.
 
-Once we have the docstring for `bah()`, we can move on to `__init__()`. Again, the body of `bah()` is replaced with just its docstring here and `mad()` is removed altogether. Thus, SCALE is only looking at the code directly within the scope of `__init__()` and the signatures and docstrings for any functions that are immediately nested within (and not any more deeply nested ones).
-
-Finally, it reaches class `Foo`. It will look at the class signature (and any preceding decorators) and the signatures and docstrings of the methods - in this case, just `__init__()`. So the comment generated for the class will be based upon a collective assessment of what all the method docstrings say, plus whatever class attributes there might be (as well as any pre-existing docstring the class may have had).
-
-Once all the docstrings have been generated, the original source code is patched to place them into the correct locations, replacing any pre-existing docstrings as required. This patching process ensures that the executable code, indentation, other comments and empty lines are all preserved without any risk of the LLM inadvertently editing them or hallucinating more code!
-
-### Language Support
-
-| Language   | Parser / approach            | Comments generated                                                  |
-| ---------- | ---------------------------- | ------------------------------------------------------------------- |
-| Python     | CPython `ast`                | Docstrings for classes/functions/methods; import list passed to LLM |
-| JavaScript | Tree-sitter (ESM + CommonJS) | JSDoc for functions/classes; import/require list passed to LLM      |
-| C          | Tree-sitter                  | Function comments; `#include` list passed to LLM                    |
-
-### Line Endings and Encoding
-
-SCALE detects the dominant line ending (LF/CR/CRLF), preserves trailing newlines, and writes exactly what you specify. Files are treated as UTF-8 with `surrogateescape` to preserve undecodable bytes during round-trip. This avoids platform newline translation and keeps arbitrary input bytes intact.
-
-### Large Files and Functions
-
-SCALE copes with source that is larger than the model's context window, using two tricks. Because comments are patched into the parsed source (and the LLM never re-emits code), reducing what the model *reads* never risks the output:
-
-* **Files too large to summarise in one pass** are summarised by *map-reduce*: the file is split into context-sized chunks, each chunk is summarised, and those partial summaries are combined into one overall summary (recursively if needed). The final summary is capped in length so the priming context stays small no matter how big the file is.
-* **Functions/classes too large for the context window** have their body *elided* for the model: the signature plus the head and tail of the body are kept and the middle is replaced with a `... N lines omitted ...` marker. The comment is written from that partial view; the real code is untouched, so nothing is lost in the output.
-
-Both behaviours trigger automatically based on the configured context size (`--n-ctx`) and are reported on `--verbose` runs.
-
-## Using SCALE (typical)
-
-Install the dependencies, download an LLM in GGUF format and then:
+SCALE splits the difference. The local model does the volume, and the hard cases are collected into a **manifest**: a single JSON file of self-contained work units (the routine's code plus context, and an empty slot for the answer). A stronger model fills in the slots; SCALE applies the answers back through the same code-preserving patcher, and a completeness check counts what's still unfilled. Routines are escalated for concrete reasons — cognitive complexity above a threshold (`--escalate-cognitive 10`), comments that twice failed verification, or C header prototypes whose docs define a public API contract.
 
 ```bash
-# Generate comments/docstrings for a source file with a local GGUF model
-python scale.py --model /path/to/model.gguf --comment /path/to/file.py --output /path/to/output.py --verbose
-
-# Generate comments and update the file in place (short form command line switches)
-python scale.py -m /path/to/model.gguf -c /path/to/file.py -o /path/to/file.py -v
+python scale.py -c --block-comments medium -l c --escalate-cognitive 10 \
+    --emit-manifest scale-manifest.json "src/*.c"      # local model does the bulk
+# ...a stronger model fills in the manifest answers...
+python scale.py --check-manifest scale-manifest.json   # exits non-zero until complete
+python scale.py -l c --apply-manifest scale-manifest.json "src/*.c"   # no model loaded
 ```
 
-Use `--help` for more guidance on the CLI interface.
+The repository ships a Claude Code skill (`.claude/skills/scale/`) that drives this loop end-to-end: ask Claude Code to "scale" some files and it runs the local pass, fills the manifest itself, applies the answers, and verifies the counts. Claude only ever sees the deferred routines, and its answers go through the same machinery as everything else.
 
-You can override LLM features, such as the chat format detection (`--format`), temperature/top-p/top-k, repeat penalty, context size, batch size, and GPU offload layers to suit different models, hardware and quantisations.
+**None of this is required.** Skip the manifest flags and SCALE is a fully offline tool — every pass, including verification, runs entirely on your own hardware.
 
-## Extensibility
+## Using SCALE
 
-* Add new languages by implementing a `generate_language_comments` function matching the Python worker’s interface and wiring it in the dispatcher. 
-* Extend or swap prompt templates by editing files under `scale-cfg` without changing code. 
+```bash
+# Docstrings for every routine in a file, written to a new file
+python scale.py -c src/parser.py -o out/parser.py -v
+
+# In place, adding paragraphing and block comments inside long bodies
+python scale.py -c --block-comments medium src/parser.py -o src/parser.py -v
+
+# The works, for a C codebase: sources + headers together, API docs on the prototypes
+python scale.py -c --block-comments medium --file-doc -l c \
+    "src/*.c" "include/*.h" --doc-site auto -v
+```
+
+Useful to know:
+
+- Multiple targets are annotated **in place** (commit first); a single target may use `-o`; with no `-o`, output goes to stdout.
+- `-m /path/model.gguf` selects the model. The default path is `models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF/Qwen2.5.1-Coder-7B-Instruct-Q5_K_M.gguf` under the project root.
+- `-l python|c|js` forces the language — recommended, since auto-detection reads the content, not the file extension.
+- Runtime knobs (`--n-ctx`, `--n-batch`, GPU offload, sampling) are exposed for tuning to your hardware; `--help` lists everything, and [docs/cli.md](docs/cli.md) has a worked example for every flag.
+
+Files larger than the model's context window are handled automatically (summarised in chunks; oversized bodies elided from the model's *view* only), and binary-safe I/O preserves your line endings and any unusual bytes exactly.
+
+## Language support
+
+| Language | Parser | Definition docs | Block comments | File description |
+| --- | --- | --- | --- | --- |
+| Python | CPython `ast` | docstrings | ✓ | module docstring |
+| C | tree-sitter | header comments (+ `--doc-site`) | ✓ | header comment |
+| JavaScript | tree-sitter (ESM + CommonJS) | JSDoc | ✓ | header comment |
+
+Adding a language means implementing one well-defined worker interface; see [docs/architecture.md](docs/architecture.md).
 
 ## Tests
 
-SCALE ships with a small suite of fast, self-contained tests under `tests/`. They require **no GGUF model** — the LLM is stubbed and only the parsing, patching, and caching logic is exercised, so the whole suite runs in a second or two inside your virtual environment:
+`tests/` contains a fast, self-contained regression suite — no model needed (the LLM is stubbed), so it runs in seconds:
 
 ```bash
-python tests/run_all.py          # run everything, with a pass/fail summary
-python tests/test_inline_def.py  # or run an individual test
+python tests/run_all.py    # everything, with a pass/fail summary; non-zero exit on failure
 ```
 
-Each test guards against a specific regression — for example, that the whole-file summary is actually sent to the model, that inline one-line definitions are never corrupted, that same-named definitions don't share a comment, and that bare-`\r` line endings map to the correct lines. A non-zero exit code means at least one test failed.
+## Scope and limits
 
-## Current Scope and Limits
-
-* The current implementation only supports Python, C and JavaScript source code.
-* Quality and speed depend on the chosen model, GGUF quant, context size and GPU memory. The wrapper exposes these controls but does not auto-tune them to your system.
-* This has been tested on a Windows 11 laptop with an NVIDIA RTX 4060 mobile GPU. Better hardware than this will be able to utilise stronger LLMs.
+- Python, C, and JavaScript only, for now.
+- Output quality tracks the model you give it. A code-tuned 7B writes good summaries and serviceable walkthroughs; genuinely insightful commentary on the hardest routines is what the escalation path is for.
+- SCALE cannot invent institutional knowledge — design rationale and cross-system context that only live in someone's head. Where that knowledge is already written down, it is preserved and updated; where it isn't, you still need a human.
 
 ## Picking an LLM
 
-Most LLMs are pretty huge! Several GiB up to several **hundred** GiB.
+Models in GGUF format are downloaded from [HuggingFace](https://huggingface.co/models?library=gguf&sort=trending). The default — and the best of those tested for comment quality — is [bartowski/Qwen2.5.1-Coder-7B-Instruct](https://huggingface.co/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF), a code-specialised 7B whose Q5_K_M quant is ~5.2 GB.
 
-As a rule of thumb, if your GPU has 8 GiB of VRAM, you should use a model with around that many parameters or fewer **and** you will probably need it to be 'quantised'. If a model has 8 billion parameters (i.e. fairly small!) and uses 16-bit floats, that's two bytes per parameter (16 GiB). Quantising squashes all the float values into smaller representations, e.g. 8, 6 or even 4 bits, at the cost of accuracy (the model becomes a little bit dumber). For example, an 8 billion parameter model with 4-bit quantisation will only require 8 x 0.5 byte = 4 GiB of VRAM.
+Rule of thumb for sizing: a model needs roughly *parameters × bytes-per-parameter* of VRAM, plus 25–30% headroom for the context window. Quantisation shrinks bytes-per-parameter (Q4 ≈ half a byte) at a small cost in smarts. On an 8 GB GPU, a 7–8B model at Q5–Q6 with a ~12k context is the comfortable ceiling; spill past your VRAM and performance falls off a cliff.
 
-However, you _also_ need a chunk of VRAM to work with while the LLM is running, in addition to loading the model itself. Typically you should leave maybe 25% - 30% of your VRAM available for workspace. One reason is to hold the 'context window' for the model. The larger the context window (how much conversation the LLM can see at any given time) the more VRAM you need available in addition to the model - or things will spill to RAM and disc during execution, killing performance.
+### GPU tier list
 
-On my RTX 4060 laptop GPU with 8 GiB of RAM, I found that I could get away with an 8 billion parameter, 6 bit quantised LLM and have room for 12k tokens of context window. Much more than that, and my system would start thrashing to CPU/disc. Better GPUs would be able to load significantly larger (quantised) models and/or have much larger context windows.
-
-# Installation Guide for Linux Users
-
-Most Linux systems will come with Python 3.xx pre-installed. This guide assumes you are on a Debian-based OS and _haven't_ got Python installed yet. You have a recent NVIDIA GPU but haven't yet installed the drivers.
-
-```bash
-# Basic Python components
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip python3-dev build-essential git cmake pkg-config
-
-# Add contrib and non-free-firmware components
-sudo sed -i 's/main$/main contrib non-free-firmware/' /etc/apt/sources.list
-sudo apt update
-
-# Install the packaged NVIDIA driver - skip to the virtual environment steps if you don't have a GPU
-sudo apt install -y nvidia-driver
-
-# Reboot to load the driver
-sudo reboot
-
-# Verify CUDA available (and which version you have)
-nvidia-smi
-
-# Create Python virtual environment
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -U pip setuptools wheel
-
-# Install Python deps used by SCALE
-pip install -U tree-sitter tree-sitter-c tree-sitter-javascript huggingface-hub
-
-# Install llama.cpp bindings...
-
-# Use the wheel index that hosts CUDA-enabled builds (cuXXX is your CUDA version)
-pip install -U "llama-cpp-python[cuda]" --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
-
-# If you can't find a matching wheel, you can compile with...
-export CMAKE_ARGS="-DLLAMA_CUDA=on -DLLAMA_CUBLAS=on"
-export FORCE_CMAKE=1
-pip install -U llama-cpp-python
-
-# If you don't even have CUDA/NVIDIA GPU, use a CPU-only build (very slow!)
-pip install -U llama-cpp-python
-
-# Get SCALE. If you already have the repo contents in ./scale, skip the clone
-git clone https://github.com/sarev/scale.git
-cd scale
-
-# Download a local LLM from https://huggingface.co/models?library=gguf&sort=trending
-
-# Log in (opens a browser or takes a token)
-huggingface-cli login
-
-# Make a local models folder
-mkdir -p models
-
-# Download a quantised GGUF - this can take a loooong time...
-# Qwen2.5.1-Coder-7B-Instruct is the default model and gave the best comments of
-# those tested (a code-specialised 7B; the Q5_K_M quant is ~5.2GB).
-huggingface-cli download \
-  bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF \
-  --include "*Q5_K_M.gguf" \
-  --local-dir models \
-  --local-dir-use-symlinks False
-
-MODEL_PATH="models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF/Qwen2.5.1-Coder-7B-Instruct-Q5_K_M.gguf"
-
-# Example: annotate a Python file
-python scale.py \
-  --model "$MODEL_PATH" \
-  --comment path/to/input.py \
-  --output  out/annotated.py \
-  --verbose
-```
-
-# Installation Guide for Windows Users
-
-I've included a lot of optional steps below. Skip over them if you just want to try SCALE out - these are only really useful for people who are looking to have more of a play (e.g. write extensions, use other AI and ML related Python components, such as tensorflow, mediapipe, transformers, StableDiffusion, pycuda, etc.)
-
-## Python
-
-SCALE is written in Python, so you'll need to have that installed. Most Linux distros will come with this by default. If not, you'll need to `sudo apt -y install python3` or similar.
-
-For Windows, you should download and install a copy of [Python 3.xx for Windows](https://www.python.org/downloads/windows/). I would typically go for a stable release that's a couple of versions older than the latest one, e.g. if the latest is 3.14.x, then I'd find and install 3.12.x. This is because a lot of the (huge and complex) Python suites that relate to AI and ML are quite slow-moving and have a lot of dependencies. If you're on the bleeding edge, you're usually ahead of what all of those support.
-
-Make sure you tick any options to add Python to your PATH during the installation procedure!
-
-## Create and Initialise a Python venv
-
-Assuming you've created a folder called 'scale' and put all of these files into it, you should create a 'virtual environment', which is just a local folder containing a copy of the Python interpreter (and other bits) and is where all of the installed packages will go. This avoids installing everything globally and potentially clashing with whatever you already have installed. 
-
-```bash
-cd scale
-python -m venv env
-
-# if you're running in bash on Windows
-. env/Scripts/activate
-# if you're running in PowerShell
-.\env\Scripts\Activate.ps1
-
-# Update the venv    
-python -m pip install --upgrade pip wheel setuptools
-```
-
-## Install Tree-sitter (language parser framework)
-
-SCALE works with current versions of these modules (tested with `tree-sitter` 0.25, `tree-sitter-c` 0.24, `tree-sitter-javascript` 0.25). The core runtime and the grammar packages share an internal ABI, so install/upgrade all three together rather than mixing old and new.
-
-```bash
-pip install -U tree-sitter tree-sitter-c tree-sitter-javascript
-```
-
-## Install the CUDA-aware llama-cpp (large language models)
-
-`llama-cpp` is the mechanism through which SCALE loads and interacts with a Large Language Model. The precise version of 'llama-cpp' depends upon the host system configuration (OS and CPU architecture), Python version, and which GPU you have (if any).
-
-Assuming you have a recent NVIDIA GPU, you should run this command to figure out your CUDA version:
-    `nvidia-smi`
-
-In my case, it's 12.4.
-
-If you don't have a suitable GPU, there are other flavours of llama-cpp-python that you can install, including a CPU-only version (which will probably be very slow!).
-
-In my example, where I have Windows 11 64-bit, Python 3.11.9, and NVIDIA CUDA 12.4, I chose to install a pre-build binary 'wheel' of `llama-cpp` and its Python bindings:
-
-```bash
-pip install --no-cache-dir --force-reinstall https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.4-cu124/llama_cpp_python-0.3.4-cp311-cp311-win_amd64.whl
-```
-
-You can have a look around pages like [this](https://abetlen.github.io/llama-cpp-python/whl/cu124/llama-cpp-python/) to see which wheels exist and hopefully find one that works on your system. 
-
-## Download a Large Language Model...
-
-You'll likely need to sign up to [HuggingFace](ttps://huggingface.co/models?library=gguf&sort=trending) and there are various models require you to request access, which is straightforward and usually pretty quick. `llama-cpp` requires local (downloaded) models to use the `GGUF` format, so you need to find a model that includes files of that type. If it has just "\*.safetensors" files it won't work.
-
-I have tried various models, notably:
-
-- [bartowski/Qwen2.5.1-Coder-7B-Instruct](https://huggingface.co/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF) - **the default**, and the best of those tested for generating comments (a code-specialised 7B).
-- [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF?show_file_info=qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf)
-- [bartowski/Meta-Llama-3.1-8B-Instruct](https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF?show_file_info=Meta-Llama-3.1-8B-Instruct-Q6_K.gguf)
-
-```bash
-pip install -U "huggingface_hub[cli]"
-hf auth login ...your login details...
-hf download bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF --include "*Q5_K_M.gguf" --local-dir models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF
-```
-
-Note the `--local-dir`: SCALE's default model path is `models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF/Qwen2.5.1-Coder-7B-Instruct-Q5_K_M.gguf` relative to the project root, so downloading to that directory means no `-m` flag is needed. (`hf` is the current HuggingFace CLI name; `huggingface-cli` still works as a deprecated alias.)
-
-# GPU Tier List
-
-Here's a slightly silly tier list of relative performance of GPU rigs for this sort of processing...
+A slightly silly tier list for this sort of processing:
 
 * **S**: H200, H100, A100, B200; multi-GPU rigs. Frontier training and huge local inference. Not consumer.
 * **A**: RTX 5090 (32 GB). Top-end consumer. 20B+ local models comfortably, very long contexts, high throughput.
 * **B**: RTX 4090 (24 GB), 4080/4070 Ti/Super, 3090. 13B–20B workable, long contexts at good speed.
 * **C**: RTX 4070 desktop, 4060 desktop. 7–13B smooth in Q4–Q5, modest long-context.
-* **D**: RTX 4060 Laptop 8 GB (my machine), 4050 Laptop 6 GB. 7–8B decent in Q4, 13B only with compromises.
+* **D**: RTX 4060 Laptop 8 GB, 4050 Laptop 6 GB. 7–8B decent in Q4, 13B only with compromises.
 * **E**: RTX 3050/1650 class laptops, older Quadros. 7B OK, anything larger is painful.
 * **F**: CPU-only or iGPU. Proof-of-concept only (awful!).
+
+## Installation — Linux
+
+Assumes a Debian-based system with an NVIDIA GPU and nothing installed yet; skip the steps you already have.
+
+```bash
+# Python and build tools
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip python3-dev build-essential git cmake pkg-config
+
+# NVIDIA driver (skip without a GPU); needs contrib/non-free-firmware enabled
+sudo sed -i 's/main$/main contrib non-free-firmware/' /etc/apt/sources.list
+sudo apt update
+sudo apt install -y nvidia-driver
+sudo reboot
+
+# Verify the driver and note your CUDA version
+nvidia-smi
+
+# Get SCALE and create a virtual environment
+git clone https://github.com/sarev/scale.git
+cd scale
+python3 -m venv env
+. env/bin/activate
+python -m pip install -U pip setuptools wheel
+
+# Parsers. The tree-sitter runtime and grammars share an ABI - install all three together.
+pip install -U tree-sitter tree-sitter-c tree-sitter-javascript
+
+# llama.cpp bindings - pick ONE of these:
+# (a) CUDA wheel (cuXXX = your CUDA version from nvidia-smi)
+pip install -U llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+# (b) build from source with CUDA
+CMAKE_ARGS="-DGGML_CUDA=on" FORCE_CMAKE=1 pip install -U llama-cpp-python
+# (c) CPU-only (very slow!)
+pip install -U llama-cpp-python
+
+# Download the default model (~5.2 GB) to where SCALE looks for it
+pip install -U "huggingface_hub[cli]"
+hf download bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF --include "*Q5_K_M.gguf" \
+    --local-dir models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF
+
+# Annotate something
+python scale.py -c path/to/input.py -o out/annotated.py -v
+```
+
+## Installation — Windows
+
+Install [Python 3.x for Windows](https://www.python.org/downloads/windows/) — a stable release a version or two behind the latest is the safe choice, since prebuilt ML wheels lag the newest Python. Tick the option to add Python to your PATH.
+
+```bash
+# From the SCALE checkout (bash syntax; for PowerShell activate with .\env\Scripts\Activate.ps1)
+python -m venv env
+. env/Scripts/activate
+python -m pip install --upgrade pip wheel setuptools
+
+# Parsers. The tree-sitter runtime and grammars share an ABI - install all three together.
+pip install -U tree-sitter tree-sitter-c tree-sitter-javascript
+```
+
+For the llama.cpp bindings, run `nvidia-smi` to find your CUDA version, then install a matching prebuilt wheel — browse the [release pages](https://github.com/abetlen/llama-cpp-python/releases) or the [wheel index](https://abetlen.github.io/llama-cpp-python/whl/cu124/llama-cpp-python/) for your OS / Python / CUDA combination. For example (Windows 11 x64, Python 3.11, CUDA 12.4):
+
+```bash
+pip install --no-cache-dir --force-reinstall https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.4-cu124/llama_cpp_python-0.3.4-cp311-cp311-win_amd64.whl
+```
+
+CPU-only builds exist too (`pip install llama-cpp-python`) but will be painfully slow.
+
+Finally, download the default model to where SCALE looks for it:
+
+```bash
+pip install -U "huggingface_hub[cli]"
+hf download bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF --include "*Q5_K_M.gguf" \
+    --local-dir models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF
+```
+
+(`hf` is the current HuggingFace CLI; `huggingface-cli` still works as a deprecated alias. Some models on HuggingFace require a quick access request and `hf auth login` first.)
+
+Sanity-check the install with the model-free test suite, then a real run:
+
+```bash
+python tests/run_all.py
+python scale.py -c path/to/input.py -o out/annotated.py -v
+```
 
 ## Licence
 
