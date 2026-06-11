@@ -5,6 +5,13 @@ the suite finishes in seconds. Run all with `env/Scripts/python.exe tests/run_al
 `tests/test_*.py` directly. Each guards a specific past bug; keep them green when touching the relevant area, and
 add one when fixing a new bug.
 
+`tests/dogfood.py` is the **model-dependent** end-to-end harness: it walls every `scale*.py` module (docstrings,
+comments, and intra-routine blank lines stripped) into `temp/dogfood/walled/`, runs the current SCALE over copies in
+`temp/dogfood/annotated/` (`--mode offline` for the pure local pipeline, `--mode escalation` to emit the run manifest
+for the /scale loop), then deterministically verifies that re-walling each output reproduces the input's code lines
+exactly. Both directories are kept for review; `--files`/`--wall-only` scope it down. Slow on the full set — it loads
+a real GGUF.
+
 ## Catalogue
 
 - `test_summary_injection.py` — the whole-file summary is actually injected into the LLM context. Guards the critical regression where a stale `"OK"` was interpolated instead of the summary, silently disabling the feature.
