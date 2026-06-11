@@ -21,8 +21,8 @@ holds regardless of which model wrote the words. Escalation supports **Python an
 
 ## Environment (this dev machine)
 
-Always use the sibling virtualenv interpreter and the sibling model (see CLAUDE.md), from the project root
-`D:\Programming\Aurora v2\scale`:
+Always use the project virtualenv interpreter and the in-project model (see CLAUDE.md), from the project root
+`D:\Programming\SCALE`:
 
 - Python: `env/Scripts/python.exe`
 - Model (`-m`): `models/bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF/Qwen2.5.1-Coder-7B-Instruct-Q5_K_M.gguf`
