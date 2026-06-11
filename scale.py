@@ -26,15 +26,17 @@ from dataclasses import replace
 from pathlib import Path
 from scale_llm import LocalChatModel, GenerationConfig, llm_formatters, Messages, Chunk
 from scale_log import echo, error, set_verbosity
-from scale_text import summarise, LENGTH_LINE, LENGTH_PARAGRAPH, LENGTH_PARAGRAPHS, PRIMING_ACK
+from scale_text import (summarise, fit_snippet, LENGTH_LINE, LENGTH_PARAGRAPH, LENGTH_PARAGRAPHS, PRIMING_ACK,
+                        MARKER_PYTHON, MARKER_C, MARKER_JS)
 import scale_escalate
 import scale_project
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import argparse
 import hashlib
 import pickle
 import re
 import sys
+import textwrap
 import uuid
 
 
@@ -1135,75 +1137,182 @@ def _symbol_provider_for(language: str):
     return None
 
 
-def _build_call_graph(targets: List[Path], references: List[Path], language_arg: Optional[str]):
+def _scan_run_files(targets: List[Path], references: List[Path], language_arg: Optional[str]):
     """
-    Build the run's call graph and contract store from every target and reference file (the model-free pre-pass).
+    Load and parse every run file exactly once, returning the retained run-file store (the merged model-free pre-pass).
 
-    Each file is parsed for its symbols (definitions + resolved-or-not call sites); a file that cannot be loaded or has
-    no symbol provider is skipped. The resulting `ProjectGraph` drives leaf-first documentation order and callee-context
-    injection; the seeded `ContractStore` carries each routine's one-line contract (from existing docs at first, then
-    refined as the def pass writes docstrings).
+    Thin binding of `scale_project.scan_run_files` to this module's loader and symbol providers. The store feeds the
+    call graph, the C doc-site plan, and the lazy callee one-liner generator, so no pre-pass re-loads or re-parses a
+    file.
 
     Parameters:
     - `targets`: The files to be annotated.
-    - `references`: The read-only reference files (seed contracts only; never documented).
+    - `references`: The read-only reference files (consulted, never written).
     - `language_arg`: The forced `--language` value (lowercased), or None to auto-detect per file.
 
     Returns:
-    - A `(graph, store)` pair, or `(None, None)` if no file yielded symbols.
+    - The `{file key -> scale_project.RunFile}` store (possibly empty).
     """
 
-    symbols_by_file: dict = {}
-    for f in list(targets) + list(references):
-        try:
-            blob, lines, _le, lang = load_source(f, language_arg)
-        except OSError:
-            continue
-        provider = _symbol_provider_for(lang) if lang in SUPPORTED_LANGUAGES else None
-        if provider is None:
-            continue
-        symbols_by_file[str(f.resolve())] = provider(blob, lines)
+    return scale_project.scan_run_files(
+        targets, references,
+        load=lambda p: load_source(p, language_arg),
+        provider_for=_symbol_provider_for,
+    )
 
-    if not symbols_by_file:
+
+def _build_call_graph(run_files: Dict[str, "scale_project.RunFile"]):
+    """
+    Build the run's call graph and contract store from the retained run-file store (model-free).
+
+    The resulting `ProjectGraph` drives leaf-first documentation order, callee-context injection, and the block pass's
+    read-side call annotations; the seeded `ContractStore` carries each routine's one-line contract (from existing docs
+    at first, then refined as the def pass writes docstrings or the lazy generator fills a gap).
+
+    Parameters:
+    - `run_files`: The store from `_scan_run_files`.
+
+    Returns:
+    - A `(graph, store)` pair, or `(None, None)` if the store is empty.
+    """
+
+    if not run_files:
         return None, None
-    graph = scale_project.build_project_graph(symbols_by_file)
+    graph = scale_project.build_project_graph({k: rf.symbols for k, rf in run_files.items()})
     return graph, scale_project.ContractStore(graph)
 
 
-def _build_c_doc_plan(targets: List[Path], references: List[Path], language_arg: Optional[str], policy: str):
+def _build_c_doc_plan(run_files: Dict[str, "scale_project.RunFile"], policy: str):
     """
-    Build the C header/implementation documentation-site plan, or None if the run has no C file (the model-free pass).
+    Build the C header/implementation documentation-site plan from the retained run-file store (model-free).
 
-    Every target and reference file is loaded and, if it is C, parsed for definitions and prototypes; the plan decides
-    where each function's doc lives (see `scale_c.plan_doc_sites_c`). References supply bodies/prototypes but are never
-    written (only target prototypes are documentation sites).
+    The plan decides where each C function's doc lives (see `scale_c.plan_doc_sites_c`). References supply
+    bodies/prototypes but are never written (only target prototypes are documentation sites).
 
     Parameters:
-    - `targets`: The files to be annotated.
-    - `references`: The read-only reference files.
-    - `language_arg`: The forced `--language` value (lowercased), or None to auto-detect per file.
+    - `run_files`: The store from `_scan_run_files`.
     - `policy`: The `--doc-site` policy (`"auto"` or `"impl"`).
 
     Returns:
-    - A `scale_c.CDocPlan`, or None when no C file is present.
+    - A `scale_c.CDocPlan`, or None when the run has no C file.
     """
 
-    target_keys = {str(t.resolve()) for t in targets}
-    files: list = []
-    for f in list(targets) + list(references):
-        try:
-            blob, lines, _le, lang = load_source(f, language_arg)
-        except OSError:
-            continue
-        if lang != "c":
-            continue
-        key = str(f.resolve())
-        files.append((key, key in target_keys, blob, lines))
-
+    files = [(rf.key, rf.is_target, rf.source_blob, rf.source_lines)
+             for rf in run_files.values() if rf.language == "c"]
     if not files:
         return None
     from scale_c import plan_doc_sites_c
     return plan_doc_sites_c(files, policy)
+
+
+def _make_callee_oneliner_context(llm: LocalChatModel, cfg: GenerationConfig, run_files, graph, store):
+    """
+    Bind the lazy callee one-liner generator over the run, returning the def pass's `callee_context` lookup.
+
+    The returned `context(file_key, qualname)` is what each file's `callee_context` hook closes over: before formatting
+    the routine's callee notes, it generates a one-line contract for any **resolved callee that has none** - reading
+    the callee's signature+body from the retained run-file store, eliding it to the context budget with the language's
+    existing mechanism (`elide_structurally` for Python, the `fit_snippet` crop for C/JS), and making a single
+    `summarise(..., LENGTH_LINE)` call. Generation is **lazy** (it happens only when a caller is being documented, so a
+    routine nothing calls is never summarised), **shallow** (one level - the callee's own callees are not recursed
+    into), and **cached** (the result is stored via `store.update`, and a callee that yields nothing is not retried),
+    so the cost is bounded by the number of distinct used-but-undocumented callees in the run.
+
+    Parameters:
+    - `llm`/`cfg`: The model and base generation configuration.
+    - `run_files`: The retained run-file store (`_scan_run_files`).
+    - `graph`/`store`: The run's `ProjectGraph` and `ContractStore`.
+
+    Returns:
+    - `context(file_key, qualname) -> notes` (the callee-contract block for that routine, possibly "").
+    """
+
+    attempted: set = set()
+
+    def generate_oneliner(sym) -> str:
+        """Summarise one callee's body from the run-file store into a one-line contract ("" when it cannot be)."""
+        rf = run_files.get(sym.file)
+        if rf is None or sym.end < sym.start or sym.end <= 0:
+            return ""
+        snippet = "\n".join(rf.source_lines[sym.start - 1:sym.end])
+        if not snippet.strip():
+            return ""
+        header_lines = max(1, len(sym.signature.split("\n")))
+        # Fit the body to the (empty-context) snippet budget so a large callee cannot blow the window. Python keeps
+        # the routine's shape by summarising its deepest suites; C/JS crop the middle. Dedent first so a nested
+        # routine still parses for the structural path (its patcher is not involved - this is a read-only view).
+        if rf.language == "python":
+            from scale_python import elide_structurally
+            snippet, _ = elide_structurally(llm, cfg, [], textwrap.dedent(snippet), header_lines, MARKER_PYTHON)
+        else:
+            marker = MARKER_C if rf.language == "c" else MARKER_JS
+            snippet, _ = fit_snippet(llm, cfg, [], snippet, header_lines, marker)
+        simple = sym.qualname.rsplit(".", 1)[-1]
+        return summarise(
+            llm, cfg, snippet, LENGTH_LINE,
+            subject=f"a {rf.language} routine named `{simple}`, called by code that is being documented",
+            instruction="In one short line, state what this routine does for its caller - just the line, no preamble.",
+        )
+
+    def context(file_key: str, qualname: str) -> str:
+        """Fill any missing callee contracts for this routine (lazily, once each), then return its callee notes."""
+        for key in store.missing_callee_contracts(file_key, qualname):
+            if key in attempted:
+                continue                                   # tried before and yielded nothing - do not retry
+            attempted.add(key)
+            sym = graph.symbols.get(key)
+            if sym is None:
+                continue
+            one = generate_oneliner(sym)
+            if one:
+                echo(f"[callgraph] Generated one-liner for undocumented callee '{key[1]}'")
+                store.update(key[0], key[1], one)
+        return store.callee_notes(file_key, qualname)
+
+    return context
+
+
+def _block_callee_notes(provider, source_blob: str, source_lines: List[str], file_key: str, graph, store):
+    """
+    Build the block pass's read-side call annotations for one file: `{qualname -> {line -> "callee: one-liner"}}`.
+
+    The def pass may have shifted lines since the pre-pass parsed the original file, so the call-site lines recorded in
+    the graph are stale; instead the **current** text is re-parsed with the language's `iter_symbols` (model-free) and
+    each fresh call site is matched to its resolved callee by `(name, kind)` via `graph.call_map` - giving the
+    annotation the call's line in the text the block pass actually reads. Only calls whose callee has a contract in
+    the store contribute; several noted calls on one line are joined with "; ".
+
+    Parameters:
+    - `provider`: The language's `iter_symbols`.
+    - `source_blob`/`source_lines`: The CURRENT (def-pass-annotated) text the block pass will parse.
+    - `file_key`: The file's run key.
+    - `graph`/`store`: The run's `ProjectGraph` and `ContractStore`.
+
+    Returns:
+    - The per-routine line-annotation maps (empty entries omitted).
+    """
+
+    notes: Dict[str, Dict[int, str]] = {}
+    for sym in provider(source_blob, source_lines):
+        cmap = graph.call_map.get((file_key, sym.qualname))
+        if not cmap:
+            continue
+        per_line: Dict[int, List[str]] = {}
+        for call in sym.calls:
+            if len(call) < 3 or not call[2]:
+                continue
+            name, kind, line = call[0], call[1], call[2]
+            target = cmap.get((name, kind))
+            contract = store.contract(target) if target is not None else None
+            if not contract:
+                continue
+            bucket = per_line.setdefault(line, [])
+            note = f"{name}: {contract}"
+            if note not in bucket:
+                bucket.append(note)
+        if per_line:
+            notes[sym.qualname] = {ln: "; ".join(ns) for ln, ns in per_line.items()}
+    return notes
 
 
 def _order_header_before_impl(targets: List[Path], pairs: List[Tuple[str, str]]) -> List[Path]:
@@ -1290,6 +1399,7 @@ def _block_pass(
     comment_value: Optional[int] = None,
     escalation=None,
     doc_override: Optional[Callable[[str], Optional[str]]] = None,
+    callee_annotations: Optional[Dict[str, Dict[int, str]]] = None,
 ) -> List[str]:
     """
     Run the within-function "blob" pass: annotate logical groups of statements inside each routine body.
@@ -1307,6 +1417,8 @@ def _block_pass(
     - `source_blob`: The complete source text to annotate (with original line endings).
     - `source_lines`: The same source text split into individual lines.
     - `language`: The programming language identifier (already validated).
+    - `callee_annotations`: Optional per-routine call annotations (`_block_callee_notes`) shown read-side on the
+      paragraphs' call lines.
 
     Returns:
     - The annotated source split into individual lines.
@@ -1331,6 +1443,7 @@ def _block_pass(
         score_prompt=_read_optional(scale_path / "blocks.score.txt"),
         value_threshold=comment_value,
         escalation=escalation,
+        callee_annotations=callee_annotations,
     )
 
 
@@ -1458,6 +1571,7 @@ def generate_comments(
     on_doc: Optional[Callable[[str, str], None]] = None,
     doc_plan=None,
     doc_override: Optional[Callable[[str], Optional[str]]] = None,
+    block_callee_notes: Optional[Callable[[str, List[str]], Dict[str, Dict[int, str]]]] = None,
 ) -> int:
     """
     Generate comments for the provided (already-loaded) source code using a Large Language Model (LLM).
@@ -1487,6 +1601,9 @@ def generate_comments(
       bound by the caller over the shared `ContractStore` and this file. Absent, the def pass behaves as before.
     - `doc_plan`: Optional per-file `--doc-site` plan (C only) threaded to the def pass; `doc_override` is the matching
       block-pass header-doc lookup so a redirected implementation's block pass keeps the routine's contract.
+    - `block_callee_notes`: Optional call-graph hook for the block pass: `(current_blob, current_lines) -> {qualname ->
+      {line -> "callee: one-liner"}}`. Called on the def pass's output (lines have shifted, so the annotations must be
+      derived from the current text) and shown read-side on the paragraphs' call lines. Absent, behaviour is unchanged.
 
     Returns:
     - 0 if the operation was successful, or an error number.
@@ -1528,9 +1645,12 @@ def generate_comments(
             llm, cfg, scale_path, src_path, source_blob, language, no_cache=no_cache, template="blocks",
             project_context=project_context,
         )
+        # Derive the read-side call annotations from the CURRENT text (the def pass shifted lines), so each one lands
+        # on the calling line the block pass actually reads.
+        annotations = block_callee_notes(current_blob, new_lines) if block_callee_notes is not None else None
         new_lines = _block_pass(llm, cfg, scale_path, messages, current_blob, new_lines, language,
                                 comment_style=block_comment_style, comment_value=comment_value, escalation=escalation,
-                                doc_override=doc_override)
+                                doc_override=doc_override, callee_annotations=annotations)
 
     # Write the output
     if dst_path:
@@ -1583,7 +1703,8 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "Default: auto-detect near the source. 'none' disables it; or pass an explicit path.")
     p.add_argument("--reference", "-r", action="append", default=[], metavar="PATH",
                    help="Read-only file(s)/dir(s)/glob(s) for SCALE to consult for context but never edit (e.g. the "
-                        "project's headers). Repeatable. Their one-line summaries are shared with every target.")
+                        "project's headers). Repeatable. References are parsed into the call graph: they resolve "
+                        "calls and supply per-routine contracts to the targets that use them.")
     p.add_argument("--doc-site", default="auto", choices=("auto", "impl"),
                    help="C only: where an extern function is documented. 'auto' (default) documents a target header's "
                         "prototype (prose from the definition's body) and skips the implementation's docstring; 'impl' "
@@ -1615,58 +1736,6 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "when deciding what to escalate.")
 
     return p.parse_args(argv)
-
-
-def _reference_oneliners(
-    llm: LocalChatModel,
-    cfg: GenerationConfig,
-    scale_path: Path,
-    references: List[Path],
-    project_blurb: str,
-    no_cache: bool,
-) -> List[Tuple[str, str]]:
-    """
-    Produce a one-line summary for each read-only reference file, as shared context for the run.
-
-    Each reference file gets the same squashed one-liner the definition pass uses (`_get_short_summary`, cached), so a
-    target being annotated can be told, briefly, what the project's other files (e.g. its headers) are for. The list is
-    capped (`scale_project.MAX_REFERENCE_FILES`) so the injected context stays small; the overflow is logged, not
-    silently dropped.
-
-    Parameters:
-    - `llm`/`cfg`: The model and config.
-    - `scale_path`: The SCALE configuration directory.
-    - `references`: The read-only reference files (already expanded).
-    - `project_blurb`: The project blurb, used as context when summarising each reference.
-    - `no_cache`: Forwarded to the summary cache.
-
-    Returns:
-    - `(filename, one_line_summary)` pairs, capped.
-    """
-
-    if not references:
-        return []
-
-    base: Messages = [{"role": "system", "content": (scale_path / "comment.txt").read_text(encoding="utf-8")}]
-    if project_blurb:
-        base = base + [
-            {"role": "user", "content":
-                "Here is some background on the wider project this file belongs to:\n\n" + project_blurb},
-            {"role": "assistant", "content": PRIMING_ACK},
-        ]
-
-    cap = scale_project.MAX_REFERENCE_FILES
-    if len(references) > cap:
-        echo(f"Summarising {cap} of {len(references)} reference files for context (the rest are omitted)...")
-
-    out: List[Tuple[str, str]] = []
-    for ref in references[:cap]:
-        blob, _lines, _le, lang = load_source(ref, None)
-        if not blob.strip():
-            continue
-        oneliner = _get_short_summary(llm, cfg, scale_path, ref, blob, lang, base, no_cache=no_cache)
-        out.append((ref.name, oneliner))
-    return out
 
 
 def _apply_manifest_file(
@@ -1796,33 +1865,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         repeat_penalty=args.repeat_penalty,
     )
 
-    # Build the shared project context once for the whole run: the project blurb (auto-detected near the targets unless
-    # --project-doc says otherwise; 'none' disables) plus one-line summaries of the read-only reference files.
+    # Build the shared project context once for the whole run: the project blurb (auto-detected near the targets
+    # unless --project-doc says otherwise; 'none' disables). References contribute below through the call graph - they
+    # are parsed for resolution and seed contracts, never summarised whole.
     project_blurb = ""
     project_doc = scale_project.resolve_project_doc(args.project_doc, targets[0])
     if project_doc is not None:
         project_blurb = scale_project.project_blurb(llm, cfg, scale_path, project_doc, no_cache=args.no_cache)
-    related = _reference_oneliners(llm, cfg, scale_path, references, project_blurb, args.no_cache)
-    project_context = scale_project.compose_project_context(project_blurb, related)
+    project_context = project_blurb
 
-    # Build the call graph once over targets ∪ references (model-free). It drives the definition pass's documentation
-    # order (callees/children first) and the callee-contract context injected into each routine's turn; the seeded
-    # store accumulates contracts across files. Only relevant when the def pass runs. Targets are reordered so a
-    # callee's file is documented before a caller's (coarse, by file).
-    graph = store = None
+    # Load and parse every run file once (the retained store), then build the call graph over targets ∪ references
+    # (model-free). The graph drives the definition pass's documentation order (callees/children first), the callee-
+    # contract context injected into each routine's turn - generating a missing callee's one-liner lazily from the
+    # retained store - and the block pass's read-side call annotations; the seeded store accumulates contracts across
+    # files. Targets are reordered so a callee's file is documented before a caller's (coarse, by file).
+    run_files: dict = {}
+    graph = store = callee_oneliners = None
     language_arg = args.language.lower() if args.language else None
-    if args.comment:
-        graph, store = _build_call_graph(targets, references, language_arg)
-        if graph is not None:
+    if args.comment or do_blocks:
+        run_files = _scan_run_files(targets, references, language_arg)
+        graph, store = _build_call_graph(run_files)
+    if graph is not None and store is not None:
+        callee_oneliners = _make_callee_oneliner_context(llm, cfg, run_files, graph, store)
+        if args.comment:
             key_to_path = {str(t.resolve()): t for t in targets}
             targets = [key_to_path[k] for k in graph.file_order(list(key_to_path.keys()))]
 
-    # Build the C header/implementation documentation-site plan (model-free) and reorder targets so a header is
-    # documented before the implementation it is paired with (so the impl's block pass can reuse the header doc).
-    # Only the definition pass acts on it; a non-C run yields None and changes nothing.
+    # Build the C header/implementation documentation-site plan (model-free, from the same retained store) and reorder
+    # targets so a header is documented before the implementation it is paired with (so the impl's block pass can
+    # reuse the header doc). Only the definition pass acts on it; a non-C run yields None and changes nothing.
     c_plan = None
     if args.comment:
-        c_plan = _build_c_doc_plan(targets, references, language_arg, args.doc_site)
+        c_plan = _build_c_doc_plan(run_files, args.doc_site)
         if c_plan is not None and c_plan.pairs:
             targets = _order_header_before_impl(targets, c_plan.pairs)
 
@@ -1851,13 +1925,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 threshold=args.escalate_cognitive, override=override, doc_style=doc_style)
 
         # Bind the call-graph hooks for this file over the shared store (closing the file key into each closure). The
-        # store accumulates across files, so a callee documented in an earlier-ordered target informs a later caller.
-        doc_order = callee_context = on_doc = None
+        # store accumulates across files, so a callee documented in an earlier-ordered target informs a later caller;
+        # `callee_context` additionally generates a one-liner, lazily, for a resolved callee that has no contract yet.
+        # The block-pass hook re-derives call-site lines from the current text, so annotations survive line shifts.
+        doc_order = callee_context = on_doc = block_notes = None
         if graph is not None and store is not None:
             file_key = str(target.resolve())
             doc_order = graph.doc_order(file_key)
-            callee_context = lambda q, fk=file_key: store.callee_notes(fk, q)
+            callee_context = lambda q, fk=file_key: callee_oneliners(fk, q)
             on_doc = lambda q, doc, fk=file_key: store.update(fk, q, doc)
+            if do_blocks:
+                sym_provider = _symbol_provider_for(language)
+                if sym_provider is not None:
+                    block_notes = (lambda blob, lines, fk=file_key, p=sym_provider:
+                                   _block_callee_notes(p, blob, lines, fk, graph, store))
 
         # Bind the C doc-site plan for this file (redirected defs / documentable prototypes) and the block-pass
         # header-doc override (so a redirected implementation's block pass still sees the routine's contract).
@@ -1884,6 +1965,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             on_doc=on_doc,
             doc_plan=doc_plan,
             doc_override=doc_override,
+            block_callee_notes=block_notes,
         )
         if frc != 0:
             rc = frc

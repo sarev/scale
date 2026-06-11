@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 The multi-file run model: positional targets accept files/directories/globs (expanded to a deduped, ordered source
-list); a `--reference` set is captured read-only; the project blurb and reference one-liners compose one context
-string. Also guards the CLI rules that fail fast (before the model loads): no matches, -o with multiple targets, and
-single-target-only manifest phases.
+list); a `--reference` set is captured read-only; `scan_run_files` loads and parses each run file exactly once into
+the retained store the pre-passes share (references are parsed, never summarised). Also guards the CLI rules that
+fail fast (before the model loads): no matches, -o with multiple targets, and single-target-only manifest phases.
 
 Model-free: the helper tests are pure, and the main() guard tests return before any LLM is loaded.
 """
@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import scale_project  # noqa: E402
-from scale import _parse_args, main, _build_call_graph, _symbol_provider_for  # noqa: E402
+from scale import _parse_args, main, _scan_run_files, _build_call_graph, _symbol_provider_for  # noqa: E402
 
 
 def test_gather_files():
@@ -39,14 +39,39 @@ def test_gather_files():
         assert [p.name for p in got] == ["a.c"], got
 
 
-def test_compose_project_context():
-    assert isinstance(scale_project.MAX_REFERENCE_FILES, int) and scale_project.MAX_REFERENCE_FILES > 0
-    assert scale_project.compose_project_context("", []) == ""
-    assert scale_project.compose_project_context("Blurb here.", []) == "Blurb here."
-    only_related = scale_project.compose_project_context("", [("err.h", "error codes")])
-    assert "Related files" in only_related and "- err.h: error codes" in only_related
-    both = scale_project.compose_project_context("Blurb.", [("err.h", "error codes")])
-    assert both.startswith("Blurb.") and "- err.h: error codes" in both
+def test_scan_run_files():
+    # The merged pre-pass: every run file (target ∪ reference) is loaded and parsed exactly once into the retained
+    # store - source text, language, target/reference flag, and symbols all captured per file.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        util = root / "util.py"
+        core = root / "core.py"
+        util.write_text('def clamp(x):\n    """Clamp x to range."""\n    return x\n', encoding="utf-8")
+        core.write_text("def run(xs):\n    return [clamp(x) for x in xs]\n", encoding="utf-8")
+
+        loads: list = []
+        from scale import load_source
+
+        def counting_load(p):
+            loads.append(str(p))
+            return load_source(p, "python")
+
+        run_files = scale_project.scan_run_files([core], [util], counting_load, _symbol_provider_for)
+        uk, ck = str(util.resolve()), str(core.resolve())
+
+        # One load per file, no re-reads; targets and references both retained, flagged correctly.
+        assert sorted(loads) == sorted([str(core), str(util)])
+        assert run_files[ck].is_target and not run_files[uk].is_target
+        assert run_files[ck].language == "python" and run_files[ck].source_lines[0].startswith("def run")
+        # Symbols are parsed in (with the full span, for the lazy one-liner generator).
+        clamp = next(s for s in run_files[uk].symbols if s.qualname == "clamp")
+        assert clamp.end >= clamp.start > 0
+
+        # A duplicate path (target repeated as reference) is scanned once.
+        again: list = []
+        run_files2 = scale_project.scan_run_files([core], [core], lambda p: (again.append(p), load_source(p, "python"))[1],
+                                                  _symbol_provider_for)
+        assert len(again) == 1 and list(run_files2) == [ck]
 
 
 def test_parse_args_multi_target_and_reference():
@@ -87,7 +112,8 @@ def test_build_call_graph():
         util.write_text('def clamp(x):\n    """Clamp x to range."""\n    return x\n', encoding="utf-8")
         core.write_text("def run(xs):\n    return [clamp(x) for x in xs]\n", encoding="utf-8")
 
-        graph, store = _build_call_graph([core, util], [], "python")
+        run_files = _scan_run_files([core, util], [], "python")
+        graph, store = _build_call_graph(run_files)
         assert graph is not None and store is not None
 
         uk, ck = str(util.resolve()), str(core.resolve())
@@ -100,11 +126,11 @@ def test_build_call_graph():
 
 def main_():
     test_gather_files()
-    test_compose_project_context()
+    test_scan_run_files()
     test_parse_args_multi_target_and_reference()
     test_main_guards_fail_fast()
     test_build_call_graph()
-    print("PASS: target/reference expansion, project-context compose, the multi-target CLI guards, and the call-graph pre-pass")
+    print("PASS: target/reference expansion, the retained run-file scan, the multi-target CLI guards, and the call-graph pre-pass")
     return 0
 
 

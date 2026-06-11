@@ -133,6 +133,37 @@ def test_callee_notes_cap():
     assert notes.count("\n- ") == 3   # capped
 
 
+def test_widened_call_tuples_and_call_map():
+    # New-style `(name, kind, line)` records resolve exactly like the old pairs (the line is ignored by resolution,
+    # and the older 2-tuple form - used by the hand-built symbols above - keeps working). The per-call-site
+    # resolution is exposed as `call_map` so the block-pass annotator can re-find calls by (name, kind).
+    syms = [
+        S("clamp", doc="Clamp."),
+        S("user", start=5, calls=[("clamp", "free", 6), ("mystery", "free", 7)]),
+    ]
+    g = sp.build_project_graph({"f.py": syms})
+    assert g.edges[("f.py", "user")] == [("f.py", "clamp")]
+    assert g.call_map[("f.py", "user")] == {("clamp", "free"): ("f.py", "clamp")}   # unresolved call -> no entry
+
+
+def test_store_contract_and_missing():
+    # `contract` reads one key's contract; `missing_callee_contracts` lists the resolved callees still lacking one
+    # (the lazy one-liner generator's work list) and empties as contracts arrive.
+    syms = [
+        S("clamp", doc="Clamp."),
+        S("helper"),
+        S("user", start=5, calls=[("clamp", "free", 6), ("helper", "free", 7)]),
+    ]
+    g = sp.build_project_graph({"f.py": syms})
+    store = sp.ContractStore(g)
+    assert store.contract(("f.py", "clamp")) == "Clamp."
+    assert store.contract(("f.py", "helper")) is None
+    assert store.missing_callee_contracts("f.py", "user") == [("f.py", "helper")]
+    store.update("f.py", "helper", "Help out.")
+    assert store.missing_callee_contracts("f.py", "user") == []
+    assert store.contract(("f.py", "helper")) == "Help out."
+
+
 def test_apply_doc_order():
     items = [("a", 3), ("b", 1), ("c", 2), ("d", 9)]
     qof = lambda it: it[0]
@@ -149,8 +180,11 @@ def main():
     test_file_order()
     test_contract_store()
     test_callee_notes_cap()
+    test_widened_call_tuples_and_call_map()
+    test_store_contract_and_missing()
     test_apply_doc_order()
-    print("PASS: call-graph resolver, leaf-first/SCC ordering, file order, ContractStore, and apply_doc_order")
+    print("PASS: call-graph resolver (2- and 3-tuple call records), call_map, leaf-first/SCC ordering, file order, "
+          "ContractStore (incl. contract/missing accessors), and apply_doc_order")
     return 0
 
 

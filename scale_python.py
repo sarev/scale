@@ -443,19 +443,20 @@ def _collect_calls_py(node: ast.AST) -> List[Tuple[str, str]]:
     Mirrors the opacity of `cognitive_complexity`: only the routine's own body is walked (nested functions/classes/
     lambdas are scored/resolved as their own routines, so they are not descended into). Each `ast.Call` is classified
     by its callee expression:
-      - a bare name `f(...)` -> `("f", "free")`;
-      - `self.m(...)` -> `("m", "self")` (the enclosing class's own method);
-      - any other attribute call `obj.m(...)` -> `("m", "method")` (linked only if `m` is a unique method name).
-    Calls through anything else (a subscript, a call result, ...) contribute no entry.
+      - a bare name `f(...)` -> `("f", "free", line)`;
+      - `self.m(...)` -> `("m", "self", line)` (the enclosing class's own method);
+      - any other attribute call `obj.m(...)` -> `("m", "method", line)` (linked only if `m` is a unique method name).
+    Calls through anything else (a subscript, a call result, ...) contribute no entry. The `line` is the call's
+    1-based source line - resolution ignores it; the block pass's read-side call annotations use it.
 
     Parameters:
     - `node`: A function/async-function/class definition node.
 
     Returns:
-    - The call sites as `(name, kind)` pairs in source order (duplicates kept; the graph dedups on resolution).
+    - The call sites as `(name, kind, line)` triples in source order (duplicates kept; the graph dedups on resolution).
     """
 
-    calls: List[Tuple[str, str]] = []
+    calls: List[Tuple[str, str, int]] = []
 
     def visit(n: ast.AST) -> None:
         """Record `n` if it is a call site, then recurse - but a nested definition/lambda is opaque (not descended)."""
@@ -463,13 +464,14 @@ def _collect_calls_py(node: ast.AST) -> List[Tuple[str, str]]:
             return
         if isinstance(n, ast.Call):
             f = n.func
+            line = getattr(n, "lineno", 0)
             if isinstance(f, ast.Name):
-                calls.append((f.id, "free"))
+                calls.append((f.id, "free", line))
             elif isinstance(f, ast.Attribute):
                 if isinstance(f.value, ast.Name) and f.value.id == "self":
-                    calls.append((f.attr, "self"))
+                    calls.append((f.attr, "self", line))
                 else:
-                    calls.append((f.attr, "method"))
+                    calls.append((f.attr, "method", line))
         for child in ast.iter_child_nodes(n):
             visit(child)
 
@@ -483,8 +485,9 @@ def iter_symbols(source_blob: str, source_lines: Chunk) -> List[Symbol]:
     Extract the call-graph `Symbol` for every routine in a Python file (the model-free pre-pass per-file step).
 
     Reuses `iter_defs_with_info` for the definition records, then attaches each routine's parent qualname, header
-    signature, existing docstring (the seed contract) and classified call sites (`_collect_calls_py`). Returns `[]` if
-    the file does not parse - a single unparseable file must not abort the whole run's pre-pass.
+    signature, full line span (`start`/`end`, read by the lazy callee one-liner generator), existing docstring (the
+    seed contract) and classified call sites with their lines (`_collect_calls_py`). Returns `[]` if the file does not
+    parse - a single unparseable file must not abort the whole run's pre-pass.
 
     Parameters:
     - `source_blob`: The complete source text.
@@ -508,7 +511,7 @@ def iter_symbols(source_blob: str, source_lines: Chunk) -> List[Symbol]:
         parent_qualname = qual_by_node_id.get(d.parent_id) if d.parent_id is not None else None
         existing_doc = ast.get_docstring(d.node) or "" if _is_def_node(d.node) else ""
         symbols.append(Symbol(
-            qualname=d.qualname, kind=d.kind, signature=signature, start=d.start, depth=d.depth,
+            qualname=d.qualname, kind=d.kind, signature=signature, start=d.start, end=d.end, depth=d.depth,
             parent_qualname=parent_qualname, existing_doc=existing_doc, calls=_collect_calls_py(d.node),
         ))
     return symbols

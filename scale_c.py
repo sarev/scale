@@ -674,24 +674,25 @@ def _collect_calls_c(node, source_bytes: bytes) -> List[Tuple[str, str]]:
 
     C has no nested functions or methods, so the whole function subtree is walked and only direct calls through a plain
     identifier are recorded (all as `"free"`). Calls through a field/pointer expression or a function pointer are not
-    bare identifiers, so they are left unresolved (no entry).
+    bare identifiers, so they are left unresolved (no entry). Each record carries the call's 1-based source line -
+    resolution ignores it; the block pass's read-side call annotations use it.
 
     Parameters:
     - `node`: The `function_definition` tree-sitter node.
     - `source_bytes`: The source bytes the tree was parsed from.
 
     Returns:
-    - The call sites as `(name, "free")` pairs.
+    - The call sites as `(name, "free", line)` triples.
     """
 
-    calls: List[Tuple[str, str]] = []
+    calls: List[Tuple[str, str, int]] = []
     stack = [node]
     while stack:
         n = stack.pop()
         if n.type == "call_expression":
             fn = n.child_by_field_name("function")
             if fn is not None and fn.type == "identifier":
-                calls.append((_node_text(source_bytes, fn), "free"))
+                calls.append((_node_text(source_bytes, fn), "free", n.start_point[0] + 1))
         for i in range(n.named_child_count):
             stack.append(n.named_child(i))
     return calls
@@ -727,7 +728,7 @@ def iter_symbols(source_blob: str, source_lines: Chunk) -> List[Symbol]:
         signature = "\n".join(source_lines[d.header_start - 1:d.header_end]) if d.header_end >= d.header_start else ""
         seen_defs.add(d.qualname)
         symbols.append(Symbol(
-            qualname=d.qualname, kind=d.kind, signature=signature, start=d.start, depth=d.depth,
+            qualname=d.qualname, kind=d.kind, signature=signature, start=d.start, end=d.end, depth=d.depth,
             parent_qualname=None, existing_doc=_doc_above_header(source_lines, d.header_start),
             calls=_collect_calls_c(d.node, source_bytes),
         ))
@@ -736,7 +737,7 @@ def iter_symbols(source_blob: str, source_lines: Chunk) -> List[Symbol]:
             continue   # a definition in the same file already carries the symbol/contract for this name
         signature = "\n".join(source_lines[d.header_start - 1:d.header_end]) if d.header_end >= d.header_start else ""
         symbols.append(Symbol(
-            qualname=d.qualname, kind="declaration", signature=signature, start=d.start, depth=d.depth,
+            qualname=d.qualname, kind="declaration", signature=signature, start=d.start, end=d.end, depth=d.depth,
             parent_qualname=None, existing_doc=_doc_above_header(source_lines, d.header_start),
             calls=[],
         ))
@@ -1377,7 +1378,9 @@ def generate_comments_c(
     This function generates documentation comments for a list of C function definitions and (under `--doc-site`)
     header prototypes. It assembles a snippet of code for each, prompts the language model to generate a comment,
     extracts the first C block comment from the response, and stores the result in a dictionary keyed by the record's
-    header span.
+    header span. A record that already has a doc comment above its header (which sits outside the snippet) has that
+    text added to the turn as an ingest-and-update seed, so the model refreshes the existing contract instead of
+    re-deriving it blind.
 
     Parameters:
     - `llm`: The language model instance used for generating comments.
@@ -1434,6 +1437,17 @@ def generate_comments_c(
             "declaration (no code), describing purpose, parameters and return value.\n\n"
             f"{snippet}\n"
         )
+
+        # Ingest-and-update: a C doc comment sits ABOVE the header, outside the snippet, so surface the routine's own
+        # existing doc as a seed - the model keeps what is still accurate and updates what is stale, rather than
+        # re-deriving the contract blind (the routine-level analogue of the --file-doc description seed).
+        existing = _doc_above_header(source_lines, info.header_start)
+        if existing:
+            prompt += (
+                "\nThe function is already documented as follows. Ingest and update this existing comment - keep "
+                "whatever is still accurate, correct anything stale, and reformat it to the requested style - rather "
+                f"than writing from scratch:\n\n{existing}\n"
+            )
 
         # Inject the one-line contracts of the functions this one calls (call-graph context).
         if callee_context is not None:

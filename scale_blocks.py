@@ -753,6 +753,7 @@ def request_block_comment(
     nudge_template: Optional[str] = None,
     score_template: Optional[str] = None,
     value_threshold: int = COMMENT_VALUE_THRESHOLD,
+    line_notes: Optional[Dict[int, str]] = None,
 ) -> Optional[str]:
     """
     Summarise one paragraph of a routine and score how much that summary is worth as a code comment.
@@ -783,12 +784,27 @@ def request_block_comment(
     - `score_template`: Optional override for the value-score prompt (defaults to `SCORE_PROMPT`).
     - `value_threshold`: The minimum 1-3 score for the summary to be left unflagged (insertable); below it the
       summary is tagged with `VALUE_FLAG` (defaults to `COMMENT_VALUE_THRESHOLD`).
+    - `line_notes`: Optional `{source line -> "callee: one-liner"}` call annotations (the call-graph context). Each
+      noted line *within this paragraph* is shown to the model with the note appended as a trailing comment, so the
+      summary can draw on what the called routine does. READ-SIDE ONLY: the annotation enriches what the model sees
+      and is never written to the output (the patcher works from the real source lines).
 
     Returns:
     - The one-line summary (suffixed with `VALUE_FLAG` when low-value), or None if the model gave nothing usable.
     """
 
-    block_text = "\n".join(source_lines[blob_start - 1:blob_end])
+    raw_lines = source_lines[blob_start - 1:blob_end]
+    if line_notes:
+        # Annotate call lines with their callee's one-liner, in the language's own trailing-comment form. This is the
+        # model's view only - the output is patched from the pristine source, so a misplaced note is harmless.
+        annotated: List[str] = []
+        for off, text in enumerate(raw_lines):
+            note = line_notes.get(blob_start + off)
+            if note and text.strip():
+                text = f"{text.rstrip()}  {style.line_prefix.rstrip()} {note}"
+            annotated.append(text)
+        raw_lines = annotated
+    block_text = "\n".join(raw_lines)
     priors = "\n".join(f"- {c}" for c in (prior_comments or [])) or "(none yet)"
 
     prompt = _fill(
@@ -1004,6 +1020,7 @@ def annotate_blocks(
     score_prompt: Optional[str] = None,
     value_threshold: Optional[int] = None,
     escalation=None,
+    callee_annotations: Optional[Dict[str, Dict[int, str]]] = None,
 ) -> Chunk:
     """
     Run the full block pass over every routine and return the annotated source.
@@ -1034,6 +1051,9 @@ def annotate_blocks(
     - `escalation`: Optional `scale_escalate.Escalation`. When supplied, a routine whose complexity exceeds the cutoff
       has its (still-local) segmentation recorded as a manifest request and its comment turns deferred to a stronger
       model - it is left untouched here and annotated later by the apply phase.
+    - `callee_annotations`: Optional `{qualname -> {line -> "callee: one-liner"}}` call-graph context. Each routine's
+      map annotates its call lines (read-side only) in the comment turn, so a paragraph that calls a known routine is
+      summarised knowing what that routine does. Absent (or for an unlisted routine), behaviour is unchanged.
 
     Returns:
     - The annotated source split into lines.
@@ -1080,6 +1100,7 @@ def annotate_blocks(
             continue
 
         # One comment turn per chunk, in body order, feeding earlier comments forward as narrative context.
+        line_notes = (callee_annotations or {}).get(target.qualname)
         edits: List[Tuple[int, Optional[str], str]] = []
         prior_comments: List[str] = []
         for blob_start, blob_end in segments:
@@ -1090,7 +1111,7 @@ def annotate_blocks(
                     llm, cfg, messages, source_lines, target, blob_start, blob_end, style,
                     prior_comments=prior_comments, length_note=length_note,
                     prompt_template=comment_prompt, nudge_template=comment_nudge, score_template=score_prompt,
-                    value_threshold=threshold,
+                    value_threshold=threshold, line_notes=line_notes,
                 )
                 if comment:
                     prior_comments.append(comment)  # keep every summary (incl. low-value, flag and all) as context

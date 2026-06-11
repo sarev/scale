@@ -821,9 +821,11 @@ def _collect_calls_js(node, source_bytes: bytes, def_node_ids: set) -> List[Tupl
     function-valued binding is opaque and resolved as its own routine. This id-set approach is precise where a
     type-based skip would not be: a `const f = () => {...}` is recorded as a `variable_declarator`, so its arrow value
     is *not* a separate def node and is correctly walked. Each `call_expression` is classified by its callee:
-      - `f(...)` -> `("f", "free")`;
-      - `this.m(...)` -> `("m", "self")`;
-      - any other `obj.m(...)` -> `("m", "method")`.
+      - `f(...)` -> `("f", "free", line)`;
+      - `this.m(...)` -> `("m", "self", line)`;
+      - any other `obj.m(...)` -> `("m", "method", line)`.
+    The `line` is the call's 1-based source line - resolution ignores it; the block pass's read-side call annotations
+    use it.
 
     Parameters:
     - `node`: The routine's tree-sitter node.
@@ -831,28 +833,29 @@ def _collect_calls_js(node, source_bytes: bytes, def_node_ids: set) -> List[Tupl
     - `def_node_ids`: The ids of every routine node in the file (used to treat nested routines as opaque).
 
     Returns:
-    - The call sites as `(name, kind)` pairs.
+    - The call sites as `(name, kind, line)` triples.
     """
 
     root_id = node.id
-    calls: List[Tuple[str, str]] = []
+    calls: List[Tuple[str, str, int]] = []
 
     def visit(n) -> None:
         """Record `n` if it is a call site, then descend - skipping the subtree of any *other* recognised definition."""
         if n.type == "call_expression":
             fn = n.child_by_field_name("function")
+            line = n.start_point[0] + 1
             if fn is not None:
                 if fn.type == "identifier":
-                    calls.append((_node_text(source_bytes, fn), "free"))
+                    calls.append((_node_text(source_bytes, fn), "free", line))
                 elif fn.type == "member_expression":
                     obj = fn.child_by_field_name("object")
                     prop = fn.child_by_field_name("property")
                     if prop is not None:
                         name = _node_text(source_bytes, prop)
                         if obj is not None and obj.type == "this":
-                            calls.append((name, "self"))
+                            calls.append((name, "self", line))
                         else:
-                            calls.append((name, "method"))
+                            calls.append((name, "method", line))
         for i in range(n.named_child_count):
             child = n.named_child(i)
             if child.id in def_node_ids and child.id != root_id:
@@ -896,7 +899,7 @@ def iter_symbols(source_blob: str, source_lines: Chunk) -> List[Symbol]:
         signature = "\n".join(source_lines[d.header_start - 1:d.header_end]) if d.header_end >= d.header_start else ""
         parent_qualname = qual_by_pyid.get(d.parent_id) if d.parent_id is not None else None
         symbols.append(Symbol(
-            qualname=d.qualname, kind=d.kind, signature=signature, start=d.start, depth=d.depth,
+            qualname=d.qualname, kind=d.kind, signature=signature, start=d.start, end=d.end, depth=d.depth,
             parent_qualname=parent_qualname, existing_doc=_doc_above_header_js(source_lines, d.header_start),
             calls=_collect_calls_js(d.node, source_bytes, def_node_ids),
         ))
@@ -1579,6 +1582,17 @@ def generate_comments_js(
                 "Return only the comment content (no code), suitable for a JSDoc block placed "
                 "immediately above the definition:\n\n"
                 f"{snippet}\n"
+            )
+
+        # Ingest-and-update: a JS doc comment sits ABOVE the header, outside the snippet, so surface the routine's own
+        # existing doc as a seed - the model keeps what is still accurate and updates what is stale, rather than
+        # re-deriving the contract blind (the routine-level analogue of the --file-doc description seed).
+        existing = _doc_above_header_js(source_lines, info.header_start)
+        if existing:
+            prompt += (
+                "\nThe routine is already documented as follows. Ingest and update this existing comment - keep "
+                "whatever is still accurate, correct anything stale, and reformat it to the requested style - rather "
+                f"than writing from scratch:\n\n{existing}\n"
             )
 
         # Inject the one-line contracts of the routines this one calls (call-graph context).

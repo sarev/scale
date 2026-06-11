@@ -40,10 +40,6 @@ from scale_log import echo
 # not every file). Explicitly named files and glob matches are taken as-is regardless of extension.
 SOURCE_EXTS = (".py", ".c", ".h", ".js", ".mjs", ".cjs")
 
-# Cap on how many read-only reference files are summarised into the shared context, so the injected one-liners stay
-# small regardless of how large the --reference set is (the overflow is logged, not silently dropped).
-MAX_REFERENCE_FILES = 16
-
 
 # Reply-length cap for the project blurb. It is background context shown above many files, so it is kept to a couple of
 # sentences regardless of how large the source overview document is.
@@ -257,26 +253,75 @@ def gather_files(patterns: List[str], exts: Tuple[str, ...] = SOURCE_EXTS) -> Li
     return sorted(out, key=lambda x: str(x))
 
 
-def compose_project_context(blurb: str, related: List[Tuple[str, str]]) -> str:
+@dataclass
+class RunFile:
     """
-    Format the project blurb and a list of related-file one-liners into a single context string for priming.
+    One file of the run (target or read-only reference), loaded and parsed exactly once by `scan_run_files`.
+
+    This is the retained run-file store backing every model-free pre-pass - the call graph is built from each file's
+    `symbols`, the C doc-site plan from the C files' text - and the lazy callee one-liner generator, which reads an
+    undocumented callee's body from `source_lines` via its symbol's `start`/`end` span. Retaining the records means no
+    pre-pass loads or parses a file a second time.
+
+    Attributes:
+    - `path`: The file's path as given on the command line.
+    - `key`: The run-wide file key (the resolved path as a string) - the same key the graph and stores use.
+    - `is_target`: Whether the file is annotated (True) or a read-only `--reference` (False).
+    - `source_blob`: The complete source text (surrogateescape-decoded, original line endings).
+    - `source_lines`: The same source split into lines.
+    - `language`: The resolved language identifier.
+    - `symbols`: The file's call-graph symbols (may be empty if the file does not parse).
+    """
+
+    path: Path
+    key: str
+    is_target: bool
+    source_blob: str
+    source_lines: List[str]
+    language: str
+    symbols: List["Symbol"]
+
+
+def scan_run_files(
+    targets: List[Path],
+    references: List[Path],
+    load: Callable,
+    provider_for: Callable,
+) -> Dict[str, RunFile]:
+    """
+    Load and parse every run file (targets ∪ references) exactly once, returning the retained run-file store.
+
+    The single merged pre-pass scan: each file is loaded once and parsed once for its symbols, and the records are
+    retained so `build_project_graph`, the C doc-site planner, and the lazy callee one-liner generator all consume the
+    same store instead of re-reading files. A file that cannot be loaded, or whose language has no symbol provider, is
+    skipped (a single bad file must not abort the run's pre-pass).
 
     Parameters:
-    - `blurb`: The project overview blurb (may be "").
-    - `related`: `(filename, one_line_summary)` pairs for read-only reference files the run should be aware of.
+    - `targets`: The files to be annotated.
+    - `references`: The read-only reference files.
+    - `load`: `load(path) -> (source_blob, source_lines, line_ending, language)` (e.g. `scale.load_source`).
+    - `provider_for`: `provider_for(language) -> iter_symbols-or-None` (e.g. `scale._symbol_provider_for`).
 
     Returns:
-    - A combined context string (possibly ""), suitable for injecting as a priming turn.
+    - The run-file records keyed by file key, in run order (targets first).
     """
 
-    parts: List[str] = []
-    if blurb.strip():
-        parts.append(blurb.strip())
-    related = [(name, summary.strip()) for name, summary in related if summary.strip()]
-    if related:
-        lines = "\n".join(f"- {name}: {summary}" for name, summary in related)
-        parts.append("Related files in this project (read-only, for reference):\n" + lines)
-    return "\n\n".join(parts)
+    target_keys = {str(t.resolve()) for t in targets}
+    out: Dict[str, RunFile] = {}
+    for f in list(targets) + list(references):
+        key = str(f.resolve())
+        if key in out:
+            continue
+        try:
+            blob, lines, _le, lang = load(f)
+        except OSError:
+            continue
+        provider = provider_for(lang)
+        if provider is None:
+            continue
+        out[key] = RunFile(path=f, key=key, is_target=key in target_keys,
+                           source_blob=blob, source_lines=lines, language=lang, symbols=provider(blob, lines))
+    return out
 
 
 def resolve_project_doc(project_doc_arg: str, start: Path) -> Optional[Path]:
@@ -306,8 +351,9 @@ def resolve_project_doc(project_doc_arg: str, start: Path) -> Optional[Path]:
 # routines are ordered by nesting rather than by call dependency. This layer adds a **model-free pre-pass** that parses
 # every run file into symbols + calls, builds a call graph, and lets the definition pass (1) document callees before
 # callers (leaf-first), and (2) inject the one-line contracts of each routine's resolved callees into its generation
-# turn. It is cost-neutral: contracts come only from existing docstrings (a seed) and the docstrings the def pass itself
-# generates (each one's first line updates the contract for later callers) - no extra model calls are made. The
+# turn. Contracts come from existing docstrings (a seed), the docstrings the def pass itself generates (each one's
+# first line updates the contract for later callers), and - for a *called but undocumented* routine - a one-liner the
+# orchestrator generates lazily at the first caller that needs it (cached on the store; see scale.py). The
 # byte-for-byte code guarantee is untouched; nothing here patches source.
 #
 # Call resolution is **confident-only** - it never guesses a receiver type. A call links only when it can be resolved
@@ -362,9 +408,15 @@ class Symbol:
     - `start`: The 1-based start line of the routine (used as a deterministic ordering tiebreak).
     - `depth`: The nesting depth (0 at file scope).
     - `parent_qualname`: The qualname of the immediately enclosing definition, or None at file scope.
-    - `existing_doc`: The first line of any documentation the routine already has (the seed contract).
-    - `calls`: The routine's own call sites as `(name, kind)` pairs, kind ∈ {"free", "self", "method"}.
+    - `existing_doc`: The routine's WHOLE existing documentation (docstring / doc-comment text, delimiter-stripped),
+      or "". Its first line seeds the one-line contract (`_first_line`); the full text is kept so a routine being
+      re-documented can be shown its own current doc as ingest-and-update context.
+    - `calls`: The routine's own call sites as `(name, kind, line)` triples, kind ∈ {"free", "self", "method"} and
+      `line` the 1-based call-site line. Resolution ignores the line (older 2-tuple records are tolerated); the block
+      pass's read-side call annotations use it to place a callee's one-liner on the calling line.
     - `file`: The run's file key (a resolved-path string); stamped by `build_project_graph`.
+    - `end`: The 1-based inclusive end line of the routine (0 when unknown). With `start` it gives the span the lazy
+      callee one-liner generator reads the routine's text from in the retained run-file store.
     """
 
     qualname: str
@@ -374,8 +426,9 @@ class Symbol:
     depth: int
     parent_qualname: Optional[str]
     existing_doc: str
-    calls: List[Tuple[str, str]] = field(default_factory=list)
+    calls: List[Tuple] = field(default_factory=list)
     file: str = ""
+    end: int = 0
 
 
 # A symbol key uniquely identifies a routine across the run: (file, qualname).
@@ -513,13 +566,17 @@ class ProjectGraph:
 
     Built by `build_project_graph` from every run file's symbols (targets and read-only references alike). `edges` maps
     each routine to the routines it calls *that were confidently resolved*; `order` is every symbol key in leaf-first
-    order (callees and nested children before their callers/parents). References take part in resolution and ordering
-    inputs but are never documented - the caller restricts documentation to its targets.
+    order (callees and nested children before their callers/parents). `call_map` records the same resolutions keyed by
+    the call record itself - caller key -> {(name, kind): callee key} - so the block pass's read-side annotator can
+    re-find a routine's call sites in the *current* (already-annotated, line-shifted) text by name+kind rather than by
+    stale line number. References take part in resolution and ordering inputs but are never documented - the caller
+    restricts documentation to its targets.
     """
 
     symbols: Dict[SymKey, Symbol]
     edges: Dict[SymKey, List[SymKey]]
     order: List[SymKey]
+    call_map: Dict[SymKey, Dict[Tuple[str, str], SymKey]] = field(default_factory=dict)
 
     def doc_order(self, file: str) -> List[str]:
         """Return the qualnames of `file`'s symbols in leaf-first documentation order."""
@@ -616,13 +673,20 @@ def build_project_graph(symbols_by_file: Dict[str, List[Symbol]]) -> ProjectGrap
         return None
 
     edges: Dict[SymKey, List[SymKey]] = {}
+    call_map: Dict[SymKey, Dict[Tuple[str, str], SymKey]] = {}
     for key, s in symbols.items():
         file = key[0]
         resolved: List[SymKey] = []
         seen: Set[SymKey] = set()
-        for (name, ckind) in s.calls:
+        # A call record is `(name, kind, line)`; the line plays no part in resolution (and an older 2-tuple record
+        # still resolves), it only serves the block pass's read-side call annotations.
+        for call in s.calls:
+            name, ckind = call[0], call[1]
             target = resolve(file, s, name, ckind)
-            if target is not None and target != key and target not in seen:
+            if target is None or target == key:
+                continue
+            call_map.setdefault(key, {})[(name, ckind)] = target
+            if target not in seen:
                 seen.add(target)
                 resolved.append(target)
         edges[key] = resolved
@@ -640,7 +704,7 @@ def build_project_graph(symbols_by_file: Dict[str, List[Symbol]]) -> ProjectGrap
 
     order = _leaf_first_order(
         list(symbols.keys()), succ, tiebreak=lambda k: (symbols[k].start, k[1]))
-    return ProjectGraph(symbols=symbols, edges=edges, order=order)
+    return ProjectGraph(symbols=symbols, edges=edges, order=order, call_map=call_map)
 
 
 class ContractStore:
@@ -649,8 +713,9 @@ class ContractStore:
 
     Seeded from every symbol's existing documentation (so a callee already documented - or a reference file - has a
     contract from the start), then refined as the definition pass writes each docstring (`update`). A caller's
-    generation turn pulls its resolved callees' contracts via `callee_notes`. Contracts thus come only from existing or
-    freshly-generated docs, so the whole layer adds no model calls.
+    generation turn pulls its resolved callees' contracts via `callee_notes`; `missing_callee_contracts` tells the
+    orchestrator which resolved callees still lack one, so it can generate a one-liner lazily and `update` it in (the
+    store itself stays pure - it never generates anything).
     """
 
     def __init__(self, graph: ProjectGraph) -> None:
@@ -669,6 +734,24 @@ class ContractStore:
         line = _first_line(docstring)
         if line:
             self._contracts[(file, qualname)] = line
+
+    def contract(self, key: SymKey) -> Optional[str]:
+        """Return the one-line contract held for a symbol key, or None when it has none yet."""
+
+        return self._contracts.get(key)
+
+    def missing_callee_contracts(self, file: str, qualname: str) -> List[SymKey]:
+        """
+        Return the resolved callees of a routine that have no contract yet (candidates for lazy one-liner generation).
+
+        Parameters:
+        - `file`/`qualname`: The calling routine.
+
+        Returns:
+        - The contract-less callees' symbol keys, in call order.
+        """
+
+        return [k for k in self._graph.edges.get((file, qualname), []) if k not in self._contracts]
 
     def callee_notes(self, file: str, qualname: str, cap: int = CALLEE_NOTES_CAP) -> str:
         """
