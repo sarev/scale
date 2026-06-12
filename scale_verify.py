@@ -11,29 +11,17 @@ Unless required by applicable law or agreed to in writing, software distributed 
 "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
 language governing permissions and limitations under the License.
 
-Grounding gate and challenge turns: the local quality floor for generated comments.
+The verification floor that every generated doc and comment must pass before it reaches a file - SCALE's local quality
+gate. The `Verifier` dataclass combines a deterministic grounding gate with clean-context challenge turns: the gate is
+model-free (every backticked word in a doc must appear somewhere in the code corpus), while each challenge runs as a
+fresh single-turn conversation so the verdict cannot be biased by the generation context.
 
-A small local model's worst failures are confident inventions - an identifier that does not exist, a behavioural claim
-the code does not make, a "comment" that merely restates the line below it. This module checks a candidate comment
-*after* it is generated, with two mechanisms that deliberately avoid growing the generation prompt (long rule-laden
-prompts make small models drift; a second small, single-aspect turn in a clean context does not):
+Three challenges cover the main failure modes: grounding (name a claim the code does not support), obviousness (does a
+block comment add anything beyond the code it sits above), and story (does a doc explain rather than restate). All
+fail open - only an explicit negative verdict rejects - so a garbled reply never discards work.
 
-- **The backtick-grounding gate** (`ungrounded_tokens`) is deterministic and model-free. House style backticks
-  identifiers, so every backticked token in a generated doc/comment must appear somewhere in the run's source files
-  (a plain substring check against the retained run-file store's text - convention-free, no assumptions about casing
-  or naming). A miss earns one nudge naming the offending tokens; a second miss routes to the failure policy.
-
-- **Challenge turns** are small, single-aspect verification questions asked in a CLEAN context - a fresh message list
-  with no priming, no file summary, no priors: just the code, the candidate text, and one question, at temperature 0
-  with a constrained reply (NONE / YES-NO / STORY-RESTATE) so parsing stays robust for a weak model. Three challenges:
-  the **grounding challenge** (def-pass docs: list anything the comment claims that the code does not do), the
-  **obviousness challenge** (block comments: does this tell the reader anything not evident from the code?), and the
-  **story challenge** (a routine's block comments as a set: do they tell the routine's story or just restate it?).
-
-The failure routing lives with the call sites: a challenge failure regenerates once with the verdict as feedback; a
-second failure drops a block comment (wrongness is worse than absence) or writes a def doc under a prominent warning
-(so the doubt is visible rather than silent). The `Verifier` here only detects and phrases; it never patches - the
-byte-for-byte code guarantee is untouched.
+`verify_def` orchestrates the floor for docstrings, running the gate and the grounding challenge in order and granting
+at most one feedback-driven regeneration per failed check before the doc is rejected rather than looped on.
 """
 
 from __future__ import annotations
@@ -111,16 +99,19 @@ _WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 def _fill_template(template: str, **fields: str) -> str:
     """
-    Substitute `{name}` placeholders by literal replacement (other braces - e.g. in code - are left untouched).
+    Substitute `{name}` placeholders in a template with the given field values.
+
+    Uses plain sequential string replacement rather than `str.format`, so literal braces elsewhere in the template are harmless.
 
     Parameters:
-    - `template`: The prompt template text.
-    - `fields`: Placeholder name to replacement value.
+    - `template`: The template text containing `{name}` placeholders.
+    - `fields`: Placeholder names mapped to their replacement strings.
 
     Returns:
-    - The filled template.
+    - The template with every named placeholder replaced.
     """
 
+    # Plain sequential replace rather than str.format, so literal braces elsewhere in the template never raise.
     out = template
     for name, value in fields.items():
         out = out.replace("{" + name + "}", value)
@@ -129,70 +120,67 @@ def _fill_template(template: str, **fields: str) -> str:
 
 def ungrounded_tokens(text: str, corpus: str) -> List[str]:
     """
-    Return the backticked identifier words in `text` that appear nowhere in the run's source (the grounding gate).
+    Collect backticked words in `text` that appear nowhere in `corpus`.
 
-    Every `backticked` span is scanned for identifier-shaped words; each word of two or more characters must occur as
-    a substring of `corpus` (the concatenated source text of every run file). The check is deliberately convention-free
-    - no casing or naming assumptions - and case-sensitive, since identifiers are. Single-character words are skipped
-    (they occur everywhere, so the check would be vacuous). A word that appears only inside the comment being checked
-    obviously cannot ground itself; the corpus is the *source* text, so an invented `ERR_READ_ERROR` is caught even
-    when a real `ERR_READ` exists.
+    Only words inside backtick spans are checked, and membership is plain substring containment, so the gate is lenient: any appearance anywhere in the corpus counts as grounded. One-character words are ignored and duplicates are dropped.
 
     Parameters:
-    - `text`: The generated doc/comment text to check.
-    - `corpus`: The concatenated source text of the run's files.
+    - `text`: The generated documentation text to check.
+    - `corpus`: The source text the identifiers must appear in.
 
     Returns:
-    - The ungrounded words, in first-seen order, deduplicated (empty when the text is fully grounded).
+    - The ungrounded words in first-seen order, empty when everything is grounded.
     """
 
     out: List[str] = []
+
+    # Only words inside backtick spans are checked, and membership is plain substring containment - deliberately lenient, so any appearance anywhere in the corpus counts as grounded.
     for span in _BACKTICK_RE.findall(text or ""):
         for word in _WORD_RE.findall(span):
             if len(word) < 2 or word in out:
                 continue
             if word not in corpus:
                 out.append(word)
+
     return out
 
 
 def _first_word_verdict(reply: str, *words: str) -> Optional[str]:
     """
-    Find which of `words` a constrained challenge reply leads with, scanning its first non-empty line.
+    Extract a verdict keyword from the first non-empty line of a model reply.
+
+    Only the first line is inspected, so trailing discussion cannot change the verdict; when several keywords appear, the first one listed in `words` wins.
 
     Parameters:
-    - `reply`: The raw model reply.
-    - `words`: The candidate verdict words (upper-case).
+    - `reply`: The raw model reply, possibly empty.
+    - `words`: Candidate verdict keywords, in precedence order.
 
     Returns:
-    - The matched word, or None when the reply names none of them.
+    - The matched keyword, or `None` when no candidate appears.
     """
 
+    # Judge only the first non-empty line, so trailing chatter after the verdict cannot flip it.
     first = next((ln.strip() for ln in (reply or "").split("\n") if ln.strip()), "")
     upper = first.upper()
+
+    # Caller order is precedence: the first listed word found wins when the line mentions several.
     for w in words:
         if re.search(rf"\b{w}\b", upper):
             return w
+
     return None
 
 
 @dataclass
 class Verifier:
+
     """
-    The run's verification harness: the deterministic grounding gate plus the clean-context challenge turns.
+    Local quality floor for generated documentation: a deterministic grounding gate plus clean-context challenge turns.
 
-    One instance is built per run (over the retained run-file store's concatenated source text) and threaded into the
-    definition and block passes. Every challenge runs against a FRESH message list - no priming, no file summary, no
-    priors - so the judging model cannot be led by the generation context that produced the candidate text. The
-    verifier only detects problems and phrases feedback; the regenerate/promote/drop routing is the call sites'.
-
-    Attributes:
-    - `llm`/`cfg`: The model and base generation configuration (challenges clone `cfg` at temperature 0).
-    - `corpus`: The concatenated source text of every run file (targets and references) for the grounding gate.
-    - `gate_nudge`/`grounding_prompt`/`grounding_feedback`/`obvious_prompt`/`obvious_feedback`/`story_prompt`/
-      `story_feedback`: Optional prompt-wording overrides (the scale-cfg files); None uses the built-in defaults.
+    The gate is model-free - backticked words must appear somewhere in `corpus` - while each challenge runs as a fresh single-turn conversation at a fixed temperature so the verdict is not biased by the generation context. The obvious and story challenges fail open: only an explicit negative verdict rejects. Every prompt/feedback field is an optional override of the corresponding built-in template; leave it as `None` to use the default.
     """
 
+    # Every prompt/feedback field is an optional override; None falls back to the built-in template constants.
     llm: object
     cfg: object
     corpus: str = ""
@@ -204,36 +192,71 @@ class Verifier:
     story_prompt: Optional[str] = None
     story_feedback: Optional[str] = None
 
-    # ---------------------------- the deterministic gate ----------------------------
 
     def ungrounded(self, text: str) -> List[str]:
-        """Return the backticked identifier words in `text` that the run's source nowhere contains."""
+        """
+        List the backticked words in `text` that are absent from this verifier's corpus.
+
+        Parameters:
+        - `text`: The documentation text to check.
+
+        Returns:
+        - The ungrounded words in first-seen order, empty when everything is grounded.
+        """
+
         return ungrounded_tokens(text, self.corpus)
 
+    # Builds the nudge listing the offending backticked tokens, fed back for one regeneration attempt.
     def gate_feedback(self, tokens: List[str]) -> str:
-        """Phrase the one corrective nudge for a gate failure, naming the offending tokens."""
+        """
+        Build the nudge message sent back to the writer when the grounding gate finds ungrounded tokens.
+
+        Parameters:
+        - `tokens`: The backticked identifiers from the doc that were not found in the code.
+
+        Returns:
+        - The nudge text, from the configured template (or the built-in default) with the offending tokens listed.
+        """
+
         return _fill_template(self.gate_nudge or GATE_NUDGE, tokens=", ".join(f"`{t}`" for t in tokens))
 
-    # ---------------------------- the clean-context challenges ----------------------------
 
+    # Every challenge runs as a fresh single-turn conversation at its own temperature, deliberately isolated from the generation context.
     def _ask(self, prompt: str, max_tokens: int) -> str:
-        """Ask one challenge question in a clean context (a fresh, single-turn message list) at temperature 0."""
+        """
+        Run a single clean-context challenge turn against the local model.
+
+        The prompt is sent as a lone user message, so the verdict cannot be swayed by the writer conversation's history.
+
+        Parameters:
+        - `prompt`: The fully rendered challenge prompt.
+        - `max_tokens`: Cap on the reply length, further bounded by the run config's own limit.
+
+        Returns:
+        - The stripped reply text, or an empty string if generation produced nothing.
+        """
+
+        # Challenge turns run at their own temperature and a tight token cap, in a fresh single-message context.
         turn_cfg = replace(self.cfg, temperature=CHALLENGE_TEMPERATURE,
                            max_new_tokens=min(self.cfg.max_new_tokens, max_tokens))
         return (self.llm.generate([{"role": "user", "content": prompt}], cfg=turn_cfg) or "").strip()
 
+    # An empty or NONE-led reply means the doc passed; anything else is the verdict text, handed back to drive a regeneration.
     def challenge_grounding(self, code: str, doc: str) -> Optional[str]:
         """
-        Ask, in a clean context, what the candidate doc claims that the code does not do (the grounding challenge).
+        Challenge whether a routine doc's claims are actually grounded in its code.
+
+        A clean-context turn shows the model only the code and the candidate doc and asks it to name an ungrounded claim, or reply `NONE`. An empty or `NONE`-leading reply counts as a pass, so a garbled verdict never raises a complaint.
 
         Parameters:
-        - `code`: The routine snippet the doc was written for (the model's elided view is fine).
-        - `doc`: The candidate documentation text.
+        - `code`: The routine's source text.
+        - `doc`: The candidate docstring text.
 
         Returns:
-        - None when the challenge passes (the reply is NONE), else the verdict text (the listed false claims).
+        - The complaint text if the challenge found an ungrounded claim, otherwise `None`.
         """
 
+        # Fail open: an empty or `NONE` reply means no objection, so only a substantive complaint is surfaced.
         prompt = _fill_template(self.grounding_prompt or GROUNDING_PROMPT, code=code, doc=doc)
         reply = self._ask(prompt, GROUNDING_REPLY_TOKENS)
         if not reply or _first_word_verdict(reply, "NONE") == "NONE":
@@ -241,100 +264,140 @@ class Verifier:
         return reply
 
     def grounding_feedback_for(self, verdict: str) -> str:
-        """Phrase the regeneration feedback for a grounding-challenge failure, carrying the verdict."""
-        return _fill_template(self.grounding_feedback or GROUNDING_FEEDBACK, verdict=verdict)
-
-    def challenge_obvious(self, block: str, comment: str) -> bool:
         """
-        Ask, in a clean context, whether a block comment tells the reader anything beyond the code (obviousness).
+        Build the feedback message sent back to the writer when the grounding challenge fails.
 
         Parameters:
-        - `block`: The paragraph's pristine source text.
-        - `comment`: The candidate one-line comment.
+        - `verdict`: The challenge turn's complaint describing what the doc got wrong.
 
         Returns:
-        - True when the comment passes (YES, or an unparseable reply - the benefit of the doubt); False on a NO.
+        - The feedback text, from the configured template (or the built-in default) with the verdict substituted in.
+        """
+
+        return _fill_template(self.grounding_feedback or GROUNDING_FEEDBACK, verdict=verdict)
+
+    # Fail-open: only an explicit NO condemns the comment as obvious, so a garbled reply keeps it.
+    def challenge_obvious(self, block: str, comment: str) -> bool:
+        """
+        Challenge whether a block comment adds anything beyond the code it sits above.
+
+        A clean-context turn shows the model only the block and the candidate comment and asks for a one-word YES/NO verdict. Anything other than an explicit `NO` passes, so a garbled reply never discards a comment.
+
+        Parameters:
+        - `block`: The source block the comment describes.
+        - `comment`: The candidate comment text.
+
+        Returns:
+        - `True` if the comment survives the challenge, `False` on an explicit `NO` verdict.
         """
 
         prompt = _fill_template(self.obvious_prompt or OBVIOUS_PROMPT, block=block, comment=comment)
         verdict = _first_word_verdict(self._ask(prompt, VERDICT_REPLY_TOKENS), "YES", "NO")
+
+        # Fail open: only an explicit NO discards the comment, so a garbled verdict keeps it.
         return verdict != "NO"
 
     def obvious_feedback_for(self) -> str:
-        """Phrase the regeneration feedback for an obviousness failure."""
-        return self.obvious_feedback or OBVIOUS_FEEDBACK
-
-    def challenge_story(self, signature: str, doc: str, notes: List[str]) -> bool:
         """
-        Ask, in a clean context, whether a routine's paragraph notes tell its story or merely restate it.
-
-        Parameters:
-        - `signature`: The routine's header text.
-        - `doc`: The routine's one-line doc summary.
-        - `notes`: The full set of turn-1 paragraph summaries, in body order.
+        Return the feedback text used when a comment fails the obviousness challenge.
 
         Returns:
-        - True when the set passes (STORY, or an unparseable reply); False on a RESTATE verdict.
+        - The configured override, or the built-in default feedback.
         """
 
+        return self.obvious_feedback or OBVIOUS_FEEDBACK
+
+    # Fail-open again: only an explicit RESTATE verdict rejects the doc as a mere restatement of the signature.
+    def challenge_story(self, signature: str, doc: str, notes: List[str]) -> bool:
+        """
+        Challenge whether a routine doc tells a genuine story rather than restating its code.
+
+        A clean-context turn presents the signature, the doc, and the supporting notes, and asks for a one-word STORY/RESTATE verdict. Anything other than an explicit `RESTATE` passes, so an unclear reply never discards a doc.
+
+        Parameters:
+        - `signature`: The routine's signature line.
+        - `doc`: The candidate docstring text.
+        - `notes`: Supporting context notes, rendered as a bullet list.
+
+        Returns:
+        - `True` if the doc reads as a story, `False` on an explicit `RESTATE` verdict.
+        """
+
+        # Notes render as a bullet list, with an explicit "(none)" placeholder so the template never gets a blank slot.
         listed = "\n".join(f"- {n}" for n in notes) or "(none)"
         prompt = _fill_template(self.story_prompt or STORY_PROMPT, signature=signature, doc=doc, notes=listed)
         verdict = _first_word_verdict(self._ask(prompt, VERDICT_REPLY_TOKENS), "STORY", "RESTATE")
+
+        # Fail open: only an explicit RESTATE rejects the doc.
         return verdict != "RESTATE"
 
     def story_feedback_for(self) -> str:
-        """Phrase the per-paragraph regeneration feedback for a story-challenge failure."""
-        return self.story_feedback or STORY_FEEDBACK
-
-    # ---------------------------- def-pass orchestration ----------------------------
-
-    def verify_def(self, code: str, doc: str, regenerate, label: str = "") -> tuple:
         """
-        Run the def-pass verification pipeline on a candidate docstring/header comment: gate, then grounding challenge.
-
-        Each mechanism allows one corrective regeneration (the gate's nudge names the offending tokens; the
-        challenge's feedback carries the verdict), produced by the caller's `regenerate(feedback)` - which reopens the
-        worker's own generation context so the model sees its snippet, its previous answer, and the feedback. A
-        regeneration that yields nothing usable (the callback returns "") keeps the previous candidate. A second
-        failure of either mechanism reports `ok=False`; the routing - promote to the manifest, or write under a
-        prominent warning - is the caller's.
-
-        Parameters:
-        - `code`: The snippet the doc was generated from (used by the grounding challenge).
-        - `doc`: The candidate documentation text.
-        - `regenerate`: Callback `feedback -> new_doc_or_empty` regenerating in the worker's context.
-        - `label`: The routine's qualname, for logging.
+        Return the feedback text used when a doc fails the story challenge.
 
         Returns:
-        - `(doc, ok)`: the (possibly regenerated) documentation text, and whether it passed verification.
+        - The configured override, or the built-in default feedback.
         """
 
-        # The deterministic gate first (free): backticked identifiers must exist in the run's source.
+        return self.story_feedback or STORY_FEEDBACK
+
+
+    # The full def-pass floor: gate ungrounded identifiers with one nudge, then run the grounding challenge with one regeneration; a False result tells the caller to warn rather than ship an unverified doc.
+    def verify_def(self, code: str, doc: str, regenerate, label: str = "") -> tuple:
+        """
+        Run a candidate docstring through the verification floor, repairing it once where possible.
+
+        Two checks run in order: the deterministic grounding gate (every backticked identifier must appear in the code) and the clean-context grounding challenge (a fresh model turn hunting for claims the code does not support). Each failure earns at most one regeneration via `regenerate`; a repeat failure rejects the doc rather than looping.
+
+        Parameters:
+        - `code`: The routine's source, the ground truth for both checks.
+        - `doc`: The candidate docstring text.
+        - `regenerate`: Callback taking a feedback string and returning a replacement doc, or a falsy value to keep the current one.
+        - `label`: Routine name used in progress messages.
+
+        Returns:
+        - A `(doc, ok)` tuple: the possibly regenerated doc, and `True` if it passed or `False` if it should be dropped.
+        """
+
+        # Cheap deterministic gate first: backticked identifiers that never appear in the code.
         tokens = self.ungrounded(doc)
+
+        # Gate failure earns exactly one repair attempt: feed the offending tokens back, then re-check.
         if tokens:
             echo(f"[verify] '{label}': ungrounded identifiers {tokens}; nudging once")
             new = regenerate(self.gate_feedback(tokens))
             if new:
                 doc = new
             tokens = self.ungrounded(doc)
+
             if tokens:
+                # A second gate failure rejects the doc outright rather than looping on nudges.
                 echo(f"[verify] '{label}': still ungrounded after the nudge ({tokens})")
                 return doc, False
 
-        # Then the grounding challenge (one clean-context model turn): claims must be supported by the code.
+        # Stronger check: a clean-context challenge turn hunting for claims the code does not support.
         verdict = self.challenge_grounding(code, doc)
+
+        # On failure, hand the challenger's verdict back as feedback for one regeneration.
         if verdict:
             echo(f"[verify] '{label}': grounding challenge failed; regenerating with the verdict:\n{verdict}")
             new = regenerate(self.grounding_feedback_for(verdict))
+
             if new:
                 doc = new
-                # A regeneration may itself invent an identifier; the gate is free, so re-check it.
+
+                # Regeneration can itself smuggle in ungrounded names, so the cheap gate runs again.
                 if self.ungrounded(doc):
                     echo(f"[verify] '{label}': regeneration introduced ungrounded identifiers")
                     return doc, False
+
+            # Re-challenge the repaired doc; this is the last chance it gets.
             verdict = self.challenge_grounding(code, doc)
+
             if verdict:
+                # Two challenge failures end the attempt: drop the doc rather than retry indefinitely.
                 echo(f"[verify] '{label}': grounding challenge failed twice")
                 return doc, False
 
+        # Both checks passed (possibly after repair): the doc is accepted.
         return doc, True

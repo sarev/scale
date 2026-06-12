@@ -11,27 +11,18 @@ Unless required by applicable law or agreed to in writing, software distributed 
 "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
 language governing permissions and limitations under the License.
 
-The online mode's manifest machinery: every routine's comments deferred to a stronger model.
+The plumbing for SCALE's online mode: the run-level manifest through which every routine's comments are deferred to a
+stronger model. The `Escalation` dataclass collects one request per routine in a file - keyed by qualified name plus
+signature hash, with null answer slots for the def and block passes - and `run_manifest` merges each file's collector
+into a single manifest in which identical snippet text crosses the wire only once.
 
-SCALE runs in one of two modes. **Offline** (the default) the local model writes everything and no manifest exists.
-**Online** (`--online --emit-manifest`) every routine's comment/docstring generation is deferred to a stronger model
-(e.g. Claude Code): the routines are recorded as manifest *requests*, the stronger model fills in the answer text, and
-SCALE patches the answers back in through the same insertion-only path as everything else - so the byte-for-byte code
-guarantee is unchanged regardless of which model produced the words.
+Completeness is counted, never trusted: `unfilled_answers` lists every blank answer slot, so a run is finished only
+when that list is empty. `build_fragment`, `merge_fragment` and `release_unfilled` support parallel filling - carving
+self-contained fragments of unfilled requests out of the master, merging their answers back fill-only so nothing is
+overwritten, and recovering requests stranded by fragments that never returned.
 
-Two phases, coordinated by a single JSON manifest **per run** (covering every target file's routines):
-
-- **emit**: a model-free pass (the GGUF is never loaded) parses each target and records one *request* per routine -
-  its identity, the code, and what the stronger model needs - leaving the target byte-for-byte untouched. One
-  `Escalation` object per target collects requests; `run_manifest` merges them.
-- **apply**: a separate, model-free pass reads the manifest (now carrying the stronger model's `answer`s), re-parses
-  each target, matches each request back to its routine by `(qualname, sig_hash)`, and patches the answers in.
-
-The manifest is kept **lean** - in the worst case (a fully uncommented codebase) every routine's code crosses the wire
-once, and nothing may make it cross twice: a routine deferred by both passes carries ONE `snippet` (its verbatim source
-span), with the block chunks referencing line ranges *into* that snippet rather than duplicating the text; and any
-request whose snippet is byte-identical to an earlier request's (e.g. a header prototype documented from an impl body
-that is itself deferred) carries a `snippet_ref` to that request instead. `doc_style` is one copy per manifest.
+Reading and writing round out the module: manifests are serialised as pretty-printed UTF-8 JSON, and `read_manifest`
+validates the file's identity and upgrades version-1 manifests to the current multi-file shape on load.
 """
 
 from __future__ import annotations
@@ -51,15 +42,14 @@ MANIFEST_VERSION = 2
 
 def request_id(qualname: str, sig_hash: str) -> str:
     """
-    Build the stable identifier for a manifest request from its qualified name and signature hash.
+    Build the canonical manifest request id for a routine.
 
     Parameters:
-    - `qualname`: The routine's fully qualified name.
-    - `sig_hash`: The routine's signature hash (`scale_python.node_sig`, or `routine_text_hash` for span-hashed
-      languages).
+    - `qualname`: The routine's qualified name.
+    - `sig_hash`: The routine's signature hash.
 
     Returns:
-    - The request identifier string, e.g. "fn:Foo.bar:ab12cd34ef56".
+    - The `fn:<qualname>:<sig_hash>` string used to identify the request.
     """
 
     return f"fn:{qualname}:{sig_hash}"
@@ -67,20 +57,18 @@ def request_id(qualname: str, sig_hash: str) -> str:
 
 def routine_text_hash(span_text: str) -> str:
     """
-    Hash a routine's verbatim text span - a shift-proof identity for languages without a structural AST signature.
+    Hash a routine's span text into a short stable identifier.
 
-    A deferred routine is left byte-for-byte untouched between emit and apply, so its span text is identical even
-    though its absolute line numbers move as other routines are annotated; hashing the text (not the position) lets
-    the apply phase re-bind the request. Note that for C the doc comment sits ABOVE the header, outside the span, so
-    the hash also survives the def-pass apply that precedes the block-pass apply.
+    Encoding with `surrogateescape` mirrors the binary-safe file loader, so spans containing bytes that are not valid UTF-8 still hash deterministically.
 
     Parameters:
-    - `span_text`: The routine's verbatim header-to-end text.
+    - `span_text`: The routine's verbatim source text.
 
     Returns:
-    - A short hex digest.
+    - The first 16 hex digits of the SHA-256 digest of the text.
     """
 
+    # `surrogateescape` mirrors the binary-safe loader, so undecodable bytes still hash stably.
     return hashlib.sha256(span_text.encode("utf-8", errors="surrogateescape")).hexdigest()[:16]
 
 
@@ -89,39 +77,38 @@ def routine_text_hash(span_text: str) -> str:
 
 @dataclass
 class Escalation:
+
     """
-    The emit-phase request collector for the online mode (one instance per target file).
+    Collector for one source file's deferred annotation requests.
 
-    An instance records what the stronger model needs to answer (`record_def` / `record_block`). Both passes record
-    into the SAME per-routine request - keyed by `(qualname, sig_hash)` - which carries the routine's code once
-    (`snippet`, its verbatim source span) plus a `def` slot and/or a `blocks` recipe. After every target has been
-    collected, `run_manifest` merges the collectors into the run's manifest. This object never calls a model.
-
-    Attributes:
-    - `doc_style`: The house-style docstring template (e.g. `comment.<lang>.txt` + `guidelines.md`), carried into the
-      manifest so the stronger model is told the required style when it writes deferred docstrings.
-    - `requests`: The collected per-routine requests, in the order their routines were first recorded.
+    Each routine is recorded exactly once, keyed by qualified name plus signature hash, with null `answer` slots left for a stronger model to fill. `to_manifest` wraps the collected requests into a single-file run manifest.
     """
 
+    # Requests keep emit order; the index dedupes by (qualname, sig_hash) so a routine never crosses the wire twice.
     doc_style: str = ""
     requests: List[dict] = field(default_factory=list)
     _index: Dict[Tuple[str, str], dict] = field(default_factory=dict, init=False, repr=False)
 
     def _routine(self, qualname: str, kind: str, sig_hash: str, snippet: str) -> dict:
         """
-        Find or create the per-routine request - the slimming pivot: one request, one snippet, both passes record into it.
+        Fetch or create the request record for a routine.
+
+        The (qualname, sig_hash) key guarantees one record per routine; a later call with a non-empty snippet backfills a record created without one, but never replaces existing text.
 
         Parameters:
-        - `qualname`/`kind`/`sig_hash`: The routine's identity.
-        - `snippet`: The routine's verbatim source span (kept from the first recording that supplies one;
-          `record_block` then overrides it, because its chunk line ranges index into its own snapshot).
+        - `qualname`: The routine's qualified name.
+        - `kind`: The routine kind (e.g. function, method or class).
+        - `sig_hash`: The routine's signature hash.
+        - `snippet`: The routine's verbatim source, or empty if already captured.
 
         Returns:
-        - The (possibly fresh) request dict, already registered in `requests`.
+        - The shared request dictionary, newly created or existing.
         """
 
         key = (qualname, sig_hash)
         req = self._index.get(key)
+
+        # Create on first sight; later calls may only backfill a missing snippet, never replace existing text.
         if req is None:
             req = {
                 "id": request_id(qualname, sig_hash),
@@ -134,18 +121,20 @@ class Escalation:
             self.requests.append(req)
         elif not req.get("snippet") and snippet:
             req["snippet"] = snippet
+
         return req
 
     def record_def(self, qualname: str, kind: str, sig_hash: str, snippet: str) -> None:
         """
-        Record a deferred definition (docstring/header-comment) request on the routine's manifest entry.
+        Register a docstring request for a routine.
+
+        Reuses or creates the routine's request record and attaches a `def` slot whose null answer is left for the stronger model to fill.
 
         Parameters:
-        - `qualname`: The routine's fully qualified name.
-        - `kind`: The routine kind ("def", "async def", "class", "function", or "declaration").
+        - `qualname`: The routine's qualified name.
+        - `kind`: The routine kind (e.g. function, method or class).
         - `sig_hash`: The routine's signature hash.
-        - `snippet`: The routine's verbatim source span (or, for a doc-site prototype, the implementation body the
-          prose is to be written from).
+        - `snippet`: The routine's verbatim source.
         """
 
         self._routine(qualname, kind, sig_hash, snippet)["def"] = {"answer": None}
@@ -161,30 +150,22 @@ class Escalation:
         snippet: str = "",
     ) -> None:
         """
-        Record a deferred within-function block request on the routine's manifest entry.
+        Register the block-comment requests for a routine.
 
-        Segmentation has already run locally (it is structural and deterministic); only the per-chunk comment *text*
-        is deferred. Each chunk is identified by its boundary index - the position of its start line within the
-        routine's sorted legal boundaries, stable across the line shifts between emit and apply because the deferred
-        routine is left untouched - and carries `lines`, the chunk's 1-based line range INTO the routine's `snippet`
-        (so the chunk text is never duplicated alongside the snippet). The snippet supplied here replaces any one a
-        def-pass recording stored earlier: the chunk ranges were computed against the block pass's view of the source,
-        which could differ from the def pass's view if the text changed in between.
+        Attaches a `blocks` section to the routine's request record, reducing each provider chunk to its boundary index, line range and a null answer slot for the stronger model to fill. A non-empty snippet replaces any text already stored.
 
         Parameters:
-        - `qualname`: The routine's fully qualified name.
-        - `kind`: The routine kind.
+        - `qualname`: The routine's qualified name.
+        - `kind`: The routine kind (e.g. function, method or class).
         - `sig_hash`: The routine's signature hash.
-        - `doc_summary`: The routine's one-line docstring summary, as context for the comment.
-        - `length_note`: The short/long length note SCALE would have used, so the model keeps the same bias.
-        - `chunks`: One dict per chunk, each `{"bidx": int, "lines": [start, end]}` (snippet-relative, 1-based,
-          inclusive); an `"answer": None` slot is added here.
-        - `snippet`: The routine's verbatim source span (header through last body line).
+        - `doc_summary`: A one-line summary of the routine for the answering model.
+        - `length_note`: Scoring guidance matched to the routine's length.
+        - `chunks`: The provider's chunk records carrying `bidx` and line ranges.
+        - `snippet`: The routine's verbatim source; optional if already captured.
         """
 
+        # Chunks are reduced to boundary index, line range and a null answer slot; any provider extras are dropped.
         req = self._routine(qualname, kind, sig_hash, snippet)
-        # The chunk `lines` index into THIS snapshot of the routine, so a block recording's snippet must win over an
-        # earlier def-pass one. The def answer is indifferent to which snapshot it reads.
         if snippet:
             req["snippet"] = snippet
         req["blocks"] = {
@@ -195,15 +176,15 @@ class Escalation:
 
     def to_manifest(self, source: str, language: str, line_ending: str) -> dict:
         """
-        Serialise this single target's requests as a complete run manifest (the one-file convenience form).
+        Wrap this collector's requests into a single-file run manifest.
 
         Parameters:
-        - `source`: The source file path (recorded for provenance / the apply phase).
-        - `language`: The resolved language identifier.
-        - `line_ending`: The detected line ending of the source.
+        - `source`: The annotated file's path as recorded in the manifest.
+        - `language`: The file's language name.
+        - `line_ending`: The file's detected line-ending style.
 
         Returns:
-        - The manifest dictionary ready to be written as JSON.
+        - The run-manifest dictionary covering just this file.
         """
 
         return run_manifest([(source, language, line_ending, self)], self.doc_style)
@@ -211,40 +192,48 @@ class Escalation:
 
 def run_manifest(parts: List[Tuple[str, str, str, "Escalation"]], doc_style: str) -> dict:
     """
-    Merge per-target escalation collectors into the run's single manifest.
+    Build the run-level manifest dict from each processed file's collected escalation requests.
 
-    Each request is stamped with its `file` so the (run-level) apply phase can route it to the right target. The
-    cross-request slimming happens here: a request whose `snippet` is byte-identical to an earlier request's (the
-    classic case: a header prototype whose prose source is an impl body that is itself deferred for blocks) drops the
-    duplicate text and carries a `snippet_ref` naming the request that holds it - the code crosses the wire once.
+    Every request is tagged with its source file, and identical snippet text crosses the wire only once: the first request keeps the text and later duplicates carry a `snippet_ref` naming that first request's id.
 
     Parameters:
-    - `parts`: One `(source_path, language, line_ending, escalation)` tuple per target that collected requests.
-    - `doc_style`: The house-style template (one copy per manifest).
+    - `parts`: One tuple per file of (source path, language, line-ending string, its `Escalation` collector).
+    - `doc_style`: The house-style text embedded verbatim for the answering model.
 
     Returns:
-    - The version-2 manifest dictionary.
+    - The manifest dict (version, tool, files, doc_style and the merged request list), ready to serialise.
     """
 
+    # Accumulators for the merged manifest; seen_snippets remembers which request first carried each snippet text.
     le_name = {"\n": "lf", "\r\n": "crlf", "\r": "cr"}
     files: List[dict] = []
     requests: List[dict] = []
     seen_snippets: Dict[str, str] = {}
+
+    # One file record per part, with the line ending named symbolically so apply can restore it exactly.
     for source, language, line_ending, esc in parts:
         files.append({"path": source, "language": language, "line_ending": le_name.get(line_ending, "lf")})
+
+        # Copy each request before tagging it with its file, leaving the per-file Escalation state untouched.
         for r in esc.requests:
             req = dict(r)
             req["file"] = source
             snippet = req.get("snippet")
+
+            # Identical routine text must cross the wire only once, however many requests carry it.
             if snippet:
                 prior = seen_snippets.get(snippet)
+
+                # Later carriers of the same text drop it and point at the first carrier's id via snippet_ref.
                 if prior is not None:
                     req["snippet"] = None
                     req["snippet_ref"] = prior
                 else:
                     seen_snippets[snippet] = req["id"]
+
             requests.append(req)
 
+    # Assemble the versioned envelope that the check, fragment and apply phases all consume.
     return {
         "version": MANIFEST_VERSION,
         "tool": "scale",
@@ -259,29 +248,32 @@ def run_manifest(parts: List[Tuple[str, str, str, "Escalation"]], doc_style: str
 
 def unfilled_answers(manifest: dict) -> List[str]:
     """
-    Return an identifier for every answer slot in the manifest that has not been filled in.
+    List every unfilled answer slot in a manifest, one label per slot.
 
-    Completeness is enforced by this counter, never by trusting a model's diligence: the driver loops until the count
-    is zero. An answer of `null` (or whitespace) is unfilled; the explicit string `"NONE"` is a deliberate decline and
-    counts as filled.
+    Null and whitespace-only answers both count as unfilled. Labels take the form `id:def` or `id:block[i]`, so the completeness report points at the exact slot.
 
     Parameters:
-    - `manifest`: The parsed manifest dictionary.
+    - `manifest`: The manifest dict to scan.
 
     Returns:
-    - One entry per unfilled slot, e.g. "fn:heavy:ab12:def" or "fn:heavy:ab12:block[2]".
+    - A list of slot labels; empty when the manifest is complete.
     """
 
     out: List[str] = []
+
+    # A def answer counts as filled only when it is a non-blank string; null and whitespace both flag it.
     for r in manifest.get("requests", []):
         d = r.get("def")
         if d is not None and not str(d.get("answer") or "").strip():
             out.append(f"{r.get('id', r.get('qualname', '?'))}:def")
         b = r.get("blocks")
+
+        # Blank chunks are reported one label apiece, indexed by position, so the report names the exact slot.
         if b is not None:
             for i, chunk in enumerate(b.get("chunks", [])):
                 if not str(chunk.get("answer") or "").strip():
                     out.append(f"{r.get('id', r.get('qualname', '?'))}:block[{i}]")
+
     return out
 
 
@@ -293,83 +285,89 @@ FRAGMENT_KEY = "fragment"
 
 def _request_unfilled(req: dict) -> bool:
     """
-    Report whether a request still has any unfilled answer slot.
+    Report whether a request still has any blank answer slot.
+
+    A blank def answer or any single blank block chunk makes the request unfilled; whitespace-only strings count as blank.
 
     Parameters:
-    - `req`: One manifest request dictionary.
+    - `req`: The request dict to inspect.
 
     Returns:
-    - True when the def answer or any block-chunk answer is null/whitespace ("NONE" counts as filled).
+    - `True` if at least one answer slot is empty, `False` once every slot is filled.
     """
 
+    # Whitespace-only answers count as unfilled, the same rule the completeness report applies.
     d = req.get("def")
     if d is not None and not str(d.get("answer") or "").strip():
         return True
     b = req.get("blocks")
+
+    # A single blank chunk is enough to keep the whole request in the claimable pool.
     if b is not None:
         for chunk in b.get("chunks", []):
             if not str(chunk.get("answer") or "").strip():
                 return True
+
     return False
 
 
 def next_fragment_name(manifest: dict, master_name: str) -> str:
     """
-    Choose the next fragment file name for a master manifest (e.g. "scale-manifest.frag-003.json").
+    Allocate the next fragment filename for a master manifest.
 
-    A monotonic `fragments_issued` counter on the master (bumped here, persisted by the caller) guarantees a name is
-    never reused within one master, even after earlier fragments have been merged and their files deleted.
+    The `fragments_issued` counter is stored in (and bumped on) the manifest itself, so numbering stays monotonic across separate emit runs. The fragment name is the master name with a zero-padded `.frag-NNN` inserted before its suffix.
 
     Parameters:
-    - `manifest`: The parsed master manifest (mutated: the issue counter is incremented).
-    - `master_name`: The master manifest's file name (stem + suffix only; no directory).
+    - `manifest`: The master manifest dict; mutated to record the new counter.
+    - `master_name`: The master manifest's filename.
 
     Returns:
-    - The fragment file name (no directory).
+    - The new fragment filename, e.g. `scale-manifest.frag-001.json`.
     """
 
+    # The issue counter lives in the master manifest itself, so numbering stays monotonic across runs.
     stem, dot, suffix = master_name.rpartition(".")
     if not dot:
         stem, suffix = master_name, "json"
     issued = int(manifest.get("fragments_issued", 0)) + 1
     manifest["fragments_issued"] = issued
+
     return f"{stem}.frag-{issued:03d}.{suffix}"
 
 
 def build_fragment(manifest: dict, size: int, fragment_name: str) -> Optional[dict]:
     """
-    Check out the next batch of unfilled requests as a self-contained fragment manifest.
+    Carve a self-contained fragment of unfilled requests out of the master manifest.
 
-    The fragment is a valid version-2 manifest in its own right (same request shape, one `doc_style` copy), so a
-    filling agent can read it directly and self-check it with the ordinary completeness counter. Each selected
-    request is marked in the MASTER (mutated in place) with the fragment's name, so concurrent calls hand out
-    disjoint work; the caller persists the master afterwards. A request whose `snippet` is a `snippet_ref` to a
-    request outside this fragment gets the referenced text inlined, keeping every fragment self-contained.
+    Up to `size` unfilled, unclaimed requests are stamped with the fragment name in the master - claiming them so concurrently issued fragments never overlap - then deep-copied into the fragment. A copy whose snippet carrier was not also picked has the snippet text inlined, so the fragment can be answered without sight of the master.
 
     Parameters:
-    - `manifest`: The parsed master manifest (mutated: selected requests gain a `fragment` marker).
-    - `size`: The maximum number of requests to include.
-    - `fragment_name`: The name to record on each selected request (the fragment's file name).
+    - `manifest`: The master manifest dict; picked requests are marked in place.
+    - `size`: Maximum number of requests to include.
+    - `fragment_name`: Recorded both as the claim stamp in the master and as the fragment's `fragment_of`.
 
     Returns:
-    - The fragment manifest dictionary, or None when every unfilled request is already checked out (or none remain).
+    - The fragment manifest dict, or `None` when nothing is left to claim or `size` is below 1.
     """
 
+    # Claim the first `size` unfilled, unclaimed requests by stamping them, so concurrently issued fragments never overlap.
     pool = [r for r in manifest.get("requests", []) if _request_unfilled(r) and not r.get(FRAGMENT_KEY)]
     if not pool or size < 1:
         return None
     picked = pool[:size]
     for r in picked:
         r[FRAGMENT_KEY] = fragment_name
-
-    # Resolve snippet_refs that point outside the fragment: the code must cross the wire once per READER, so a
-    # fragment may never force its agent back to the master file.
     picked_ids = {r.get("id") for r in picked}
     snippets_by_id: Dict[str, str] = {}
+
+    # Index every snippet carrier in the master so refs pointing outside this fragment can be resolved.
     for r in manifest.get("requests", []):
         if r.get("snippet") and r.get("id") not in snippets_by_id:
             snippets_by_id[r["id"]] = r["snippet"]
+
     out_requests: List[dict] = []
+
+    # Deep-copy each pick; if its snippet carrier was not also picked, inline the text so the fragment is self-contained.
     for r in picked:
         req = json.loads(json.dumps(r))  # deep copy; the fragment must not alias the master
         ref = req.get("snippet_ref")
@@ -379,6 +377,8 @@ def build_fragment(manifest: dict, size: int, fragment_name: str) -> Optional[di
         out_requests.append(req)
 
     used_files = {r.get("file") for r in out_requests}
+
+    # Mirror the master's envelope but list only the files these requests actually reference.
     return {
         "version": MANIFEST_VERSION,
         "tool": manifest.get("tool", "scale"),
@@ -391,67 +391,79 @@ def build_fragment(manifest: dict, size: int, fragment_name: str) -> Optional[di
 
 def merge_fragment(manifest: dict, fragment: dict) -> int:
     """
-    Fold a filled fragment's answers back into the master manifest and release its checked-out requests.
+    Merge a completed fragment's answers back into the master manifest.
 
-    Requests are matched by `(id, file)` (two files may legitimately carry the same id when their routines are
-    byte-identical) and chunks by `bidx`. First write wins: a master slot that is already filled is never
-    overwritten, so a stale or duplicated fragment cannot clobber good answers. Every master request the fragment
-    covers has its checkout marker cleared - a slot the fragment left unfilled simply returns to the pile.
+    The merge is fill-only: a fragment answer is copied only where the master slot is still blank, so existing answers are never overwritten. Requests are matched on (id, file) and chunks on `bidx`; rows the master does not know are ignored. Every matched master request has its fragment claim removed, so slots the fragment left blank become claimable again.
 
     Parameters:
-    - `manifest`: The parsed master manifest (mutated in place).
-    - `fragment`: The parsed fragment manifest carrying answers.
+    - `manifest`: The master manifest dict, updated in place.
+    - `fragment`: The returned fragment dict.
 
     Returns:
-    - The number of answer slots newly filled in the master.
+    - The number of answer slots filled by this merge.
     """
 
+    # Index master requests by (id, file); setdefault keeps the first row should duplicates ever occur.
     index: Dict[Tuple[str, str], dict] = {}
     for r in manifest.get("requests", []):
         index.setdefault((str(r.get("id")), str(r.get("file"))), r)
-
     filled = 0
+
+    # Rows the master does not recognise are skipped, so a stale or foreign fragment cannot corrupt it.
     for fr in fragment.get("requests", []):
         mr = index.get((str(fr.get("id")), str(fr.get("file"))))
         if mr is None:
             continue
         md, fd = mr.get("def"), fr.get("def")
+
+        # Fill-only def merge: an answer already present in the master is never overwritten.
         if md is not None and fd is not None:
             if not str(md.get("answer") or "").strip() and str(fd.get("answer") or "").strip():
                 md["answer"] = fd["answer"]
                 filled += 1
+
         mb, fb = mr.get("blocks"), fr.get("blocks")
+
+        # Chunks are matched by their stable bidx, not by list position.
         if mb is not None and fb is not None:
             by_bidx = {c.get("bidx"): c for c in fb.get("chunks", [])}
+
             for chunk in mb.get("chunks", []):
                 fc = by_bidx.get(chunk.get("bidx"))
+
+                # Same fill-only rule for chunks, counting each transferred answer.
                 if fc is not None and not str(chunk.get("answer") or "").strip() \
                         and str(fc.get("answer") or "").strip():
                     chunk["answer"] = fc["answer"]
                     filled += 1
+
+        # Release the claim even if the fragment left slots blank, so leftovers become claimable again.
         mr.pop(FRAGMENT_KEY, None)
+
     return filled
 
 
 def release_unfilled(manifest: dict) -> int:
     """
-    Return every still-unfilled request to the pile by clearing its checkout marker.
+    Release the fragment claims on requests that are still unfilled.
 
-    Called when a fill round ends incomplete (an agent died or skipped slots): the next `build_fragment` can then
-    hand the remaining work out again.
+    Recovers requests stranded by fragments that were issued but never merged back, returning them to the pool `build_fragment` draws from.
 
     Parameters:
-    - `manifest`: The parsed master manifest (mutated in place).
+    - `manifest`: The master manifest dict, updated in place.
 
     Returns:
-    - The number of requests released.
+    - The number of requests whose claim was released.
     """
 
     released = 0
+
+    # Reclaim requests stranded by fragments that never came back, returning them to the claimable pool.
     for r in manifest.get("requests", []):
         if r.get(FRAGMENT_KEY) and _request_unfilled(r):
             r.pop(FRAGMENT_KEY, None)
             released += 1
+
     return released
 
 
@@ -460,33 +472,35 @@ def release_unfilled(manifest: dict) -> int:
 
 def write_manifest(path: Path, manifest: dict) -> None:
     """
-    Write a manifest dictionary to disk as indented JSON (UTF-8).
+    Write a manifest dict to disk as pretty-printed UTF-8 JSON with a trailing newline.
 
     Parameters:
-    - `path`: The destination file path.
-    - `manifest`: The manifest dictionary to serialise.
+    - `path`: Destination file path.
+    - `manifest`: The manifest dict to serialise.
     """
 
+    # Pretty-printed, non-ASCII-escaped JSON with a trailing newline keeps manifests readable and diff-friendly.
     Path(path).write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def _upgrade_v1(manifest: dict) -> dict:
     """
-    Upgrade a version-1 (single-file, per-pass-request) manifest to the version-2 shape in memory.
+    Convert a version-1 manifest into the current multi-file manifest shape.
 
-    The v1 schema carried one request per pass ("def" with a top-level `answer`; "block" with per-chunk `text` and
-    `answer`). Each becomes a v2 per-routine request stamped with the manifest's single `source` file; v1 block chunks
-    keep their answers (their `text` is simply dropped - apply places by boundary index, not text).
+    Version 1 described a single file with separate per-pass requests; the upgrade folds each request's pass-specific fields into the v2 `def`/`blocks` sub-objects and hoists the file metadata into a one-entry `files` list. Existing answers are carried across, but v1 stored no chunk line ranges, so those are left as `None`.
 
     Parameters:
-    - `manifest`: The parsed v1 manifest.
+    - `manifest`: The parsed version-1 manifest dictionary.
 
     Returns:
-    - An equivalent v2 manifest dictionary.
+    - A new manifest dictionary in the current version's shape.
     """
 
+    # A v1 manifest described exactly one file, so its single source path is stamped onto every request.
     source = manifest.get("source", "")
     requests: List[dict] = []
+
+    # Rebuild each request in the v2 shape; v1 carried no per-request id, so derive one from the qualname and signature hash.
     for r in manifest.get("requests", []):
         req = {
             "id": request_id(r.get("qualname", "?"), r.get("sig_hash", "")),
@@ -496,6 +510,8 @@ def _upgrade_v1(manifest: dict) -> dict:
             "snippet": r.get("snippet"),
             "file": source,
         }
+
+        # Fold v1's separate per-pass requests into the v2 sub-objects; v1 stored no chunk line ranges, so those stay None.
         if r.get("pass") == "def":
             req["def"] = {"answer": r.get("answer")}
         elif r.get("pass") == "block":
@@ -505,8 +521,10 @@ def _upgrade_v1(manifest: dict) -> dict:
                 "chunks": [{"bidx": c.get("bidx"), "lines": None, "answer": c.get("answer")}
                            for c in r.get("chunks", [])],
             }
+
         requests.append(req)
 
+    # Hoist the v1 top-level file metadata into v2's one-entry files list.
     return {
         "version": MANIFEST_VERSION,
         "tool": manifest.get("tool", "scale"),
@@ -519,20 +537,21 @@ def _upgrade_v1(manifest: dict) -> dict:
 
 def read_manifest(path: Path) -> dict:
     """
-    Read and lightly validate a manifest file, returning it in the current (version-2) shape.
+    Load and validate a SCALE manifest from disk.
 
-    A version-1 manifest is upgraded in memory so the apply phase needs to understand only one schema.
+    Version-1 manifests are upgraded in memory so callers always receive the current shape, and the `requests` and `files` keys are guaranteed to exist.
 
     Parameters:
-    - `path`: The manifest file path.
+    - `path`: Path to the manifest JSON file.
 
     Returns:
-    - The parsed manifest dictionary (version 2).
+    - The manifest dictionary, in the current version's shape.
 
-    Raises:
-    - `ValueError`: If the file is not a SCALE manifest of a supported version.
+    Notes:
+    Raises `ValueError` if the file is not a SCALE manifest of a recognised version.
     """
 
+    # Only version 1 and the current version are accepted; v1 is upgraded in memory so callers only ever see one shape.
     manifest = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(manifest, dict) or manifest.get("version") not in (1, MANIFEST_VERSION):
         raise ValueError(f"{path}: not a SCALE manifest of version 1 or {MANIFEST_VERSION}")
@@ -540,4 +559,5 @@ def read_manifest(path: Path) -> dict:
         manifest = _upgrade_v1(manifest)
     manifest.setdefault("requests", [])
     manifest.setdefault("files", [])
+
     return manifest

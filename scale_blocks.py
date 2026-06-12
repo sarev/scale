@@ -11,24 +11,18 @@ Unless required by applicable law or agreed to in writing, software distributed 
 "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
 language governing permissions and limitations under the License.
 
-Shared, language-agnostic engine for the within-function "blob" pass.
+The language-agnostic engine for SCALE's block pass, which inserts paragraph spacing and short comments inside routine
+bodies. Each language worker supplies `BlockTarget` records naming the lines where a comment may legally be placed;
+everything from there - segmentation, generation, scoring and patching - is shared across languages.
 
-Where the definition pass comments whole routines, this pass annotates *logical groups of statements inside a routine
-body*: it places a blank line above each group and, only where the code does not speak for itself, a short comment.
-The shape is deliberately different from the definition pass:
+Paragraphs are found either by the deterministic `structural_breaks` rules (docstrings, nested defs, returns,
+substantial nested blocks and the dedents out of them) or by a model segmentation turn over a numbered view of the
+body. Each paragraph then gets a two-turn comment-and-score exchange in `request_block_comment`, with an empty-reply
+nudge, a grounding correction and an obviousness challenge deciding whether the comment is kept.
 
-- Segmentation is line-based, but a per-language provider (see `BlockTarget`) decides which lines may legally begin a
-  block, so the model can never split mid-statement.
-- The model only ever returns line numbers (block boundaries) and comment text - never code.
-- Patching is insertion-only above legal statement starts: every original code line survives exactly once, in order,
-  unmodified; only blank and comment lines are added or rewritten. Each chunk gets a blank line above it - paragraphing
-  a wall of statements into its blocks is value in itself - and a comment too where the model had something to say
-  (`NONE` adds the blank but no comment, and never deletes an existing one). A belt-and-braces guard re-checks this
-  invariant per routine and abandons any routine whose edit would alter code.
-
-The provider, the line numbers, and the patcher together preserve SCALE's core guarantee that executable code is never
-touched. Only the per-language `BlockTarget` provider and `CommentStyle` differ between languages; everything here is
-shared.
+All edits are insertion-only and pass through `code_preserved`, the guard that proves the executable code is untouched
+before a routine's changes are accepted. `apply_blocks` replays ready-made manifest answers through the same guard,
+and `defer_block_targets` records targets in the online run manifest instead of annotating them locally.
 """
 
 from __future__ import annotations
@@ -162,19 +156,19 @@ COMMENT_NUDGE = (
 
 def _fill(template: str, **fields: str) -> str:
     """
-    Substitute `{name}` placeholders in a prompt template by literal replacement.
+    Substitute `{name}` placeholders in a template with the given field values.
 
-    Unlike `str.format`, this leaves any other braces in the text untouched, so a user-edited prompt file is free to
-    contain stray `{` / `}` (and the substituted code snippets, which routinely contain braces, are never re-scanned).
+    Uses plain sequential replacement rather than `str.format`, so braces that do not name a supplied field pass through untouched.
 
     Parameters:
-    - `template`: The prompt template text.
-    - `fields`: Placeholder name to replacement value.
+    - `template`: Text containing `{name}` placeholders.
+    - `fields`: Placeholder names mapped to their replacement strings.
 
     Returns:
-    - The template with each `{name}` replaced by its value.
+    - The template with every supplied placeholder replaced.
     """
 
+    # Sequential replace rather than str.format, so unrelated braces in the template cannot raise.
     out = template
     for name, value in fields.items():
         out = out.replace("{" + name + "}", value)
@@ -183,21 +177,14 @@ def _fill(template: str, **fields: str) -> str:
 
 @dataclass(frozen=True)
 class CommentStyle:
+
     """
-    Describe how comments are rendered for a language, so the shared engine can emit block comments without knowing the
-    language.
+    Comment delimiters for one source language.
 
-    A single-line comment always uses `line_prefix`. A multi-line comment uses the block form when `block_open` is set
-    (delimiters on their own lines, each interior line prefixed with `block_cont`); otherwise every line uses
-    `line_prefix` (as in Python, which has no block-comment syntax).
-
-    Attributes:
-    - `line_prefix`: The line-comment introducer, including any trailing space (e.g. "# ", "// ").
-    - `block_open`: The opening delimiter for a multi-line block comment, or None to always use line comments.
-    - `block_cont`: The continuation prefix for interior lines of a block comment (e.g. " * ").
-    - `block_close`: The closing delimiter for a multi-line block comment.
+    `line_prefix` is always present; the three `block_*` delimiters exist only for languages with a block-comment form, and rendering falls back to line comments when they are `None`.
     """
 
+    # The block_* delimiters stay None for languages with no block-comment form, forcing line-comment rendering.
     line_prefix: str
     block_open: Optional[str] = None
     block_cont: Optional[str] = None
@@ -217,31 +204,14 @@ SLASH_BLOCK_STYLE = CommentStyle(line_prefix="// ", block_open="/*", block_cont=
 
 @dataclass(frozen=True)
 class BlockTarget:
+
     """
-    One routine (function, method, or class) the block pass may annotate, described purely in terms of line numbers.
+    One routine body targeted by the block pass.
 
-    A provider produces one `BlockTarget` per routine body. `boundary_lines` is the set of lines that begin exactly one
-    statement at any nesting depth within the body, without descending into nested definitions (a nested definition is
-    a single opaque boundary). The model chooses a subset of these as block starts; the engine never invents a boundary
-    the provider did not offer.
-
-    Attributes:
-    - `qualname`: The fully qualified routine name (for logging/prompts), e.g. "Foo.bar".
-    - `kind`: The routine kind, e.g. "def", "async def", or "class".
-    - `header_start`: The first line of the signature/header, including decorators (1-based).
-    - `header_end`: The last header line (the line before the first body statement).
-    - `body_start`: The first body line (1-based).
-    - `body_end`: The last body line, inclusive.
-    - `boundary_lines`: Sorted tuple of lines that may legally begin a block.
-    - `indent_of`: Maps each boundary line to its exact leading-whitespace string.
-    - `depth`: Nesting depth (0 = module level), used to order generation deepest-first.
-    - `doc`: The routine's own docstring/header comment (or ""), used as brief context for the comment pass.
-    - `sig`: A structural signature of the routine (see `scale_python.node_sig`), used by the online manifest flow to
-      re-bind a deferred routine across the emit/apply phases ("" when not computed).
-    - `segments`: Optional precomputed `(start, end)` chunk ranges from a provider's deterministic segmenter; when
-      present the block pass uses them instead of asking the model to segment (None falls back to the LLM segment pass).
+    All line numbers are 1-based positions in the file. `boundary_lines` holds the only lines where a comment may be inserted, `indent_of` gives the indentation to use at each of them, and `segments`, when present, carries pre-computed paragraph ranges that bypass the structural segmenter.
     """
 
+    # Line numbers are 1-based file positions; boundary_lines lists the only legal comment insertion points.
     qualname: str
     kind: str
     header_start: int
@@ -274,35 +244,14 @@ SEG_MIN_LEADING_DECLS = 2
 
 @dataclass(frozen=True)
 class SegStatement:
+
     """
-    One body statement, normalised for the language-agnostic structural segmenter (`structural_breaks`).
+    Structural facts about one body statement, as consumed by the segmenter's break rules.
 
-    A per-language provider flattens a routine body into these records (skipping a leading docstring, treating a
-    nested definition as one opaque statement, recursing into compound suites). The segmenter then reads only this
-    normalised view, so the paragraph rules live in exactly one place regardless of the source language or parser.
-
-    Attributes:
-    - `start`: The statement's 1-based start line (a paragraph break, if placed, goes above this line).
-    - `end`: The statement's 1-based inclusive end line.
-    - `depth`: A monotonic nesting measure within the body (deeper statements compare greater). Any per-language
-      proxy works as long as it is order-preserving - the engine only ever compares depths for equality/ordering
-      (Python passes the source column; the tree-sitter workers pass the parent-chain depth).
-    - `is_return`: Whether this statement is a `return` (drives the "paragraph off a trailing return" rule).
-    - `is_def`: Whether this statement is an opaque nested definition (drives the "blank after a nested def" rule).
-    - `opens_block`: The source-line span of the compound/def block this statement opens, or 0 if it opens none.
-    - `first_in_scope`: Whether this is the routine's own first body statement (never gets a break above it; a
-      blank after a docstring, when present, is the only break the first position can carry).
-    - `closed_block`: The span of the outermost block that closed immediately before this statement (0 if none),
-      used only when this statement dedents back out of a nested block.
-    - `merge_anchor`: For a `return` that is the second of a two-statement `[simple_stmt, return]` suite, the line of
-      that preceding statement. The trailing-return rule then anchors the paragraph there (and the two statements
-      share one paragraph) instead of breaking before the return - so a tiny `[stmt; return]` block reads as a single
-      unit, commented at its start. None for any other statement.
-    - `force_break`: Whether the provider requires a paragraph break above this statement regardless of the other
-      rules (used by the leading-declaration heuristic: the first real statement after a scope's opening run of
-      variable declarations breaks off from them, so the declarations sit as their own paragraph).
+    `opens_block` and `closed_block` give the size of the block a statement opens or has just closed, `merge_anchor` ties a trailing return to the statement it belongs with, and `force_break` lets a provider demand a paragraph break regardless of the other rules.
     """
 
+    # Per-statement structural facts the break rules consume; merge_anchor glues a trailing return to the statement it belongs with.
     start: int
     end: int
     depth: int
@@ -326,42 +275,36 @@ def structural_breaks(
     allow_first_in_scope: bool = True,
 ) -> List[Tuple[int, int]]:
     """
-    Deterministically segment a routine body into paragraph chunks from its normalised statement records.
+    Split a routine body into paragraph ranges using purely structural rules.
 
-    This is the shared core of SCALE's structural paragraph segmenter: every language worker builds
-    `SegStatement` records and calls this one function, so the rules (Steve's stated conventions) are defined
-    once. A break is placed - only ever at a legal `boundary_lines` line, so the body is never split mid-statement
-    - for: the first statement after a docstring (when the body has one); the statement after a nested def/class (a
-    def clearly ends a paragraph); a `return` whose preceding statement is at the same depth; a compound/def block
-    of at least `min_block_lines` source lines; the statement resuming after such a block closes (a dedent); and any
-    statement the provider marked `force_break` (the leading-declaration heuristic: the first real statement after a
-    scope's opening run of variable declarations breaks off, leaving the declarations as their own paragraph).
-
-    The `allow_*` flags capture the only real cross-language differences: brace languages have no in-body docstring
-    (`allow_first_in_scope=False`, and `has_doc` is then irrelevant) and C has no nested functions
-    (`allow_after_def=False`).
+    Walks the statements in order and opens a paragraph at provider-forced breaks, after a docstring, after a nested def, around returns, at substantial nested blocks, and on the dedent out of one - the first matching rule wins. Only lines in `boundary_lines` may start a paragraph, and the body's first statement always does, so the returned ranges cover the whole body.
 
     Parameters:
-    - `stmts`: The body's statements in source order, as normalised records.
-    - `has_doc`: Whether the routine body opens with a docstring (only meaningful when `allow_first_in_scope`).
-    - `boundary_lines`: The legal block-start lines; a break is only placed at one of these.
-    - `body_end`: The last line of the routine body, clamping the final chunk's end.
-    - `min_block_lines`: The size gate for the before-compound and dedent rules.
-    - `allow_after_def`: Whether the "blank after a nested def" rule applies (off for C).
-    - `allow_first_in_scope`: Whether the "blank after a docstring" rule applies (off for brace languages).
+    - `stmts`: Structural facts for each statement, in body order.
+    - `has_doc`: Whether the routine has a docstring (enables the first-in-scope break).
+    - `boundary_lines`: The only line numbers allowed to start a paragraph.
+    - `body_end`: Last body line, used to close the final range.
+    - `min_block_lines`: Minimum block size that forces breaks around a nested block.
+    - `allow_after_def`: Permit the break after a nested def.
+    - `allow_first_in_scope`: Permit the break separating a docstring from the first statement.
 
     Returns:
-    - A list of `(start, end)` chunk ranges, sorted by start, non-overlapping, each starting at a legal boundary.
+    - Inclusive `(start, end)` line ranges, one per paragraph, in body order.
     """
 
+    # Only provider-approved boundary lines may start a paragraph.
     legal = set(boundary_lines)
     breaks: set = set()
+
+    # Statements off a legal boundary can never open a paragraph; provider-forced breaks are honoured unconditionally.
     for i, s in enumerate(stmts):
         if s.start not in legal:
             continue
         prev = stmts[i - 1] if i > 0 else None
         if s.force_break:
             breaks.add(s.start)                      # provider-forced break (e.g. off a leading declaration block)
+
+        # One rule ladder per statement - the first matching rule wins, so their order is deliberate.
         if s.first_in_scope:
             if has_doc and allow_first_in_scope:
                 breaks.add(s.start)                  # blank separating a docstring from the first statement
@@ -376,10 +319,7 @@ def structural_breaks(
         elif prev is not None and prev.depth > s.depth and (s.closed_block == 0 or s.closed_block >= min_block_lines):
             breaks.add(s.start)                      # resuming after a substantial nested block closed
 
-    # The opening paragraph - from the first body statement up to the first break - is a chunk too, so it is
-    # summarised and scored like every other paragraph rather than silently dropped. (A trivial opener, e.g. a
-    # declaration block, simply scores low and gets no comment; a meaningful one is not lost.) The patcher places no
-    # blank above it since it sits right after the header.
+    # The body's first statement always opens a paragraph, so the returned ranges cover the whole body.
     starts = sorted(breaks)
     if stmts and stmts[0].start in legal and (not starts or starts[0] != stmts[0].start):
         starts.insert(0, stmts[0].start)
@@ -391,108 +331,106 @@ def structural_breaks(
 
 def _is_comment_line(line: str, style: CommentStyle) -> bool:
     """
-    Report whether a line is a pure comment line in the given language (ignoring leading whitespace).
+    Report whether a line is a comment line under the given style.
 
-    A line carrying code with a trailing comment is not a pure comment line and returns False.
+    Both the line prefix and any block-comment delimiters are matched with surrounding whitespace stripped, so variants without the conventional trailing space still count; blank lines never do.
 
     Parameters:
     - `line`: The source line to test.
-    - `style`: The comment-style descriptor for the language.
+    - `style`: Comment delimiters for the file's language.
 
     Returns:
-    - True if the stripped line begins with the line-comment prefix or a block-comment delimiter.
+    - `True` if the line opens, continues, or closes a comment; `False` otherwise.
     """
 
+    # Delimiters are compared stripped, so a marker without its usual trailing space still matches.
     s = line.lstrip()
     if not s:
         return False
     if s.startswith(style.line_prefix.strip()):
         return True
+
+    # Continuation and closing lines of a block comment count as comment lines too.
     for delim in (style.block_open, style.block_cont, style.block_close):
         if delim and s.startswith(delim.strip()):
             return True
+
     return False
 
 
 def render_comment_lines(text: str, indent: str, style: CommentStyle) -> List[str]:
     """
-    Render comment `text` as one or more source lines at the given indentation, using the language's comment style.
+    Render comment text as indented source lines in the given style.
 
-    A single line of text becomes a single line comment. Multiple lines become a block comment when the style provides
-    block delimiters, or a run of line comments otherwise (e.g. Python).
+    Single-line text (or any style without a block form) is rendered as line comments; multi-line text is wrapped in the block delimiters, using the line prefix for continuation lines when the style defines no continuation marker. Every line is right-stripped so blank comment lines carry no trailing whitespace.
 
     Parameters:
-    - `text`: The comment body (without any comment delimiters); may contain newlines.
-    - `indent`: The exact leading-whitespace string to prefix each rendered line with.
-    - `style`: The comment-style descriptor for the language.
+    - `text`: The comment text, with embedded newlines for multiple lines.
+    - `indent`: Indentation prepended to every emitted line.
+    - `style`: Comment delimiters for the file's language.
 
     Returns:
     - The rendered comment as a list of source lines.
     """
 
+    # Single-line text stays in compact line-comment form; only genuinely multi-line text earns the block delimiters.
     lines = text.split("\n")
-
-    # Line-comment form: one prefix per line (the only option when no block delimiters are defined).
     if style.block_open is None or len(lines) == 1:
         return [(f"{indent}{style.line_prefix}{ln}").rstrip() for ln in lines]
-
-    # Block-comment form: delimiters on their own lines, interior lines carry the continuation prefix.
     out = [f"{indent}{style.block_open}"]
     cont = style.block_cont if style.block_cont is not None else style.line_prefix
     out.extend((f"{indent}{cont}{ln}").rstrip() for ln in lines)
     out.append(f"{indent}{style.block_close}")
+
     return out
 
 
 def _parse_comment_reply(reply: str, style: CommentStyle) -> Optional[str]:
     """
-    Turn a model reply for a single block into clean comment text, or None when no comment is wanted.
+    Extract the usable comment text from a raw model reply.
 
-    The density gate is built in: an empty reply, or the explicit sentinel `NONE`, yields None (the common case). Any
-    surrounding code fence is removed, and any comment delimiters the model echoed back are stripped so the result is
-    plain prose ready for `render_comment_lines`.
+    The reply may arrive wrapped in a code fence and/or already dressed in the target language's comment delimiters; both are stripped so the caller holds bare prose. An explicit `NONE` - detected both before and after cleaning - means the model declined to comment.
 
     Parameters:
-    - `reply`: The raw model reply.
-    - `style`: The comment-style descriptor for the language.
+    - `reply`: The raw model reply text.
+    - `style`: The `CommentStyle` whose delimiters are stripped from each line.
 
     Returns:
-    - The cleaned comment text, or None if the model declined to comment this block.
+    - The cleaned comment text, or `None` if the reply was empty or an explicit `NONE`.
     """
 
+    # Unwrap any code fence and honour an explicit NONE refusal before any delimiter stripping.
     text = reply.strip()
     if not text:
         return None
-
-    # Strip a surrounding ``` code fence if present (keep the fenced content).
     fence = re.match(r"^```[^\n]*\n(.*)\n```$", text, flags=re.DOTALL)
     if fence:
         text = fence.group(1).strip()
-
-    # Explicit decline sentinel, in whatever light wrapping the model used.
     if text.strip("`\"'* ").upper() == "NONE":
         return None
-
-    # Strip any comment delimiters the model echoed back, line by line.
     delims = [d for d in (style.line_prefix.strip(), style.block_open, style.block_close) if d]
     cleaned: List[str] = []
+
+    # Clean each reply line of whatever comment dressing the model added.
     for ln in text.split("\n"):
         s = ln.strip()
+
+        # Shed at most one leading delimiter per line, so a marker inside the prose itself survives.
         for d in delims:
             if s.startswith(d):
                 s = s[len(d):].strip()
                 break
-        # Drop a lone block continuation marker (e.g. "*") left after stripping.
+
+        # A bare block-continuation marker is dressing, not content - keep the line but blank it.
         if style.block_cont and s == style.block_cont.strip():
             s = ""
         cleaned.append(s)
 
-    # Trim leading/trailing blank lines introduced by delimiter stripping.
+    # Trim blank edges and re-check: stripping may have exposed an empty or NONE-only reply.
     while cleaned and not cleaned[0]:
         cleaned.pop(0)
     while cleaned and not cleaned[-1]:
         cleaned.pop()
-
     result = "\n".join(cleaned).strip()
     if not result or result.upper() == "NONE":
         return None
@@ -501,23 +439,25 @@ def _parse_comment_reply(reply: str, style: CommentStyle) -> Optional[str]:
 
 def _is_explicit_none(reply: str) -> bool:
     """
-    Report whether a reply is a deliberate "no comment needed" answer (rather than an empty / evasive non-answer).
+    Report whether a model reply is an explicit `NONE` refusal.
 
-    Used to decide whether to nudge the model again: a clear NONE is accepted as-is, but an unusable non-answer earns
-    one more, gentler attempt.
+    Only the first line is consulted, after unwrapping any surrounding code fence and stripping quote and markdown decoration, so a refusal followed by explanatory chatter still registers.
 
     Parameters:
-    - `reply`: The raw model reply.
+    - `reply`: The raw model reply text.
 
     Returns:
-    - True if the reply's first line is essentially the word NONE.
+    - `True` if the reply leads with `NONE`, otherwise `False`.
     """
 
+    # Only the first line decides, after unwrapping any code fence and shedding quote/markdown dressing.
     text = reply.strip()
     fence = re.match(r"^```[^\n]*\n(.*)\n```$", text, flags=re.DOTALL)
     if fence:
         text = fence.group(1).strip()
     head = text.split("\n", 1)[0].strip().strip("`\"'*.: ")
+
+    # Prefix match, so a refusal followed by justification still counts.
     return head.upper().startswith("NONE")
 
 
@@ -526,61 +466,76 @@ def _is_explicit_none(reply: str) -> bool:
 
 def render_numbered_body(source_lines: Chunk, target: BlockTarget) -> str:
     """
-    Render a routine's body for the segment pass, numbering only the lines that may legally begin a chunk.
+    Render a routine's body as a numbered view for the segmentation prompt.
 
-    Boundary lines are shown with their original source line number in a left gutter (cat -n style); all other lines
-    are shown without a number so the model cannot pick them. A long run of non-boundary lines - continuation lines, or
-    the opaque body of a nested definition - is collapsed to a single elision band, keeping the view compact and
-    legible regardless of body size. The signature is included (unnumbered) for context.
+    Only the lines in `target.boundary_lines` carry numbers - they are the sole legal segment starts - while the header and the remaining body lines appear unnumbered as context, with long unnumbered runs collapsed into an elision band.
 
     Parameters:
-    - `source_lines`: The full source split into lines (1-based addressing via index+1).
-    - `target`: The routine to render.
+    - `source_lines`: The pristine source lines of the whole file.
+    - `target`: The `BlockTarget` whose header and body ranges are rendered.
 
     Returns:
-    - The numbered body as a single string.
+    - The rendered view as a single newline-joined string.
     """
 
+    # Only boundary lines will carry numbers; size the gutter once so the pipe column stays aligned.
     boundary = set(target.boundary_lines)
     gutter = max(4, len(str(target.body_end)))
-
     def numbered(n: int, text: str) -> str:
-        """Render a boundary line with its number in the gutter."""
+        """
+        Render one source line with its right-aligned line number in the gutter.
+        """
+
         return f"{str(n).rjust(gutter)}| {text}"
 
     def unnumbered(text: str) -> str:
-        """Render a non-boundary line with an empty gutter."""
+        """
+        Render one source line with a blank gutter, marking it as context only.
+        """
+
         return f"{' ' * gutter}| {text}"
 
     out: List[str] = []
 
-    # Context header: the signature lines, unnumbered.
+    # The header is context only - rendered unnumbered so it can never be claimed as a segment start.
     for ln in range(target.header_start, target.header_end + 1):
         if 1 <= ln <= len(source_lines):
             out.append(unnumbered(source_lines[ln - 1]))
 
-    # Body: number boundary lines; collapse over-long non-boundary runs to an elision band.
     run: List[str] = []
 
+    # Long unnumbered stretches collapse into an elision band to keep the view within prompt budget.
     def flush_run() -> None:
-        """Emit the accumulated non-boundary run, eliding it to a band when it is over-long."""
+        """
+        Flush the buffered run of context lines into the output.
+
+        Runs longer than `MAX_CONTEXT_RUN` are replaced with a single elision band so the rendered view stays compact; the buffer is cleared either way.
+        """
+
         if not run:
             return
+
+        # Runs past `MAX_CONTEXT_RUN` become a single elision band rather than swelling the view.
         if len(run) > MAX_CONTEXT_RUN:
             out.append(unnumbered(ELISION_BAND.format(n=len(run))))
         else:
             out.extend(unnumbered(t) for t in run)
+
         run.clear()
 
     for ln in range(target.body_start, target.body_end + 1):
         if not (1 <= ln <= len(source_lines)):
             continue
         text = source_lines[ln - 1]
+
+        # Boundary lines flush the pending run and appear numbered; everything between accumulates for possible elision.
         if ln in boundary:
             flush_run()
             out.append(numbered(ln, text))
         else:
             run.append(text)
+
+    # Catch a run that reaches the end of the body.
     flush_run()
 
     return "\n".join(out)
@@ -588,43 +543,41 @@ def render_numbered_body(source_lines: Chunk, target: BlockTarget) -> str:
 
 def _parse_segments(reply: str, boundary_lines: Tuple[int, ...], body_end: int) -> List[Tuple[int, int]]:
     """
-    Extract chunk line ranges from a model reply, snapping starts to legal statement boundaries.
+    Parse the model's segmentation reply into validated `(start, end)` line ranges.
 
-    The model is asked for `start-end` ranges. Each start must be a legal boundary (statement start) or the range is
-    dropped, so the model can never begin a chunk at an illegal line. Starts are deduplicated and sorted; each end is
-    clamped to lie within the body and not to overlap the next chunk. If the reply contains no ranges at all, every
-    bare number that is a legal boundary is taken as a chunk start (with the end inferred from the next start) - so the
-    pass still works if the model ignores the range format.
+    Explicit `start-end` pairs are preferred; failing that, every bare number naming a legal boundary becomes a segment start running to the body end. Starts outside `boundary_lines` are discarded, duplicate starts keep their first occurrence, and ends are clamped so segments never overlap the next segment or overrun the body.
 
     Parameters:
-    - `reply`: The raw model reply.
-    - `boundary_lines`: The legal boundary line numbers offered to the model.
-    - `body_end`: The last line of the routine body (clamps the final chunk's end).
+    - `reply`: The raw model reply listing the segments.
+    - `boundary_lines`: The line numbers that are legal segment starts.
+    - `body_end`: The last body line, used to cap every range.
 
     Returns:
-    - A list of `(start, end)` chunk ranges, sorted by start, non-overlapping, with legal starts.
+    - The cleaned segments as a list of `(start, end)` tuples, ordered by start.
     """
 
+    # Tolerate hyphen, en dash or em dash between range endpoints - models vary.
     allowed = set(boundary_lines)
-
     pairs = re.findall(r"(\d+)\s*[-–—]\s*(\d+)", reply)
+
+    # Prefer explicit ranges; with none, each bare boundary number becomes a start running to the body end.
     if pairs:
         candidates = [(int(a), int(b)) for a, b in pairs if int(a) in allowed]
     else:
-        # No ranges given: fall back to bare numbers as starts (ends inferred below).
         starts = sorted({int(tok) for tok in re.findall(r"\d+", reply)} & allowed)
         candidates = [(s, body_end) for s in starts]
 
-    # Deduplicate by start (keep the first range seen for each start), sorted ascending.
     seen: set = set()
     ordered: List[List[int]] = []
+
+    # Sort by start and keep only the first claim on each start line.
     for a, b in sorted(candidates, key=lambda p: p[0]):
         if a in seen:
             continue
         seen.add(a)
         ordered.append([a, b])
 
-    # Clamp each end: at least the start, at most the body end, and never past the next chunk's start.
+    # Clamp each end so segments stay non-empty, never reach the next start, and never overrun the body.
     for i, pair in enumerate(ordered):
         next_start = ordered[i + 1][0] - 1 if i + 1 < len(ordered) else body_end
         pair[1] = min(max(pair[1], pair[0]), body_end, next_start)
@@ -641,39 +594,33 @@ def request_segments(
     prompt_template: Optional[str] = None,
 ) -> List[Tuple[int, int]]:
     """
-    Ask the model to group the routine body into chunk line ranges, and return the sanitised ranges.
+    Ask the model to split a routine's body into commentable segments.
 
-    The numbered body view is appended as a turn and popped after the reply, keeping the persistent context bounded.
-    The view is elided to the snippet budget first so a very large body still fits the context window. Each chunk's
-    start is snapped to `target.boundary_lines` (an illegal start is dropped), so the model can never begin a chunk at
-    a line that is not a legal statement start. Asking for ranges rather than split points keeps the model grouping
-    related lines instead of fragmenting the body line by line.
+    The body is rendered as a numbered view, cropped to fit the context budget, then sent as a single low-temperature turn that is removed from `messages` afterwards; the reply is parsed into validated line ranges.
 
     Parameters:
-    - `llm`: The LocalChatModel instance.
-    - `cfg`: The generation configuration.
-    - `messages`: The persistent priming context (mutated then restored).
-    - `source_lines`: The full source split into lines.
-    - `target`: The routine being segmented.
+    - `llm`: The local chat model used for the segmentation turn.
+    - `cfg`: The base generation configuration; temperature and reply length are tightened for this turn.
+    - `messages`: The shared conversation, restored to its prior state before returning.
+    - `source_lines`: The pristine source lines of the whole file.
+    - `target`: The `BlockTarget` describing the routine to segment.
+    - `prompt_template`: Optional override for the default segmentation prompt.
 
     Returns:
-    - A list of `(start, end)` chunk ranges, sorted by start, non-overlapping, with legal starts.
+    - The parsed segments as a list of `(start, end)` line tuples.
     """
 
+    # One throwaway low-temperature turn: the prompt is popped straight after the reply so the shared context stays bounded.
     view = render_numbered_body(source_lines, target)
-
-    # Keep the view within the context window. Eliding the middle only loses some candidate lines (they simply will
-    # not get a chunk); it never risks the output, which is patched from the real source.
     view, _ = fit_snippet(llm, cfg, messages, view, header_line_count=1, marker=MARKER_PYTHON)
-
     prompt = _fill(prompt_template or SEGMENT_PROMPT, kind=target.kind, qualname=target.qualname, view=view)
     messages.append({"role": "user", "content": prompt})
     turn_cfg = replace(cfg, temperature=SEGMENT_TEMPERATURE, max_new_tokens=min(cfg.max_new_tokens, SEGMENT_REPLY_TOKENS))
     reply = llm.generate(messages, cfg=turn_cfg)
     messages.pop()
-
     segments = _parse_segments(reply, target.boundary_lines, target.body_end)
     echo(f"[blocks] '{target.qualname}': {len(segments)} chunk(s) identified")
+
     return segments
 
 
@@ -682,39 +629,37 @@ def request_segments(
 
 def _doc_summary(doc: str) -> str:
     """
-    Reduce a routine docstring to a one-line summary for use as brief context.
-
-    Takes the first non-empty line, which by convention is the docstring's summary sentence; returns a short
-    placeholder when there is no docstring.
+    Return the first non-blank line of a docstring, stripped, or a placeholder when there is none.
 
     Parameters:
-    - `doc`: The routine's docstring (may be empty or multi-line).
+    - `doc`: The docstring text to summarise; may be empty.
 
     Returns:
-    - A single summary line.
+    - The first non-blank line, or `(no description)` when every line is blank.
     """
 
     for line in doc.splitlines():
         if line.strip():
             return line.strip()
+
     return "(no description)"
 
 
 def _parse_summary(reply: str, style: CommentStyle) -> str:
     """
-    Extract a routine paragraph's one-line summary from a model reply, best-effort.
+    Reduce a raw model reply to a single clean comment line.
 
-    Takes the first non-empty line, strips any echoed comment delimiters / surrounding quotes and a stray
-    `VALUE_FLAG` (in case the model copied a flagged prior note), and treats a bare refusal as no summary.
+    Tolerates common model misbehaviour: a wrapping code fence is unwrapped, an echoed comment delimiter is stripped, stray flags and quoting are scrubbed, and the usual refusal words collapse to the empty string.
 
     Parameters:
-    - `reply`: The raw model reply.
-    - `style`: The comment-style descriptor for the language.
+    - `reply`: The raw model reply; may be `None` or empty.
+    - `style`: The comment style whose delimiters the model may have echoed.
 
     Returns:
-    - The cleaned one-line summary, or "" when the reply carries no usable description.
+    - The cleaned one-line summary, or an empty string when the model declined or produced nothing usable.
     """
 
+    # Models often wrap the reply in a code fence despite instructions; unwrap it and keep only the first non-blank line.
     text = (reply or "").strip()
     fence = re.match(r"^```[^\n]*\n(.*)\n```$", text, flags=re.DOTALL)
     if fence:
@@ -722,10 +667,14 @@ def _parse_summary(reply: str, style: CommentStyle) -> str:
     first = next((ln.strip() for ln in text.split("\n") if ln.strip()), "")
     if not first:
         return ""
+
+    # Strip an echoed comment delimiter so the style's own prefix is never doubled when the comment is inserted.
     for d in (style.line_prefix.strip(), style.block_open, style.block_close):
         if d and first.startswith(d):
             first = first[len(d):].strip()
             break
+
+    # Treat the model's various ways of saying 'nothing worth noting' as a deliberate empty answer.
     first = first.replace(VALUE_FLAG, "").replace(CHALLENGE_FLAG, "").strip("`\"'* ").strip()
     if first.upper() in ("", "NONE", "SKIP", "N/A", "TRIVIAL"):
         return ""
@@ -734,24 +683,49 @@ def _parse_summary(reply: str, style: CommentStyle) -> str:
 
 def _parse_score(reply: str, default: int = COMMENT_VALUE_THRESHOLD) -> int:
     """
-    Extract the 1-3 value score from a model reply, clamped to [1, 3], falling back to `default` if no digit is present.
+    Extract a 1-3 value score from a model reply.
 
-    Clamping keeps a model that lapses into the old 1-5 habit safe: a stray 4 or 5 reads as "top of the scale" (3,
-    keep) rather than being missed, and a 0 reads as 1.
+    Parameters:
+    - `reply`: The raw scoring reply; only its first digit is read.
+    - `default`: The score assumed when the reply contains no digit at all.
+
+    Returns:
+    - The clamped score in the range 1 to 3, or `default` for a digit-free reply.
     """
+
+    # The first digit anywhere counts; a digit-free reply defaults to the keep threshold rather than silently dropping the comment.
     m = re.search(r"[0-9]", reply or "")
     return min(3, max(1, int(m.group()))) if m else default
 
 
 def _comment_to_insert(comment: Optional[str]) -> Optional[str]:
-    """Return the comment to write into the code: None when it carries `VALUE_FLAG` or `CHALLENGE_FLAG`, else unchanged."""
+    """
+    Decide whether a block-pass result should actually be inserted into the source.
+
+    Parameters:
+    - `comment`: The comment text, possibly carrying a trailing rejection flag, or `None`.
+
+    Returns:
+    - The comment unchanged, or `None` when it is absent or flagged as rejected.
+    """
+
+    # A trailing flag marks a comment that was generated but rejected (low value or failed challenge): it is kept for logging only, never inserted.
     if comment and comment.rstrip().endswith((VALUE_FLAG, CHALLENGE_FLAG)):
         return None
     return comment
 
 
 def _strip_note_flags(comment: Optional[str]) -> str:
-    """Return a note's bare text, with any trailing `VALUE_FLAG`/`CHALLENGE_FLAG` marker removed."""
+    """
+    Remove the internal rejection flags from a comment so it can be shown to a reader.
+
+    Parameters:
+    - `comment`: The comment text, possibly flagged, or `None`.
+
+    Returns:
+    - The flag-free text, stripped of surrounding whitespace; empty when `comment` is `None`.
+    """
+
     out = comment or ""
     for flag in (VALUE_FLAG, CHALLENGE_FLAG):
         out = out.replace(flag, "")
@@ -760,31 +734,28 @@ def _strip_note_flags(comment: Optional[str]) -> str:
 
 def _context_window(source_lines: Chunk, target: BlockTarget, blob_start: int, blob_end: int) -> Tuple[int, int]:
     """
-    Compute the raw source window `(lo, hi)` shown around a paragraph in the comment turn.
+    Choose the range of source lines shown around a paragraph in the block-pass prompt.
 
-    The base window is `BLOCK_CONTEXT_LINES` either side of the paragraph, clamped to the routine
-    (`header_start`..`body_end`) so the signature is the furthest back it can reach. The lower edge is then nudged
-    further back to the paragraph's enclosing scope opener - walking up at most `BLOCK_SCOPE_NUDGE_CAP` lines, the
-    first non-blank line with strictly smaller leading whitespace than the paragraph's first line - so a paragraph
-    deep inside an `if`/loop is read knowing what guards it. The nudge only ever extends the window backwards.
+    The window is a fixed number of lines either side of the paragraph, clamped to the routine's bounds, then widened backwards (within a cap) to reach the statement that opens the paragraph's enclosing scope, so the model can see which branch or loop the paragraph sits in.
 
     Parameters:
-    - `source_lines`: The full source split into lines.
-    - `target`: The routine the paragraph belongs to.
-    - `blob_start`: The first line of the paragraph (1-based).
-    - `blob_end`: The last line of the paragraph, inclusive.
+    - `source_lines`: The pristine source, one entry per line.
+    - `target`: The routine being commented; supplies the clamping bounds.
+    - `blob_start`: First line of the paragraph (1-based).
+    - `blob_end`: Last line of the paragraph (1-based).
 
     Returns:
-    - The `(lo, hi)` window bounds, 1-based and inclusive.
+    - A `(lo, hi)` pair of 1-based inclusive line numbers to display.
     """
 
+    # Start from a fixed-size window clamped to the routine; the paragraph's own indent anchors the scope search below.
     lo = max(target.header_start, blob_start - BLOCK_CONTEXT_LINES)
     hi = min(target.body_end, blob_end + BLOCK_CONTEXT_LINES)
-
-    # Scope nudge: find the paragraph's enclosing scope opener and pull the window back to include it.
     first = source_lines[blob_start - 1] if 1 <= blob_start <= len(source_lines) else ""
     para_indent = first[:len(first) - len(first.lstrip())]
     floor = max(target.header_start, blob_start - BLOCK_SCOPE_NUDGE_CAP)
+
+    # Scan upwards, within a capped distance, for the nearest non-blank line indented less than the paragraph: the statement that opened its enclosing scope.
     for ln in range(blob_start - 1, floor - 1, -1):
         if not (1 <= ln <= len(source_lines)):
             break
@@ -792,6 +763,8 @@ def _context_window(source_lines: Chunk, target: BlockTarget, blob_start: int, b
         if not text.strip():
             continue
         indent = text[:len(text) - len(text.lstrip())]
+
+        # Widen the window back to take in the scope opener, so the prompt shows which branch or loop the paragraph belongs to.
         if len(indent) < len(para_indent):
             lo = min(lo, ln)        # never forward: the ±N window already reaches at least this far back
             break
@@ -819,60 +792,43 @@ def request_block_comment(
     feedback: Optional[str] = None,
 ) -> Optional[str]:
     """
-    Summarise one paragraph of a routine and score how much that summary is worth as a code comment.
+    Generate, verify and score one block comment for a paragraph of a routine's body.
 
-    Two turns. **Turn 1** always asks for a one-line description of the paragraph - there is no opt-out, because the
-    summary is the running record (`priors`) that later paragraphs depend on (a paragraph left undescribed used to
-    starve its successors of context and drive hallucinations). The paragraph is shown gutter-marked `> ` inside its
-    raw context window (`_context_window`) alongside the routine's purpose and the notes on earlier paragraphs; the
-    file overview is already primed. **Turn 2** asks for a
-    1-3 value score for that summary as a code comment (1 = restates the code, 2 = signpost, 3 = intent/gotcha).
-
-    The summary is always returned (for the caller to keep as context). When its score falls below
-    `value_threshold`, the magic `VALUE_FLAG` is appended so the caller can recognise it as low-value - keeping it as
-    context but skipping it at output (`_comment_to_insert`).
+    Runs the two-turn comment-then-score exchange in the shared conversation, with up to one nudge on an empty reply, one grounding correction, and one regenerate-and-rescore retry when the verifier's obviousness challenge fails. Every message appended here is popped before returning, so the caller's conversation is left exactly as it arrived.
 
     Parameters:
-    - `llm`: The LocalChatModel instance.
-    - `cfg`: The generation configuration.
-    - `messages`: The persistent priming context (mutated then restored).
-    - `source_lines`: The full source split into lines.
-    - `target`: The routine the paragraph belongs to.
-    - `blob_start`: The first line of the paragraph (a chosen chunk start).
-    - `blob_end`: The last line of the paragraph, inclusive.
-    - `style`: The comment-style descriptor for the language.
-    - `prior_comments`: One-line notes on earlier paragraphs of this routine (narrative context).
-    - `length_note`: A short- vs long-routine note injected into the score turn as `{length_note}`.
-    - `prompt_template`: Optional override for the summary prompt (defaults to `COMMENT_PROMPT`).
-    - `nudge_template`: Optional override for the summary retry nudge (defaults to `COMMENT_NUDGE`).
-    - `score_template`: Optional override for the value-score prompt (defaults to `SCORE_PROMPT`).
-    - `value_threshold`: The minimum 1-3 score for the summary to be left unflagged (insertable); below it the
-      summary is tagged with `VALUE_FLAG` (defaults to `COMMENT_VALUE_THRESHOLD`).
-    - `line_notes`: Optional `{source line -> "callee: one-liner"}` call annotations (the call-graph context). Each
-      noted line *within this paragraph* is shown to the model with the note appended as a trailing comment, so the
-      summary can draw on what the called routine does. READ-SIDE ONLY: the annotation enriches what the model sees
-      and is never written to the output (the patcher works from the real source lines).
-    - `verifier`: Optional `scale_verify.Verifier`. When supplied, an insertable summary additionally faces the
-      deterministic grounding gate (backticked identifiers must exist in the run's source; one corrective nudge) and
-      the clean-context obviousness challenge (one regeneration with the verdict as feedback). A summary that fails
-      either twice is tagged with `CHALLENGE_FLAG`: kept as context, never written.
-    - `feedback`: Optional reviewer feedback appended to the summary turn (the story-challenge retry), steering the
-      regenerated note towards intent rather than restatement.
+    - `llm`: The local chat model used for every turn.
+    - `cfg`: Base generation settings; temperature and reply budget are tightened per turn.
+    - `messages`: The shared conversation; restored to its incoming state on every exit path.
+    - `source_lines`: The pristine source, one entry per line.
+    - `target`: The routine that owns the paragraph.
+    - `blob_start`: First line of the paragraph (1-based).
+    - `blob_end`: Last line of the paragraph (1-based).
+    - `style`: The comment style, used to clean delimiters from replies.
+    - `prior_comments`: Comments already written for this routine, shown to discourage repetition.
+    - `length_note`: Scoring guidance keyed to the routine's length.
+    - `prompt_template`: Optional override for the built-in comment prompt.
+    - `nudge_template`: Optional override for the empty-reply nudge prompt.
+    - `score_template`: Optional override for the value-scoring prompt.
+    - `value_threshold`: Minimum score (1-3) a comment must reach to be kept.
+    - `line_notes`: Optional per-line callee notes appended to the paragraph's lines in the prompt view.
+    - `verifier`: Optional grounding/obviousness verifier; `None` disables both checks.
+    - `feedback`: Optional extra instruction appended to the first prompt.
 
     Returns:
-    - The one-line summary (suffixed with `VALUE_FLAG` when low-value, or `CHALLENGE_FLAG` when it failed
-      verification twice), or None if the model gave nothing usable.
+    - The comment text when kept; the text with a trailing internal flag when generated but dropped (low value or failed challenge); or `None` when no usable reply was produced.
     """
 
-    # The model's view: the paragraph inside its raw context window, target lines gutter-marked `> ` and context
-    # lines indented to match. Call lines within the paragraph carry their callee's one-liner as a trailing comment.
-    # This is the model's view only - the output is patched from the pristine source, so a misplaced note is harmless.
+    # Build the source view the model will see: the scope-aware context window around the paragraph.
     lo, hi = _context_window(source_lines, target, blob_start, blob_end)
     view_lines: List[str] = []
+
     for ln in range(lo, hi + 1):
         if not (1 <= ln <= len(source_lines)):
             continue
         text = source_lines[ln - 1]
+
+        # Paragraph lines are marked with '>' to set them apart from mere context; callee one-liners ride along as trailing notes.
         if blob_start <= ln <= blob_end:
             note = line_notes.get(ln) if line_notes else None
             if note and text.strip():
@@ -880,9 +836,10 @@ def request_block_comment(
             view_lines.append(f"> {text}")
         else:
             view_lines.append(f"  {text}")
+
+    # First comment turn at a low temperature; `appended` counts every message pushed so the shared context can be unwound on every exit path.
     block_text = "\n".join(view_lines)
     priors = "\n".join(f"- {c}" for c in (prior_comments or [])) or "(none yet)"
-
     prompt = _fill(
         prompt_template or COMMENT_PROMPT,
         kind=target.kind, qualname=target.qualname, doc=_doc_summary(target.doc),
@@ -891,27 +848,29 @@ def request_block_comment(
     if feedback:
         prompt += "\n\n" + feedback
     turn_cfg = replace(cfg, temperature=COMMENT_TEMPERATURE, max_new_tokens=min(cfg.max_new_tokens, COMMENT_REPLY_TOKENS))
-
-    # Turn 1: a one-line description, always. Nudge once if the first reply is unusable.
     appended = 0
     messages.append({"role": "user", "content": prompt})
     appended += 1
     summary = _parse_summary(llm.generate(messages, cfg=turn_cfg), style)
+
+    # An empty or refused first reply earns exactly one nudge before giving up.
     if not summary:
         messages.append({"role": "assistant", "content": "(no answer)"})
         messages.append({"role": "user", "content": nudge_template or COMMENT_NUDGE})
         appended += 2
         summary = _parse_summary(llm.generate(messages, cfg=turn_cfg), style)
+
+    # Still nothing after the nudge: restore the context and report no comment.
     if not summary:
         for _ in range(appended):
             messages.pop()
         return None
 
-    # The grounding gate (deterministic, model-free check; one corrective nudge): a note naming an identifier that
-    # exists nowhere in the run's source is nudged to correct it, and tagged CHALLENGE_FLAG if it still does not -
-    # kept as context (the running record must not starve later paragraphs) but never written.
+    # Grounding gate: every backticked identifier in the summary must actually appear in the code.
     if verifier is not None:
         tokens = verifier.ungrounded(summary)
+
+        # Ungrounded identifiers get one corrective turn naming the offending tokens.
         if tokens:
             echo(f"[verify] '{target.qualname}' L{blob_start}-{blob_end}: ungrounded identifiers {tokens}; nudging")
             messages.append({"role": "assistant", "content": summary})
@@ -920,13 +879,17 @@ def request_block_comment(
             new = _parse_summary(llm.generate(messages, cfg=turn_cfg), style)
             if new:
                 summary = new
+
+            # A second grounding failure is final: unwind the conversation and drop the comment.
             if verifier.ungrounded(summary):
                 for _ in range(appended):
                     messages.pop()
                 echo(f"[verify] '{target.qualname}' L{blob_start}-{blob_end}: still ungrounded; comment dropped")
+
+                # The flag suffix keeps the text visible in logs while marking it as never-to-insert.
                 return f"{summary} {CHALLENGE_FLAG}"
 
-    # Turn 2: score the summary's value as a code comment (1-3).
+    # Score turn: with the summary now on record, the model rates its value in the same context at a colder temperature.
     messages.append({"role": "assistant", "content": summary})
     score_prompt = _fill(score_template or SCORE_PROMPT, kind=target.kind, qualname=target.qualname,
                          length_note=length_note, block=block_text)
@@ -935,14 +898,13 @@ def request_block_comment(
     score_cfg = replace(cfg, temperature=SCORE_TEMPERATURE, max_new_tokens=min(cfg.max_new_tokens, SCORE_REPLY_TOKENS))
     score = _parse_score(llm.generate(messages, cfg=score_cfg))
     kept = score >= value_threshold
-
-    # The obviousness challenge (clean context - just the pristine paragraph, the note, one YES/NO question) on a
-    # note that would be written: a NO regenerates the note once with the verdict as feedback (re-scored, then
-    # re-challenged); a second NO tags it CHALLENGE_FLAG - dropped from the output, kept as context. This kills
-    # restatement and purpose-clause score-gaming that the (same-context) score turn lets through.
     challenge_failed = False
+
+    # Only comments that passed the score face the obviousness challenge, judged against the pristine, unannotated paragraph.
     if kept and verifier is not None:
         pristine = "\n".join(source_lines[blob_start - 1:blob_end])
+
+        # One retry on a failed challenge: retract the score turn, regenerate with the obviousness feedback, then rescore from scratch.
         if not verifier.challenge_obvious(pristine, summary):
             echo(f"[verify] '{target.qualname}' L{blob_start}-{blob_end}: obviousness challenge failed; regenerating")
             messages.pop()                                   # retract the score turn; the note turn is still open
@@ -957,17 +919,21 @@ def request_block_comment(
             appended += 2
             score = _parse_score(llm.generate(messages, cfg=score_cfg))
             kept = score >= value_threshold
+
+            # Failing the challenge twice is final; the comment is dropped rather than retried again.
             if kept and not verifier.challenge_obvious(pristine, summary):
                 echo(f"[verify] '{target.qualname}' L{blob_start}-{blob_end}: failed twice; comment dropped")
                 challenge_failed = True
 
+    # Unwind every turn this call added: the shared context must leave exactly as it arrived.
     for _ in range(appended):
         messages.pop()
-
     if challenge_failed:
         return f"{summary} {CHALLENGE_FLAG}"
     echo(f"[block] {target.qualname} L{blob_start}-{blob_end} score={score}/{value_threshold} "
          f"{'KEEP' if kept else 'drop'}: {summary}")
+
+    # Low-value comments are returned flagged rather than as `None`, so callers can still log what was rejected.
     return summary if kept else f"{summary} {VALUE_FLAG}"
 
 
@@ -976,35 +942,33 @@ def request_block_comment(
 
 def _code_signature(lines: Chunk, style: CommentStyle) -> List[str]:
     """
-    Return the executable lines of `lines`, dropping blanks and pure comment lines.
-
-    Used by the safety guard to verify that a block-pass edit changed only blank and comment lines.
+    Reduce a chunk to its executable lines for preservation comparison.
 
     Parameters:
-    - `lines`: The lines to filter.
-    - `style`: The comment-style descriptor for the language.
+    - `lines`: The source lines to filter.
+    - `style`: The comment style used to recognise comment lines.
 
     Returns:
-    - The lines that carry code (neither blank nor a pure comment), in order.
+    - The non-blank, non-comment lines, in their original order.
     """
 
+    # Ignoring blanks and comments means the preservation check sees only executable text, so comment insertion never trips it.
     return [ln for ln in lines if ln.strip() and not _is_comment_line(ln, style)]
 
 
 def code_preserved(old_lines: Chunk, new_lines: Chunk, style: CommentStyle) -> bool:
     """
-    Report whether two versions of the source carry identical code, ignoring blank and comment lines.
+    Check that an edited line list differs from the original only in comments and blank lines.
 
-    This is the block pass's safety net: because every edit is insertion or replacement of blank/comment lines, the
-    code signature must be unchanged. A mismatch means something went wrong and the edit must be abandoned.
+    This is the block-pass preservation guard: both sides are reduced to a comment-stripped code signature, so any change to executable text fails the comparison.
 
     Parameters:
-    - `old_lines`: The original lines.
-    - `new_lines`: The candidate edited lines.
-    - `style`: The comment-style descriptor for the language.
+    - `old_lines`: The original source lines.
+    - `new_lines`: The candidate (edited) source lines.
+    - `style`: The comment style used to recognise and strip comment lines.
 
     Returns:
-    - True if the executable lines are identical in both versions.
+    - `True` if the executable code is preserved byte-for-byte, otherwise `False`.
     """
 
     return _code_signature(old_lines, style) == _code_signature(new_lines, style)
@@ -1012,29 +976,32 @@ def code_preserved(old_lines: Chunk, new_lines: Chunk, style: CommentStyle) -> b
 
 def _existing_comment_start(out_lines: Chunk, stmt_idx: int, indent: str, style: CommentStyle) -> int:
     """
-    Find the first index of the contiguous comment block sitting directly above a statement at the same indent.
+    Find where the comment run attached to a statement begins.
 
-    Only comment lines immediately above the statement, at exactly the statement's indentation, are treated as that
-    block's own comment (so an unrelated, differently-indented comment is left untouched).
+    Scans upward from the statement over contiguous comment lines, claiming only those at the statement's exact indentation; a run at a different indent is treated as belonging elsewhere and left alone.
 
     Parameters:
-    - `out_lines`: The working copy of the source lines.
+    - `out_lines`: The working list of source lines.
     - `stmt_idx`: The 0-based index of the statement line.
-    - `indent`: The statement's exact leading-whitespace string.
-    - `style`: The comment-style descriptor for the language.
+    - `indent`: The statement's leading whitespace; claimed comment lines must match it exactly.
+    - `style`: The comment style used to recognise comment lines.
 
     Returns:
-    - The 0-based start index of the existing comment block, or `stmt_idx` when there is none.
+    - The 0-based index of the first line of the attached comment run, or `stmt_idx` itself when there is none.
     """
 
+    # `cs` staying at `stmt_idx` is the no-comment-found result.
     cs = stmt_idx
     i = stmt_idx - 1
+
+    # Walk upward over contiguous comment lines, claiming only those at the statement's own indent - anything else belongs to an enclosing scope.
     while i >= 0 and _is_comment_line(out_lines[i], style):
         leading = out_lines[i][: len(out_lines[i]) - len(out_lines[i].lstrip())]
         if leading != indent:
             break
         cs = i
         i -= 1
+
     return cs
 
 
@@ -1044,49 +1011,41 @@ def _apply_edits(
     style: CommentStyle,
 ) -> Chunk:
     """
-    Apply block edits to a copy of the source, inserting blank/comment lines above chosen statement starts.
+    Splice block comments and paragraph spacing into a copy of the source lines.
 
-    Edits are applied in reverse line order so earlier indices stay valid as lines are inserted. Every chunk gets a
-    blank line above it (inserted only if absent - pre-existing blanks are never removed), which paragraphs a wall of
-    statements into its blocks. Where the model returned comment text, the patcher additionally replaces an existing
-    same-indent comment block directly above the statement, or inserts a fresh comment; a None comment adds only the
-    blank and keeps any existing comment untouched (it never deletes one). Code lines are never moved.
+    Edits are applied bottom-up so each boundary's line number stays valid throughout. A non-empty comment replaces any comment run already attached to the boundary statement; a `None` comment keeps an existing run as-is. A blank separator line is inserted above the blob unless the previous line is blank or opens a suite.
 
     Parameters:
-    - `source_lines`: The source split into lines (not mutated).
-    - `edits`: Tuples of (boundary_line, comment_or_None, indent), one per chosen block start.
-    - `style`: The comment-style descriptor for the language.
+    - `source_lines`: The pristine source lines; never mutated.
+    - `edits`: `(boundary, comment, indent)` triples, where `boundary` is the 1-based line number of the statement starting a blob.
+    - `style`: The comment style used to render and recognise comment lines.
 
     Returns:
-    - A new list of lines with the edits applied.
+    - A new line list with all edits applied.
     """
 
     out = source_lines[:]
 
+    # Apply edits bottom-up so earlier boundaries' line numbers stay valid as lines are inserted or removed.
     for boundary, comment, indent in sorted(edits, key=lambda e: e[0], reverse=True):
         stmt_idx = boundary - 1
         if not (0 <= stmt_idx < len(out)):
             continue
-
         cs = _existing_comment_start(out, stmt_idx, indent, style)
         has_existing = cs < stmt_idx
 
+        # A fresh comment replaces any run already attached to the statement; with none supplied, an existing run is kept verbatim.
         if comment:
-            # New text: replace any existing same-indent comment, or insert above the statement.
             body = render_comment_lines(comment, indent, style)
             start = cs
         elif has_existing:
-            # NONE never deletes: keep the existing comment exactly as it is, re-anchored below the blank.
             body = out[cs:stmt_idx]
             start = cs
         else:
-            # NONE with no comment: paragraph the chunk anyway (a blank line breaks the wall into its blocks).
             body = []
             start = stmt_idx
 
-        # Ensure a blank line above the chunk, unless one is already there, it is the file start, or the chunk sits at
-        # the start of a just-opened block (the line above ends with `{` or `:`) - a blank as the first line inside a
-        # brace/suite reads badly, so a [stmt; return] paragraph anchored there is commented without a leading blank.
+        # Insert a separating blank above the blob, but never directly under a line that opens a suite.
         prev_line = out[start - 1] if start - 1 >= 0 else ""
         opens_suite = prev_line.rstrip().endswith(("{", ":"))
         need_blank = start - 1 >= 0 and prev_line.strip() != "" and not opens_suite
@@ -1102,27 +1061,29 @@ def apply_blocks(
     style: CommentStyle,
 ) -> Chunk:
     """
-    Apply one routine's chosen blocks to the source, guarding that only blank/comment lines change.
+    Apply a routine's ready-made block comments to the source, guarded against code changes.
 
-    This is the single-routine entry point (used directly by tests and, per routine, by `annotate_blocks`). It renders
-    and inserts the edits, then verifies the code signature is unchanged; if the guard fails, the original lines are
-    returned untouched so a faulty edit can never corrupt the routine.
+    This is the manifest-apply counterpart to `annotate_blocks`: the comments arrive pre-decided, so the work is just building the edits, trial-applying them, and keeping the result only if the preservation guard passes.
 
     Parameters:
-    - `source_lines`: The source split into lines (not mutated).
-    - `target`: The routine the blocks belong to (provides per-boundary indentation).
-    - `blocks`: Tuples of (boundary_line, comment_or_None), one per chosen block start.
-    - `style`: The comment-style descriptor for the language.
+    - `source_lines`: The pristine source lines.
+    - `target`: The block target the comments belong to; supplies per-boundary indentation and the name used in diagnostics.
+    - `blocks`: `(boundary, comment)` pairs; a `None` comment inserts paragraph spacing only.
+    - `style`: The comment style used to render comment lines.
 
     Returns:
-    - The edited lines, or the original lines unchanged if the safety guard failed.
+    - The patched line list, or an untouched copy of the original if the edit would alter code.
     """
 
+    # Pair each boundary with its recorded indentation and trial-apply the ready-made comments.
     edits = [(b, comment, target.indent_of.get(b, "")) for b, comment in blocks]
     candidate = _apply_edits(source_lines, edits, style)
+
+    # Preservation guard: any patch that changes the comment-stripped code is rejected outright.
     if not code_preserved(source_lines, candidate, style):
         echo(f"[blocks] Skipped '{target.qualname}': edit would alter code; keeping original")
         return source_lines[:]
+
     return candidate
 
 
@@ -1137,33 +1098,35 @@ def defer_block_targets(
     note_long: Optional[str] = None,
 ) -> int:
     """
-    Record every routine's chunk recipe on the manifest (the online emit phase) - model-free, language-agnostic.
+    Record every usable block target in the run manifest instead of annotating it locally.
 
-    Segmentation is structural and has already been computed by the provider (`BlockTarget.segments`); only the
-    per-chunk comment *text* is deferred. The routine's code rides the manifest ONCE, as its verbatim span; each chunk
-    carries its boundary index (placement at apply) and its 1-based line range INTO that span (what the stronger
-    model reads). A target with no boundaries, no segments, or no re-binding signature is skipped (nothing could be
-    placed or re-bound at apply time).
+    Each target's full span (header through body) is captured once as a self-contained snippet, with chunk line ranges rebased to 1-based positions within it. Targets missing boundaries, segments, or a signature hash are skipped, as they cannot be re-bound at apply time.
 
     Parameters:
-    - `escalation`: The `scale_escalate.Escalation` collector for this target file.
-    - `source_lines`: The source split into lines (never modified).
-    - `targets`: The routines from the language's block provider.
-    - `note_short`/`note_long`: Optional overrides for the short-/long-routine length notes (defaults
-      `COMMENT_NOTE_SHORT`/`COMMENT_NOTE_LONG`), recorded so the stronger model keeps the same strictness bias.
+    - `escalation`: The run-manifest collector that receives each block record.
+    - `source_lines`: The pristine source lines of the file.
+    - `targets`: The block targets produced by the structural segmenter.
+    - `note_short`: Optional override for the short-routine length note.
+    - `note_long`: Optional override for the long-routine length note.
 
     Returns:
-    - The number of routines recorded.
+    - The number of targets actually deferred.
     """
 
     count = 0
+
+    # Targets missing boundaries, segments, or a signature hash cannot be re-bound at apply time, so they never enter the manifest.
     for target in sorted(targets, key=lambda t: t.body_start):
         if not target.boundary_lines or not target.segments or not target.sig:
             continue
+
+        # The scoring note follows routine length: short routines get the stricter wording.
         if len(target.segments) <= SHORT_FUNCTION_CHUNKS:
             length_note = note_short or COMMENT_NOTE_SHORT
         else:
             length_note = note_long or COMMENT_NOTE_LONG
+
+        # Capture the whole span once and rebase chunk ranges to 1-based snippet lines, so each record is self-contained.
         span = "\n".join(source_lines[target.header_start - 1:target.body_end])
         chunks = [
             {"bidx": target.boundary_lines.index(s),
@@ -1175,6 +1138,7 @@ def defer_block_targets(
             doc_summary=_doc_summary(target.doc), length_note=length_note, chunks=chunks, snippet=span,
         )
         count += 1
+
     return count
 
 
@@ -1196,75 +1160,77 @@ def annotate_blocks(
     verifier=None,
 ) -> Chunk:
     """
-    Run the full block pass over every routine and return the annotated source.
+    Run the block pass: generate, verify, and splice paragraph comments into every target.
 
-    Routines are processed deepest-first (consistent with the definition pass) so a model turn is small and self-
-    contained; nested definitions are already opaque boundaries, so each routine's edits fall on distinct lines. For
-    each routine the segment pass groups the body into chunk ranges and the comment pass writes (or declines) a comment
-    per chunk; the routine's edits are kept only if they survive the per-routine code-preservation guard. All surviving
-    edits are finally applied in one reverse-order pass over the original lines, so line shifts can never invalidate an
-    edit.
+    Targets are processed deepest-first. Each one's segments are taken as precomputed or requested from the model, every blob gets a comment-and-score exchange, and for longer routines the assembled notes face a story challenge with one feedback-driven regeneration before the routine's comments are dropped. Each routine's edits must pass the code-preservation guard in isolation; survivors are applied to the pristine source in a single final pass. A `value_threshold` above 3 disables comment generation entirely, leaving paragraph spacing only.
 
     Parameters:
-    - `llm`: The LocalChatModel instance.
-    - `cfg`: The generation configuration.
-    - `messages`: The persistent priming context for this pass.
-    - `source_lines`: The source split into lines (not mutated).
-    - `targets`: The routines to annotate.
-    - `style`: The comment-style descriptor for the language.
-    - `segment_prompt`: Optional override for the segment-pass prompt template (defaults to `SEGMENT_PROMPT`).
-    - `comment_prompt`: Optional override for the comment-pass prompt template (defaults to `COMMENT_PROMPT`).
-    - `comment_nudge`: Optional override for the comment retry nudge (defaults to `COMMENT_NUDGE`).
-    - `note_short`/`note_long`: Optional overrides for the short-/long-routine length notes (defaults
-      `COMMENT_NOTE_SHORT`/`COMMENT_NOTE_LONG`); injected into the value-score turn.
-    - `score_prompt`: Optional override for the value-score prompt template (defaults to `SCORE_PROMPT`).
-    - `value_threshold`: Minimum 1-3 value score for a comment to be written into the code (`--block-comments`); when
-      None, `COMMENT_VALUE_THRESHOLD` is used. Higher is stricter; `1` keeps all. A value above 3 (e.g. `4`) can never
-      be cleared, so the comment turns are skipped entirely - the pass only paragraphs the body, no model work.
-    - `callee_annotations`: Optional `{qualname -> {line -> "callee: one-liner"}}` call-graph context. Each routine's
-      map annotates its call lines (read-side only) in the comment turn, so a paragraph that calls a known routine is
-      summarised knowing what that routine does. Absent (or for an unlisted routine), behaviour is unchanged.
-    - `verifier`: Optional `scale_verify.Verifier`. Per comment it adds the grounding gate and the obviousness
-      challenge (see `request_block_comment`); per routine - when the routine is long enough (more than
-      `SHORT_FUNCTION_CHUNKS` chunks) and at least one note would be written - the **story challenge** judges the
-      full note set in a clean context. A failed set is regenerated once with the verdict as per-paragraph feedback;
-      a second failure drops the routine's comments (the paragraphing blanks stay; wrongness is worse than absence).
+    - `llm`: The local chat model used for segmenting, commenting, and scoring.
+    - `cfg`: Generation settings for the model calls.
+    - `messages`: The primed chat history; generation turns are appended then popped per reply.
+    - `source_lines`: The pristine source lines of the file.
+    - `targets`: The block targets to annotate.
+    - `style`: The comment style used to render and recognise comments.
+    - `segment_prompt`: Optional override for the segmentation prompt.
+    - `comment_prompt`: Optional override for the comment prompt.
+    - `comment_nudge`: Optional override for the comment nudge template.
+    - `note_short`: Optional override for the short-routine length note.
+    - `note_long`: Optional override for the long-routine length note.
+    - `score_prompt`: Optional override for the scoring prompt.
+    - `value_threshold`: Minimum 1-3 score a comment must reach to be kept; above 3 switches commenting off.
+    - `callee_annotations`: Optional per-routine map of line numbers to call-site notes fed into the comment turns.
+    - `verifier`: Optional verifier supplying the story-challenge turns.
 
     Returns:
-    - The annotated source split into lines.
+    - A new line list with all surviving comments and paragraph spacing applied.
     """
 
+    # Deepest-nested targets go first; a threshold above 3 is unreachable by any score, so the comment turns are skipped and only spacing remains.
     ordered = sorted(targets, key=lambda t: (t.depth, t.body_start, -t.body_end), reverse=True)
     threshold = value_threshold if value_threshold is not None else COMMENT_VALUE_THRESHOLD
     comments_off = threshold > 3  # no 1-3 score can clear it, so skip the comment turns entirely (paragraph only)
-
     all_edits: List[Tuple[int, Optional[str], str]] = []
+
     for target in ordered:
         if not target.boundary_lines:
             continue
 
-        # Prefer a provider's deterministic structural segmentation; fall back to the LLM segment pass for
-        # languages/targets that don't supply one. Structural segmentation is free, reproducible, and needs no model.
+        # Prefer the segmenter's precomputed paragraphs; only fall back to asking the model when none were supplied.
         if target.segments is not None:
             segments = target.segments
         else:
             segments = request_segments(llm, cfg, messages, source_lines, target, segment_prompt)
+
         if not segments:
             continue
 
-        # Short routines lean conservative (don't echo the docstring); longer ones invite a per-block walkthrough.
+        # The length note steers scoring strictness: short routines tolerate fewer navigational comments.
         if len(segments) <= SHORT_FUNCTION_CHUNKS:
             length_note = note_short or COMMENT_NOTE_SHORT
         else:
             length_note = note_long or COMMENT_NOTE_LONG
 
-        # One comment turn per chunk, in body order, feeding earlier comments forward as narrative context.
+        # Call-graph read-side annotations for this routine, if any were gathered.
         line_notes = (callee_annotations or {}).get(target.qualname)
 
+        # Closure so a failed story challenge can regenerate every chunk with the verifier's feedback attached.
         def run_chunks(feedback: Optional[str] = None) -> Tuple[List[Tuple[int, Optional[str], str]], List[str]]:
-            """One comment turn per chunk; returns the routine's edits and the full set of turn-1 notes."""
+            """
+            Generate one comment edit per segment of the current target.
+
+            Accepted comments are fed back as context for later blobs, and an edit is recorded for every blob even when no comment is written, so paragraph spacing is always applied.
+
+            Parameters:
+            - `feedback`: Optional verifier feedback from a failed story challenge, passed to each comment turn on regeneration.
+
+            Returns:
+            - An `(edits, prior_comments)` tuple: the per-blob `(boundary, comment, indent)` edits and the raw notes produced.
+            """
+
             edits: List[Tuple[int, Optional[str], str]] = []
             prior_comments: List[str] = []
+
+            # Each kept comment is fed back as context so later blobs do not repeat it; with comments off the model is never consulted.
             for blob_start, blob_end in segments:
                 if comments_off:
                     comment = None               # threshold > 3: paragraph only, no model work
@@ -1277,38 +1243,43 @@ def annotate_blocks(
                     )
                     if comment:
                         prior_comments.append(comment)  # keep every summary (incl. flagged ones) as context
+
+                # An edit is recorded for every blob, comment or not, so paragraph spacing is always applied.
                 edits.append((blob_start, _comment_to_insert(comment), target.indent_of.get(blob_start, "")))
+
             return edits, prior_comments
 
         edits, notes = run_chunks()
-
-        # The story challenge (clean context): do the routine's notes, as a set, tell its story or just restate it?
-        # Length-guarded - a short routine's docstring plus visible code already walk a reader through it, so it never
-        # triggers - and skipped when nothing would be written anyway. A failed set is regenerated once with the
-        # verdict as per-paragraph feedback, then re-challenged.
         story_failed = False
+
+        # The story challenge runs only where it can pay off: a verifier present, comments actually written, and a routine long enough to have a narrative.
         if (verifier is not None and not comments_off and len(segments) > SHORT_FUNCTION_CHUNKS
                 and any(_comment_to_insert(n) for n in notes)):
             signature = "\n".join(source_lines[target.header_start - 1:target.header_end])
+
+            # On a failed challenge, regenerate once with the verifier's feedback rather than dropping straight away.
             if not verifier.challenge_story(signature, _doc_summary(target.doc), [_strip_note_flags(n) for n in notes]):
                 echo(f"[verify] '{target.qualname}': story challenge failed; regenerating the routine's notes once")
                 edits, notes = run_chunks(verifier.story_feedback_for())
+
+                # Still failing after the retry marks the routine for dropping - there is never a third attempt.
                 if (any(_comment_to_insert(n) for n in notes)
                         and not verifier.challenge_story(signature, _doc_summary(target.doc),
                                                          [_strip_note_flags(n) for n in notes])):
                     story_failed = True
 
-        # Failure routing: a twice-failed story drops the routine's comments (the paragraphing blanks stay -
-        # wrongness is worse than absence); individually-flagged notes are already excluded from the edits.
+        # Dropping keeps the paragraph spacing: `None` comments still insert blank separators, just no text.
         if story_failed:
             echo(f"[verify] '{target.qualname}': story challenge failed twice; dropping its comments")
             edits = [(b, None, indent) for b, _comment, indent in edits]
 
-        # Per-routine guard: simulate this routine's edits on the pristine source and keep them only if code is intact.
         trial = _apply_edits(source_lines, edits, style)
+
+        # Per-routine guard: a bad patch costs only this routine's comments, never the whole file's.
         if code_preserved(source_lines, trial, style):
             all_edits.extend(edits)
         else:
             echo(f"[blocks] Skipped '{target.qualname}': edit would alter code; keeping original")
 
+    # All surviving edits are spliced into the pristine source in one final pass.
     return _apply_edits(source_lines, all_edits, style)

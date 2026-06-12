@@ -11,13 +11,14 @@ Unless required by applicable law or agreed to in writing, software distributed 
 "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
 language governing permissions and limitations under the License.
 
-Helpers for keeping the text SCALE sends to the LLM within the model's context window.
+Shared text-shaping utilities for fitting prose and source into the model's context window. `summarise` is the general
+summarising turn used throughout the tool: a length keyword selects both the instruction wording and a reply-token
+cap, either of which the caller may override explicitly, and the cap only ever tightens the configured budget.
 
-The expensive, fragile case is a single routine whose body is larger than the context window. Because SCALE patches
-comments into the parsed source (and never has the LLM re-emit code), the snippet the model *reads* can be reduced
-freely without any risk to the output: the comment will simply be written from a partial view of the body. This module
-provides that reduction - it keeps a routine's signature plus the head and tail of its body and elides the middle,
-replacing it with a short marker noting how many lines were omitted.
+The other two functions crop code rather than prose: `elide_to_budget` trims a snippet's body to a token budget by
+keeping its head and tail around an elision marker, always preserving the header lines verbatim, and `fit_snippet`
+measures the budget actually left beside the current conversation - scaled down by a safety factor so estimation error
+cannot overflow the window - before applying the same elision.
 """
 
 from __future__ import annotations
@@ -65,29 +66,25 @@ def summarise(
     instruction: Optional[str] = None,
 ) -> str:
     """
-    Ask the model to summarise `text` into a target length, and return the summary.
+    Ask the model for a summary of arbitrary text at a chosen length.
 
-    This is SCALE's one reusable "compress some text" call. It is used wherever the tool needs the model to distil
-    something - a whole source file, a chunk of one, or a deeply-nested block being elided to fit the context window -
-    so the prompt shape and the reply-length discipline live in a single place. The reply is capped to a size matching
-    `length` (overridable via `max_tokens`) so a one-line ask cannot ramble.
+    The `length` keyword selects both the instruction wording and a reply-token cap from internal tables; an explicit `instruction` or `max_tokens` overrides the corresponding table entry. The cap only ever tightens the configured token budget, never raises it.
 
     Parameters:
-    - `llm`: A model exposing `generate`.
-    - `cfg`: The base generation configuration (cloned with a length-appropriate `max_new_tokens`).
-    - `text`: The text to summarise.
-    - `length`: One of `LENGTH_LINE` / `LENGTH_PARAGRAPH` / `LENGTH_PARAGRAPHS`.
-    - `base_messages`: Optional priming context to prepend (e.g. the system prompt + file overview); omit for a cheap,
-      standalone summary that needs no wider context.
-    - `subject`: A short noun phrase describing what `text` is, woven into the prompt (e.g. "a Python source file").
-    - `max_tokens`: Optional reply-token cap overriding the per-length default.
-    - `instruction`: Optional instruction text that replaces the default length-based one (e.g. a file-description
-      spec). The `length` still picks the reply-token cap unless `max_tokens` is given.
+    - `llm`: The chat model used to generate the summary.
+    - `cfg`: The generation configuration; its per-turn token budget is clamped to the cap.
+    - `text`: The text to be summarised.
+    - `length`: Target length key selecting the instruction and token cap.
+    - `base_messages`: Optional conversation prefix to prepend before the summary request.
+    - `subject`: Phrase naming what the text is, woven into the prompt.
+    - `max_tokens`: Optional explicit reply-token cap, overriding the length default.
+    - `instruction`: Optional explicit summarising instruction, overriding the length default.
 
     Returns:
-    - The summary text, stripped.
+    - The model's summary with surrounding whitespace stripped.
     """
 
+    # Both the instruction wording and the reply-token cap come from the per-length tables; the cap only ever tightens cfg.max_new_tokens, never raises it.
     if instruction is None:
         instruction = _LENGTH_INSTRUCTION.get(length, _LENGTH_INSTRUCTION[LENGTH_PARAGRAPH])
     prompt = (
@@ -97,6 +94,7 @@ def summarise(
     cap = max_tokens if max_tokens is not None else _LENGTH_RESERVE.get(length, _LENGTH_RESERVE[LENGTH_PARAGRAPH])
     turn_cfg = replace(cfg, max_new_tokens=min(cfg.max_new_tokens, cap))
     messages = (base_messages or []) + [{"role": "user", "content": prompt}]
+
     return llm.generate(messages, cfg=turn_cfg).strip()
 
 
@@ -117,55 +115,41 @@ def elide_to_budget(
     head_tail_ratio: float = 0.5,
 ) -> Tuple[List[str], int]:
     """
-    Reduce a routine snippet to fit a token budget by eliding the middle of its body.
+    Trim a snippet's body to a token budget by keeping its head and tail around an elision marker.
 
-    The header (signature, decorators, opening line(s)) is always preserved, since it carries the most intent for the
-    least cost. The remaining budget is spent on the start and end of the body - the start typically holds setup and
-    guard clauses, the end the return value - with the uninformative middle replaced by `marker`. If the snippet
-    already fits, it is returned unchanged.
+    The header lines always survive verbatim; the header and the marker are charged against the budget first, and the remaining body budget is split between head and tail by `head_tail_ratio`. If the snippet already fits, or nothing would actually be dropped, the input lines are returned unchanged.
 
     Parameters:
-    - `snippet_lines`: The full snippet split into lines (header followed by body).
-    - `header_line_count`: How many leading lines form the header and must always be kept.
-    - `budget_tokens`: The maximum number of tokens the returned snippet may occupy.
-    - `estimate_fn`: A cheap function estimating the token count of a string (e.g. `LocalChatModel.estimate_tokens`).
-    - `marker`: A `str.format` template taking `n`, inserted where the body was elided.
-    - `head_tail_ratio`: The fraction of the body budget spent on the head (the remainder goes to the tail).
+    - `snippet_lines`: The snippet as a list of lines.
+    - `header_line_count`: Number of leading lines that must always be kept.
+    - `budget_tokens`: Total token budget for the result.
+    - `estimate_fn`: Callable estimating the token count of a string.
+    - `marker`: Elision marker template; `{n}` is replaced with the omitted line count.
+    - `head_tail_ratio`: Fraction of the body budget given to the head.
 
     Returns:
-    - A tuple `(lines, omitted)` where `lines` is the (possibly reduced) snippet and `omitted` is the number of body
-      lines removed (0 if no elision was necessary).
-
-    Notes:
-    - The token sizing is approximate (it relies on `estimate_fn`); callers wanting a hard guarantee should pass a
-      budget with a safety margin already applied.
-    - In the degenerate case where even the header exceeds the budget, the header is returned together with a marker
-      reporting that the whole body was omitted.
+    - A tuple of the (possibly elided) lines and the number of omitted lines, 0 when nothing was dropped.
     """
 
+    # Fast path when everything already fits; otherwise the header and the marker itself are charged first, and only the remainder is split between head and tail by the ratio.
     if estimate_fn("\n".join(snippet_lines)) <= budget_tokens:
         return snippet_lines, 0
-
     header = snippet_lines[:header_line_count]
     body = snippet_lines[header_line_count:]
     if not body:
-        # Nothing to trim (the header alone is over budget); leave it to the caller's last-resort guard.
         return snippet_lines, 0
-
     header_tokens = estimate_fn("\n".join(header)) if header else 0
     marker_tokens = estimate_fn(marker.format(n=len(body)))
     body_budget = budget_tokens - header_tokens - marker_tokens
     if body_budget <= 0:
-        # No room for any body lines: keep just the header and note the full body was dropped.
         return header + [marker.format(n=len(body))], len(body)
-
     head_budget = int(body_budget * head_tail_ratio)
     tail_budget = body_budget - head_budget
-
-    # Greedily keep body lines from the top up to the head budget.
     head: List[str] = []
     used = 0
     i = 0
+
+    # Grow the head greedily from the top, charging an extra token per line to approximate the joining newline.
     while i < len(body):
         cost = estimate_fn(body[i]) + 1  # +1 approximates the joining newline
         if used + cost > head_budget:
@@ -174,10 +158,12 @@ def elide_to_budget(
         used += cost
         i += 1
 
-    # Greedily keep body lines from the bottom up to the tail budget, without overlapping the head.
+    # Now fill the tail backwards from the end under its own budget.
     tail: List[str] = []
     used_tail = 0
     j = len(body) - 1
+
+    # The j >= i bound stops the tail before it re-includes any line the head already kept.
     while j >= i:
         cost = estimate_fn(body[j]) + 1
         if used_tail + cost > tail_budget:
@@ -186,11 +172,10 @@ def elide_to_budget(
         used_tail += cost
         j -= 1
 
+    # If the head and tail met, nothing was dropped: return the original rather than splicing in a pointless marker.
     omitted = len(body) - len(head) - len(tail)
     if omitted <= 0:
-        # Everything fit once split head/tail (rare); return the original untouched.
         return snippet_lines, 0
-
     return header + head + [marker.format(n=omitted)] + tail, omitted
 
 
@@ -205,27 +190,25 @@ def fit_snippet(
     safety: float = 0.9,
 ) -> Tuple[str, int]:
     """
-    Elide a routine snippet, if necessary, so it fits the context window of an `llm`.
+    Crop a snippet to the model's remaining context budget, eliding the middle of its body.
 
-    This is the convenience wrapper the language workers call. It asks the model for the snippet's token budget
-    (`llm.snippet_budget`), then applies `elide_to_budget` using the model's cheap token estimator. A `safety` factor
-    is applied to the budget to absorb estimation error, since the estimate is approximate.
+    The budget is measured against the current conversation and scaled down by `safety` so token-estimation error cannot overflow the context window.
 
     Parameters:
-    - `llm`: A `LocalChatModel` exposing `snippet_budget` and `estimate_tokens`.
-    - `cfg`: The generation configuration (used for the reply reserve in the budget calculation).
-    - `messages`: The persistent priming context the snippet will be appended to.
-    - `snippet`: The assembled routine snippet (header plus body) as a single string.
-    - `header_line_count`: How many leading lines form the header and must always be kept.
-    - `marker`: A `str.format` template taking `n`, inserted where the body is elided.
-    - `head_tail_ratio`: The fraction of the body budget spent on the head.
-    - `safety`: Multiplier (< 1) applied to the budget to allow for token-estimate error.
+    - `llm`: The chat model, used for the budget measurement and token estimates.
+    - `cfg`: The generation configuration.
+    - `messages`: The conversation the snippet must fit alongside.
+    - `snippet`: The snippet text to crop.
+    - `header_line_count`: Number of leading lines that must always be kept.
+    - `marker`: Elision marker template; `{n}` is replaced with the omitted line count.
+    - `head_tail_ratio`: Fraction of the body budget given to the head.
+    - `safety`: Fraction of the measured budget actually used.
 
     Returns:
-    - A tuple `(snippet, omitted)` where `snippet` is the (possibly reduced) text and `omitted` is the number of body
-      lines removed (0 if it already fit).
+    - A tuple of the (possibly elided) snippet text and the number of omitted lines, 0 when it already fits.
     """
 
+    # The safety factor deliberately undershoots the measured budget so token-estimate error cannot overflow the context window.
     budget = int(llm.snippet_budget(messages, cfg) * safety)
     lines = snippet.split("\n")
     elided, omitted = elide_to_budget(lines, header_line_count, budget, llm.estimate_tokens, marker, head_tail_ratio)

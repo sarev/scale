@@ -11,11 +11,19 @@ Unless required by applicable law or agreed to in writing, software distributed 
 "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
 language governing permissions and limitations under the License.
 
-This Python program, `scale_c.py`, is a tool for generating and inserting documentation comments into C source code files.
+The C language worker: it parses source with tree-sitter (tolerating both the 0.21 and 0.22 binding APIs), discovers
+every function definition and prototype, and supplies the per-language pieces the shared pipeline needs - the
+definition pass, the block-pass segmenter, the symbol scanner for the project call graph, and the file-doc target.
 
-It uses the Tree-sitter C parser to analyse the code, identify function definitions, and then asks a language model (LLM)
-to provide documentation comments for each function. The comments are then inserted or replaced above the corresponding
-function declarations in the source code.
+The definition pass gives each routine one bounded model turn, seeded with its existing comment and callee notes, then
+splices the result above the header with `patch_comments_textually_c` - existing comment blocks are replaced in place
+and code lines are never touched. `_collect_body_c` and `iter_block_targets_c` feed the structural segmenter, and a
+doc-style detector picks `//` or `/* */` rendering to match the file.
+
+The module also owns two C-specific extras: the run-wide doc-site plan (`CDocPlan` and `plan_doc_sites_c`), which
+redirects a function's documentation from its definition to its header declaration when both are in the run, and the
+online-mode pair `collect_def_requests_c` and `apply_manifest_c`, which record routines in the run manifest and
+re-bind the filled answers by qualified name and span hash before patching.
 """
 
 from __future__ import annotations
@@ -39,19 +47,18 @@ import textwrap
 
 def _load_c_language_and_parser() -> Tuple[Language, Parser]:
     """
-    Load the C language and parser.
+    Construct the tree-sitter C `Language` and `Parser` across binding versions.
 
-    This function loads the C language and creates a parser instance. It handles cases where `c_language()` returns a
-    `Language` object or a label, and returns a tuple containing the loaded `Language` object and the created `Parser`
-    instance.
+    Tolerates both the one-argument `Language(...)` API (tree-sitter >= 0.22) and the labelled two-argument 0.21 form, plus both the `set_language()` and constructor-argument `Parser` styles.
 
     Returns:
-    - A tuple of two objects: the loaded `Language` object and the created `Parser` instance.
+    - A `(Language, Parser)` pair ready to parse C source.
     """
 
+    # What the grammar binding returns - a `Language` or a raw pointer - depends on its version.
     ptr_or_lang: Any = c_language()
 
-    # Wrap capsule -> Language, or accept Language directly.
+    # Shim over the tree-sitter API split: one-argument `Language` from 0.22 onward, the labelled two-argument form on 0.21.
     if isinstance(ptr_or_lang, Language):
         lang = ptr_or_lang
     else:
@@ -60,7 +67,7 @@ def _load_c_language_and_parser() -> Tuple[Language, Parser]:
         except TypeError:
             lang = Language(ptr_or_lang, "C")   # old 0.21 API (second arg is a label)
 
-    # Some builds expose Parser().set_language(...), others Parser(Language)
+    # Parser construction split likewise: older bindings use `set_language()`, newer ones take the language in the constructor.
     try:
         p = Parser()
         p.set_language(lang)
@@ -75,21 +82,22 @@ C_LANGUAGE, C_PARSER = _load_c_language_and_parser()
 
 def _parse_c(source_blob: str) -> Tuple[Any, bytes]:
     """
-    Normalise line endings and parse C source once.
+    Parse C source with tree-sitter and return the syntax tree plus the bytes it was parsed from.
 
-    Tree-sitter counts rows by '\\n' only, whereas the source may use '\\r' or '\\r\\n'. Line endings are normalised to
-    '\\n' so that node rows line up with the caller's line-split source. The same normalised bytes are returned and used
-    for any node-text extraction, keeping byte offsets self-consistent with the parse tree.
+    Line endings are normalised to LF before encoding, so node byte offsets index into the returned buffer rather than the original blob.
 
     Parameters:
-    - `source_blob`: The C source code as a string.
+    - `source_blob`: The C source text to parse.
 
     Returns:
-    - A tuple of the parsed tree and the normalised source bytes it was parsed from.
+    - A `(tree, source_bytes)` tuple: the tree-sitter parse tree and the UTF-8 bytes it indexes into.
     """
 
+    # Normalise every line ending to LF before encoding, so tree-sitter rows and byte offsets match the line maths used downstream.
     norm = source_blob.replace("\r\n", "\n").replace("\r", "\n")
     source_bytes = norm.encode("utf-8", errors="replace")
+
+    # Return the encoded bytes too: node byte offsets index this exact buffer, not the original blob.
     return C_PARSER.parse(source_bytes), source_bytes
 
 
@@ -97,13 +105,13 @@ def _parse_c(source_blob: str) -> Tuple[Any, bytes]:
 
 def _to_1based(row0: int) -> int:
     """
-    Convert a 0-based row index to a 1-based index.
+    Convert a 0-based tree-sitter row to a 1-based line number.
 
     Parameters:
-    - `row0`: The 0-based row index to convert.
+    - `row0`: The 0-based row index.
 
     Returns:
-    - The corresponding 1-based row index.
+    - The corresponding 1-based line number.
     """
 
     return row0 + 1
@@ -111,19 +119,18 @@ def _to_1based(row0: int) -> int:
 
 def _row_of(point) -> int:
     """
-    Return the row number of a tree-sitter point.
+    Extract the row from a tree-sitter point of either supported shape.
 
-    This function supports both tuple and object forms of points. If the input is an object with a `.row` attribute,
-    it is used directly. Otherwise, it assumes the input is a tuple (row, col) and returns the first element (the
-    row number).
+    Older tree-sitter bindings give points as `(row, col)` tuples while newer ones use objects with a `.row` attribute; both are accepted.
 
     Parameters:
-    - `point`: The tree-sitter point to extract the row from.
+    - `point`: A tree-sitter point, as an object or a tuple.
 
     Returns:
-    - The row number of the point as an integer.
+    - The 0-based row of the point.
     """
-    
+
+    # Tolerate both tree-sitter binding generations: attribute-style points and plain tuples.
     try:
         return point.row  # object with .row
     except AttributeError:
@@ -132,15 +139,18 @@ def _row_of(point) -> int:
 
 def _col_of(point) -> int:
     """
-    Return the 0-based column of a tree-sitter point, tolerating both the object (`.column`) and tuple (`[1]`) forms.
+    Extract the column from a tree-sitter point of either supported shape.
+
+    The tuple fallback mirrors `_row_of`, covering older tree-sitter bindings that give points as `(row, col)` tuples rather than objects with a `.column` attribute.
 
     Parameters:
-    - `point`: The tree-sitter point to extract the column from.
+    - `point`: A tree-sitter point, as an object or a tuple.
 
     Returns:
-    - The 0-based column of the point as an integer.
+    - The 0-based column of the point.
     """
 
+    # Tolerate both tree-sitter binding generations, as in the row accessor.
     try:
         return point.column  # object with .column
     except AttributeError:
@@ -149,13 +159,13 @@ def _col_of(point) -> int:
 
 def _line_span_from_node(n) -> Tuple[int, int]:
     """
-    Return the inclusive 1-based start and end line span for a given node.
+    Return a node's extent as a 1-based inclusive line span.
 
     Parameters:
-    - `n`: The node for which to compute the line span.
+    - `n`: The tree-sitter node.
 
     Returns:
-    - A tuple of two integers representing the 1-based start and end line numbers.
+    - A `(first, last)` tuple of 1-based line numbers covering the node.
     """
 
     return _to_1based(_row_of(n.start_point)), _to_1based(_row_of(n.end_point))
@@ -163,20 +173,20 @@ def _line_span_from_node(n) -> Tuple[int, int]:
 
 def _get_text_for_lines(source_lines: Chunk, a: int, b: int) -> str:
     """
-    Extract a range of lines from the source code.
+    Join a 1-based inclusive line range into a single newline-separated string.
 
-    This method returns a string containing the specified range of lines, joined by newline characters.
-    If the start line number is greater than the end line number, an empty string is returned.
+    Bounds are clamped to the file rather than treated as errors, and an empty or inverted range yields the empty string.
 
     Parameters:
-    - `source_lines`: The list of source code lines.
-    - `a`: The starting line number (inclusive).
-    - `b`: The ending line number (exclusive).
+    - `source_lines`: The file's lines, without trailing newlines.
+    - `a`: First line of the range (1-based, inclusive).
+    - `b`: Last line of the range (1-based, inclusive).
 
     Returns:
-    - A string containing the extracted lines.
+    - The selected lines joined with newlines, or an empty string for an empty range.
     """
 
+    # Clamp out-of-range bounds to the file instead of raising; a range left inverted after clamping is treated as empty.
     a = max(1, a)
     b = min(len(source_lines), b)
     if a > b:
@@ -186,32 +196,35 @@ def _get_text_for_lines(source_lines: Chunk, a: int, b: int) -> str:
 
 def _node_text(source_bytes: bytes, n) -> str:
     """
-    Decode the exact source slice for a node.
+    Decode the source text covered by a tree-sitter node.
+
+    Safe with `None`, so callers may slice optional child nodes without a guard.
 
     Parameters:
-    - `source_bytes`: The bytes containing the source code.
-    - `n`: The node for which to decode the source slice.
+    - `source_bytes`: The encoded source that the node's byte offsets index into.
+    - `n`: The tree-sitter node, or `None`.
 
     Returns:
-    - A string representing the decoded source slice, or an empty string if `n` is `None`.
+    - The node's UTF-8 text (invalid bytes replaced), or an empty string when `n` is `None`.
     """
 
+    # Safe with a missing node, so callers can fetch optional children without a guard.
     if n is None:
         return ""
-
-    # Use 'replace' to be robust to any odd bytes in the file.
     return source_bytes[n.start_byte:n.end_byte].decode("utf-8", errors="replace")
 
 
 def _leading_spaces_count(line: str) -> int:
     """
-    Count the number of leading spaces in a line.
+    Count the leading spaces on a line.
+
+    Only spaces are counted: a leading tab stops the count rather than being expanded.
 
     Parameters:
-    - `line`: The input string to count leading spaces from.
+    - `line`: The line to measure.
 
     Returns:
-    - The number of leading spaces in the input string.
+    - The number of leading space characters.
     """
 
     return len(line) - len(line.lstrip(" "))
@@ -219,46 +232,54 @@ def _leading_spaces_count(line: str) -> int:
 
 def _scan_existing_comment_block_above(source_lines: Chunk, header_start_line_1b: int) -> Optional[Tuple[int, int]]:
     """
-    Detect an existing comment block immediately above the header start line.
+    Locate an existing comment block sitting directly above a C function header.
 
-    This function scans the source lines for a contiguous block of comments that ends just above the header.
-    It supports both C-style block comments '/* ... */' and C-style line comments '//'.
+    Recognises either a `/* ... */` block whose closing delimiter ends the line immediately above the header, or an unbroken run of `//` lines touching the header. A blank line breaks adjacency, so detached comments are never claimed.
 
     Parameters:
-    - `source_lines`: The source code lines to scan.
-    - `header_start_line_1b`: The line number of the header start (1-based).
+    - `source_lines`: The source file as a list of lines.
+    - `header_start_line_1b`: 1-based line number of the function header.
 
     Returns:
-    - A tuple `(start_line_1b, end_line_1b)` representing the start and end line numbers of the comment block,
-      or `None` if no comment block is found.
+    - 1-based inclusive `(start, end)` line span of the comment block, or `None` if no adjacent comment exists.
     """
 
+    # Index the line directly above the header; at the top of the file there is nothing to scan.
     i = header_start_line_1b - 2  # zero-based line just above header
     if i < 0:
         return None
 
-    # Case A: block comment ending above
+    # A trailing */ immediately above the header signals a block comment to claim.
     if source_lines[i].rstrip().endswith("*/"):
         j = i
+
+        # Walk upward to the matching /* opener and claim the whole block.
         while j >= 0:
             if source_lines[j].lstrip().startswith("/*"):
                 return (j + 1, i + 1)
             j -= 1
-        # malformed; fall through
 
-    # Case B: contiguous '//' lines
+    # No block comment - try a contiguous run of // lines instead.
     j = i
     saw_slash = False
+
+    # Climb while lines still belong to the comment run.
     while j >= 0:
         stripped = source_lines[j].lstrip()
+
         if stripped.startswith("//"):
             saw_slash = True
             j -= 1
             continue
+
+        # Blank lines and code both end the run - the comment must touch the header to count.
         if stripped == "":
             break  # blank breaks adjacency
         break
+
+    # Only a non-empty run counts.
     if saw_slash:
+        # j overshot to the line before the run, so +2 gives the 1-based first comment line.
         start_1b = j + 2
         return (start_1b, i + 1)
 
@@ -267,21 +288,14 @@ def _scan_existing_comment_block_above(source_lines: Chunk, header_start_line_1b
 
 def file_doc_target_c(source_blob: str, source_lines: Chunk) -> Optional[FileDocTarget]:
     """
-    Build the file-level header doccomment target for a C source file.
-
-    Gathers the entire leading-comment zone at the top of the file - which may span several contiguous comment blocks
-    (mixed `/* ... */` and `//`, separated by blank lines but with no intervening code) - into one target. The scan
-    starts after an optional shebang, collects every comment line until the first real code or preprocessor line, and
-    marks the pure-content comment lines (block continuations and `//` lines) as description-eligible while leaving
-    delimiters, single-line `/* ... */` comments, and blank continuations to be preserved. The slots for replacing,
-    appending, or freshly inserting a description are computed from the zone's shape.
+    Find the top-of-file description target zone for a C source file.
 
     Parameters:
-    - `source_blob`: The complete source text (unused; accepted for provider-signature symmetry).
-    - `source_lines`: The source split into individual lines.
+    - `source_blob`: The full source text (unused; present for the shared provider signature).
+    - `source_lines`: The source file as a list of lines.
 
     Returns:
-    - A `FileDocTarget`, or None if the file is empty.
+    - A `FileDocTarget` for the leading comment zone, or `None` if no safe target was found.
     """
 
     return scan_brace_leading_zone(source_lines, SLASH_BLOCK_STYLE)
@@ -292,29 +306,14 @@ def file_doc_target_c(source_blob: str, source_lines: Chunk) -> Optional[FileDoc
 
 @dataclass(frozen=True)
 class DefInfoC:
+
     """
-    Represents information about a C function definition.
+    Immutable record describing one function definition found in a C parse tree.
 
-    This class abstracts over the details of a C function definition, providing a structured representation
-    that can be used to generate documentation comments for the function.
-
-    Attributes:
-        qualname (str): The name of the function.
-        node (object): The tree-sitter Node object representing the function definition.
-        kind (str): The type of node, always "function".
-        start (int): The line number where the function definition starts (1-based).
-        end (int): The line number where the function definition ends (inclusive).
-        header_start (int): The line number where the function header starts.
-        header_end (int): The line number where the function header ends (line before body starts '{').
-        depth (int): The nesting depth of the function, always 0 for C (no nested functions).
-        parent_id (Optional[int]): The ID of the parent node, always None.
-        children_ids (Tuple[int, ...]): A tuple of IDs of child nodes, always empty.
-
-    Note:
-        This class is designed to be used in conjunction with the `LLM exchange` module to generate
-        documentation comments for C functions.
+    Line numbers are 1-based and inclusive; `header_start`/`header_end` span the signature up to the line before the opening brace. `depth`, `parent_id` and `children_ids` mirror the shape used by the other language workers and stay at their defaults, as C functions do not nest.
     """
 
+    # Line fields are 1-based; depth and parent/child links stay at their defaults because C functions do not nest - they exist for parity with the other language workers.
     qualname: str
     node: object
     kind: str
@@ -332,14 +331,19 @@ class DefInfoC:
 
 def _display_include_target(tok: str) -> str:
     """
-    Render the include target as it appeared, preserving any quotes or angle brackets.
+    Normalise an include target token for display.
 
-    If the token is already quoted (e.g. `"...` or `'...'`) or enclosed in angle brackets (`<...>`), return it unchanged.
-    Otherwise, return the bare token (e.g. a macro name).
+    The token is stripped of surrounding whitespace; quoted and angle-bracket forms are returned verbatim, as is anything else.
+
+    Parameters:
+    - `tok`: The raw path token from a `#include` directive.
+
+    Returns:
+    - The stripped token text.
     """
 
+    # Both branches return the stripped token unchanged - the quoted/angle-bracket test makes no difference here.
     tok = tok.strip()
-    # Already quoted or angled? keep as-is
     if (len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in ('"', "'")) or (tok.startswith("<") and tok.endswith(">")):
         return tok
     return tok
@@ -347,23 +351,16 @@ def _display_include_target(tok: str) -> str:
 
 def _collect_includes_c(tree, source_bytes: bytes) -> List[Tuple[int, str]]:
     """
-    Collect a list of #include directives in source order.
+    Collect every `#include` directive in a parsed C file as display-ready list items.
 
-    This function parses the given C source code and extracts a plain-English list of #include directives.
-    It supports various forms of includes, including:
-
-    *   `#include <...>`
-    *   `#include "..."`
-    *   `#include MACRO_NAME`
-
-    The function returns a list of tuples containing the line number and a description of each include directive.
+    The grammar's structured `path` field is preferred; malformed or macro-style directives fall back to regex extraction from the raw text, so every directive yields an entry.
 
     Parameters:
-    - `tree`: The parsed Tree-sitter tree for the source.
-    - `source_bytes`: The (normalised) source bytes the tree was parsed from.
+    - `tree`: The tree-sitter parse tree for the file.
+    - `source_bytes`: The raw source bytes the tree was parsed from.
 
     Returns:
-    - A list of tuples, where each tuple contains the line number (1-based) and a description of the include directive.
+    - A list of `(line, text)` tuples in source order, where `line` is 1-based and `text` is a Markdown list item naming the include target.
     """
 
     out: List[Tuple[int, str]] = []
@@ -371,55 +368,60 @@ def _collect_includes_c(tree, source_bytes: bytes) -> List[Tuple[int, str]]:
 
     def add(n, payload: str) -> None:
         """
-        Add a payload to the output list at the specified line number.
+        Append one include entry tagged with the node's 1-based source line.
 
         Parameters:
-        - `n`: A Tree-sitter node representing the position where the payload should be added.
-        - `payload`: The string to be appended to the output list.
-
-        Notes:
-        The line number is calculated from the 0-based row of the node's start point, converted to 1-based.
+        - `n`: The tree-sitter node whose start line tags the entry.
+        - `payload`: The display text to record.
         """
 
         ln = _to_1based(_row_of(n.start_point))
         out.append((ln, payload))
 
     stack = [root]
+
+    # Iterative depth-first walk over the parse tree.
     while stack:
         n = stack.pop()
         t = n.type
 
+        # An include directive: prefer the grammar's structured path field.
         if t == "preproc_include":
-            # Prefer the grammar field if available
             path_node = n.child_by_field_name("path")
+
+            # Take the parsed path when present, else fall back to regexes over the raw directive text.
             if path_node is not None:
                 raw = _node_text(source_bytes, path_node).strip()
-                # Normalise display but preserve delimiters if present
                 target = _display_include_target(raw)
                 add(n, f"- {target}")
             else:
-                # Fallback: parse the directive text
                 full = _node_text(source_bytes, n)
                 m = re.search(r"<([^>]+)>", full)
+
+                # Angle-bracket form first, then the quoted form.
                 if m:
                     add(n, f"- <{m.group(1)}>")
                 else:
                     m = re.search(r'"([^"\n\r]+)"', full)
+
+                    # Last resorts: quoted form, then a macro-name include named by its identifier - every directive yields an entry.
                     if m:
                         add(n, f'- "{m.group(1)}"')
                     else:
-                        # Try to catch identifier-like includes (e.g. macros)
                         m = re.search(r"#\s*include\s+([A-Za-z_]\w*)", full)
                         target = m.group(1) if m else "<unknown>"
                         add(n, f"- Includes {target}")
-            # Do not descend into children of this directive
+
+            # Includes cannot nest, so skip the node's children.
             continue
 
-        # Generic DFS over named children
+        # Push children reversed so the stack pops them in source order.
         for i in range(n.named_child_count - 1, -1, -1):
             stack.append(n.named_child(i))
 
+    # Guarantee source-line order whatever the traversal produced.
     out.sort(key=lambda t: t[0])
+
     return out
 
 
@@ -431,29 +433,24 @@ def describe_includes_c(
     source_bytes: bytes
 ) -> None:
     """
-    Build a list of #includes from the source code and feed it to the LLM as extra context.
+    Prime the conversation with the file's `#include` list.
 
-    The includes are echoed and pushed as a context turn followed by a **fixed acknowledgement we supply ourselves**
-    (`PRIMING_ACK`) - the model is not asked to generate an "OK". Making a small model parrot "OK" during priming
-    conditions it to answer the first real request with "OK" too, and the round trip is a wasted generation call.
+    The includes are gathered and appended to the chat history as a user turn answered by a canned acknowledgement, giving later generation turns sight of the file's dependencies. A file with no includes leaves the history untouched.
 
     Parameters:
-    - `llm`: The LocalChatModel instance (unused now the acknowledgement is supplied, kept for signature symmetry).
-    - `cfg`: The GenerationConfig instance (unused; kept for signature symmetry).
-    - `messages`: The Messages instance used for storing and sending messages.
-    - `tree`: The parsed Tree-sitter tree for the source.
-    - `source_bytes`: The (normalised) source bytes the tree was parsed from.
-
-    Notes:
-    This method does not return any value, as it is designed to update the message list in place.
+    - `llm`: The local chat model (unused; present for the shared priming signature).
+    - `cfg`: The generation configuration (unused; present for the shared priming signature).
+    - `messages`: The chat history to receive the priming exchange.
+    - `tree`: The tree-sitter parse tree for the file.
+    - `source_bytes`: The raw source bytes the tree was parsed from.
     """
 
+    # Prime the chat with the include list and a canned acknowledgement - context for later turns, no generation happens here.
     items = _collect_includes_c(tree, source_bytes)
     if not items:
         return
     lines = [text for _, text in items]
     payload = "\n".join(lines)
-
     echo(f"\n[C] Includes...\n{payload}")
     prompt = (
         "For additional context, here is a list of includes within this program:\n\n"
@@ -468,89 +465,93 @@ def describe_includes_c(
 
 def iter_defs_with_info_c(tree, source_bytes: bytes) -> List[DefInfoC]:
     """
-    Collect real function definitions from a C file.
+    Scan a parsed C file and return a `DefInfoC` record for every function definition.
 
-    This function walks a parsed C tree, identifies function definitions, and collects metadata.
-    Forward declarations are excluded from the results.
+    Names are recovered by digging through the declarator to the underlying identifier, and header spans run to the line before the opening brace. Records are flat (depth 0, no parent links) since C functions do not nest.
 
     Parameters:
-    - `tree`: The parsed Tree-sitter tree for the source.
-    - `source_bytes`: The (normalised) source bytes the tree was parsed from.
+    - `tree`: The tree-sitter parse tree for the file.
+    - `source_bytes`: The raw source bytes the tree was parsed from.
 
     Returns:
-    - A sorted list of `DefInfoC` objects, each containing information about a real function definition.
+    - A list of `DefInfoC` records sorted by start line, then end line.
     """
 
     root = tree.root_node
-
     results: List[DefInfoC] = []
 
+    # Header spans the signature up to the line before the opening brace; a bodiless definition collapses to its first line.
     def header_span_for_function(fn_node) -> Tuple[int, int]:
         """
-        Return the line span of the header for a function.
+        Compute the 1-based line span of a C function definition's header.
 
-        The header ends on the line before the compound statement (body) begins, unless there is no body,
-        in which case it spans the entire function definition.
+        The header runs from the definition's first line up to the line before the one on which the compound body opens; definitions without a parsable body degrade to a single-line span.
+
+        Parameters:
+        - `fn_node`: The tree-sitter `function_definition` node to measure.
+
+        Returns:
+        - A `(start, end)` tuple of 1-based inclusive line numbers covering the header.
         """
 
-        # In C grammar, function_definition has field 'declarator' and 'body'
+        # The body's start is what marks where the header text ends.
         body = fn_node.child_by_field_name("body")
+
+        # With a real body, the header is every line before the one holding the opening brace.
         if body and body.type == "compound_statement":
             start, _ = _line_span_from_node(fn_node)
             header_end = _to_1based(_row_of(body.start_point)) - 1
+
             return start, header_end
-        # Fallback: no body? Treat header as single line (should not happen for function_definition)
+
+        # No compound body (malformed or macro-mangled definition): fall back to the node's own first line.
         s, _e = _line_span_from_node(fn_node)
+
         return s, s
 
+    # Dig through nested declarators (pointers, parameter lists) to the underlying identifier.
     def function_name(fn_node) -> str:
         """
-        Extract function identifier text from the declarator subtree.
+        Extract a C function's name from its definition node.
 
-        This function traverses the declarator subtree to find the function identifier node.
-        If found, it returns the identifier as a string. If not found, it returns "<anonymous>".
+        The identifier can be nested arbitrarily deep inside the declarator (pointer returns, parameter lists), so the declarator subtree is searched depth-first.
 
         Parameters:
-        - `fn_node`: The declarator subtree node to extract the function identifier from.
+        - `fn_node`: The tree-sitter `function_definition` node to name.
 
         Returns:
-        - The extracted function identifier as a string, or "<anonymous>" if not found.
+        - The function's identifier text, or `"<anonymous>"` when no identifier exists.
         """
 
-        # function_definition -> declarator (function_declarator) -> declarator (pointer? direct_declarator)
+        # The name hides somewhere inside the declarator subtree, so a missing declarator means no name at all.
         decl = fn_node.child_by_field_name("declarator")
         if decl is None:
             return "<anonymous>"
-        # Find the innermost identifier under the declarator
         stack = [decl]
+
+        # Depth-first search; children are pushed in reverse so the leftmost identifier wins.
         while stack:
             n = stack.pop()
             if n.type == "identifier":
-                # slice from bytes to handle non-ASCII robustly
                 return source_bytes[n.start_byte:n.end_byte].decode("utf-8", errors="replace")
-            # traverse children
             for i in range(n.named_child_count - 1, -1, -1):
                 stack.append(n.named_child(i))
+
+        # Declarator with no identifier anywhere (e.g. abstract): degrade rather than fail.
         return "<anonymous>"
 
-    # DFS over named nodes
+    # Record every function flat - depth 0, no parent links - since C functions do not nest.
     def walk(n) -> None:
         """
-        Collect function definitions from the abstract syntax tree (AST).
+        Recursively collect every C function definition beneath a syntax node.
 
-        This function recursively traverses the AST, identifying function definitions and collecting metadata.
-        For each function definition, it extracts the qualified name, line span, header span, and other relevant information.
+        Each match is appended to the enclosing `results` list as a flat entry - C has no routine nesting, so depth and parentage are constant.
 
         Parameters:
-        - `n`: The current node in the AST to process.
-
-        Notes:
-        - Function definitions are identified by their type (`"function_definition"`).
-        - Anonymous functions are assigned a default qualified name (`"<anonymous>"`).
-        - The function collects metadata for each definition, including the qualified name, line span, header span, and more.
-        - The collected metadata is stored in a `DefInfoC` object.
+        - `n`: The tree-sitter node at which to start the walk.
         """
 
+        # Every definition is recorded flat: C has no nesting, so depth and parent are fixed.
         if n.type == "function_definition":
             qual = function_name(n) or "<anonymous>"
             s, e = _line_span_from_node(n)
@@ -567,56 +568,63 @@ def iter_defs_with_info_c(tree, source_bytes: bytes) -> List[DefInfoC]:
                 parent_id=None,
                 children_ids=tuple(),
             ))
-            # no nested functions in C; still walk body for completeness if needed
+
+        # Keep descending regardless, so definitions inside linkage or preprocessor wrappers are still found.
         for i in range(n.named_child_count):
             walk(n.named_child(i))
 
     walk(root)
-    # Multiple definitions due to #ifdef blocks are kept; caller may disambiguate by span.
+
+    # Sorting guarantees source order whatever the walk produced.
     return sorted(results, key=lambda d: (d.start, d.end))
 
 
 def _decl_function_declarator(decl_node):
     """
-    Return the `function_declarator` of a C `declaration` node iff it is a plain function prototype, else None.
+    Find the `function_declarator` inside a C declaration, if it has one.
 
-    The declarator chain is descended only through `pointer_declarator` wrappers (a pointer-returning prototype such
-    as `char *foo(int)`); any other wrapper (a `parenthesized_declarator`, as in a function-pointer variable
-    `int (*fp)(int)`) means this is not a prototype, so None is returned.
+    Pointer wrappers are peeled off on the way down, so prototypes for functions returning pointers are still recognised; any other declarator shape means the declaration is not a function prototype.
 
     Parameters:
-    - `decl_node`: A tree-sitter `declaration` node.
+    - `decl_node`: The tree-sitter `declaration` node to inspect.
 
     Returns:
-    - The `function_declarator` node, or None.
+    - The `function_declarator` node, or `None` when the declaration does not declare a function.
     """
 
     n = decl_node.child_by_field_name("declarator")
+
+    # Unwrap until the parameter-list shape surfaces - that is what marks a function prototype.
     while n is not None:
         if n.type == "function_declarator":
             return n
+
+        # Pointer wrappers (functions returning pointers) just add a layer: peel and keep looking.
         if n.type == "pointer_declarator":
             n = n.child_by_field_name("declarator")
             continue
+
+        # Any other shape (variable, array, etc.) means this declaration is not a function.
         return None
+
     return None
 
 
 def _prototype_name(decl_node, source_bytes: bytes) -> Optional[str]:
     """
-    Return the function name of a C prototype `declaration`, or None if the node is not a plain function prototype.
+    Extract the function name from a C prototype declaration.
 
-    Confident-only: a function pointer, an abstract declarator, or any unexpected shape yields None (so it is ignored
-    rather than mis-documented). Pointer-return wrappers around the name are unwound.
+    Pointer layers around the identifier are peeled off, but anything that does not bottom out at a plain identifier (function pointers, abstract declarators) is rejected.
 
     Parameters:
-    - `decl_node`: A tree-sitter `declaration` node.
-    - `source_bytes`: The source bytes the tree was parsed from.
+    - `decl_node`: The tree-sitter `declaration` node to inspect.
+    - `source_bytes`: The raw source bytes the tree was parsed from.
 
     Returns:
-    - The function name, or None.
+    - The prototype's identifier text, or `None` when the declaration is not a plain named function prototype.
     """
 
+    # Only plain named prototypes qualify: pointer layers are peeled, but function pointers and abstract declarators are turned away.
     fd = _decl_function_declarator(decl_node)
     if fd is None:
         return None
@@ -630,30 +638,39 @@ def _prototype_name(decl_node, source_bytes: bytes) -> Optional[str]:
 
 def iter_decls_with_info_c(tree, source_bytes: bytes) -> List[DefInfoC]:
     """
-    Collect function *prototypes* (forward declarations) from a C file.
+    Collect every function prototype declaration in a parsed C file.
 
-    Walks for `declaration` nodes that are plain function prototypes (a `function_declarator` reached only through
-    pointer wrappers), including prototypes nested inside `#ifdef`/`#if` preprocessor blocks. Local variable
-    declarations (inside a function body) are skipped, as are variable/typedef/struct declarations and function-pointer
-    variables (no qualifying `function_declarator`). Each prototype's `header_start`/`header_end`/`start`/`end` all span
-    the prototype itself (which may be multi-line); `kind` is `"declaration"`.
+    Function bodies are never descended into, so local variable declarations cannot masquerade as prototypes; only declarations that bottom out at a plain named function declarator are kept.
 
     Parameters:
-    - `tree`: The parsed Tree-sitter tree for the source.
-    - `source_bytes`: The (normalised) source bytes the tree was parsed from.
+    - `tree`: The tree-sitter parse tree for the file.
+    - `source_bytes`: The raw source bytes the tree was parsed from.
 
     Returns:
-    - A list of `DefInfoC` records (kind `"declaration"`), sorted by line span.
+    - A list of `DefInfoC` records of kind `"declaration"`, sorted into source order.
     """
 
     results: List[DefInfoC] = []
 
+    # Each named prototype becomes a flat entry whose header spans the whole declaration.
     def walk(n) -> None:
-        """Collect prototypes, not descending into function bodies (local declarations) or other declarations."""
+        """
+        Recursively collect function prototype declarations beneath a syntax node.
+
+        Function bodies are pruned outright so local variable declarations are never mistaken for prototypes; matches are appended to the enclosing `results` list.
+
+        Parameters:
+        - `n`: The tree-sitter node at which to start the walk.
+        """
+
         if n.type in ("function_definition", "compound_statement"):
             return  # do not descend into bodies: their local variable declarations are not prototypes
+
+        # A name comes back only for genuine function prototypes; everything else is ignored.
         if n.type == "declaration":
             name = _prototype_name(n, source_bytes)
+
+            # A prototype is a single statement, so its header span is simply the whole declaration.
             if name:
                 s, e = _line_span_from_node(n)
                 results.append(DefInfoC(
@@ -661,70 +678,77 @@ def iter_decls_with_info_c(tree, source_bytes: bytes) -> List[DefInfoC]:
                     start=s, end=e, header_start=s, header_end=e,
                     depth=0, parent_id=None, children_ids=tuple(),
                 ))
+
             return  # a declaration has no nested prototypes
+
+        # Descend through wrappers (linkage specs, preprocessor groups) that may still hold prototypes.
         for i in range(n.named_child_count):
             walk(n.named_child(i))
 
     walk(tree.root_node)
+
+    # Sort by position so callers see prototypes in source order, whatever order the walk found them.
     return sorted(results, key=lambda d: (d.start, d.end))
 
 
 def _collect_calls_c(node, source_bytes: bytes) -> List[Tuple[str, str]]:
     """
-    Collect a C function's call sites for the call-graph resolver: every `f(...)` with a bare-identifier callee.
+    Gather the direct function calls made inside a C syntax subtree.
 
-    C has no nested functions or methods, so the whole function subtree is walked and only direct calls through a plain
-    identifier are recorded (all as `"free"`). Calls through a field/pointer expression or a function pointer are not
-    bare identifiers, so they are left unresolved (no entry). Each record carries the call's 1-based source line -
-    resolution ignores it; the block pass's read-side call annotations use it.
+    Only calls through a bare identifier are recorded - calls via function pointers or struct members cannot be resolved to a name. Each hit carries the callee name, the kind tag `"free"`, and its 1-based line number.
 
     Parameters:
-    - `node`: The `function_definition` tree-sitter node.
-    - `source_bytes`: The source bytes the tree was parsed from.
+    - `node`: The tree-sitter node whose subtree is scanned.
+    - `source_bytes`: The raw source bytes the tree was parsed from.
 
     Returns:
-    - The call sites as `(name, "free", line)` triples.
+    - A list of `(name, kind, line)` tuples, one per direct call.
     """
 
+    # Each hit is recorded as (name, kind, 1-based line); an explicit stack keeps the walk iterative.
     calls: List[Tuple[str, str, int]] = []
     stack = [node]
+
     while stack:
         n = stack.pop()
+
+        # Only direct calls through a bare identifier count - pointer and member calls cannot be named.
         if n.type == "call_expression":
             fn = n.child_by_field_name("function")
             if fn is not None and fn.type == "identifier":
                 calls.append((_node_text(source_bytes, fn), "free", n.start_point[0] + 1))
+
         for i in range(n.named_child_count):
             stack.append(n.named_child(i))
+
     return calls
 
 
 def iter_symbols(source_blob: str, source_lines: Chunk) -> List[Symbol]:
     """
-    Extract the call-graph `Symbol` for every function in a C file (the model-free pre-pass per-file step).
+    Extract every function definition and bare declaration from C source as `Symbol` records.
 
-    Reuses `iter_defs_with_info_c` for the definition records, then attaches each function's header signature, the
-    existing doc comment above it (the seed contract, via `_doc_above_header`) and its bare-identifier call sites.
-    Function *prototypes* (`iter_decls_with_info_c`) are also emitted as `"declaration"` symbols so a header's existing
-    doc can seed a contract for callers; a declaration has no call sites and `build_project_graph` keeps it out of the
-    free-function uniqueness index (so a decl/def pair never makes a name ambiguous). Every C symbol is at file scope
-    (no nesting, no parent). Returns `[]` if the file cannot be parsed.
+    Definitions are collected first, complete with signature text, any documentation block sitting above the header, and the names they call. Declarations (prototypes) are then added only for names with no in-file definition, so each symbol appears exactly once. Unparseable source yields an empty list rather than an error.
 
     Parameters:
-    - `source_blob`: The complete source text.
-    - `source_lines`: The same source split into lines.
+    - `source_blob`: The full C source text to parse.
+    - `source_lines`: The source split into lines, used to recover signature text.
 
     Returns:
-    - One `Symbol` per function definition and prototype (the `file` field is left blank for `build_project_graph`).
+    - A list of `Symbol` records, empty when the source cannot be parsed.
     """
 
+    # Unparseable source means nothing to document: report no symbols rather than raising.
     try:
         tree, source_bytes = _parse_c(source_blob)
     except Exception:
         return []
 
+    # Track definition names so prototypes of already-defined functions can be skipped below.
     symbols: List[Symbol] = []
     seen_defs: set = set()
+
+    # Definitions carry the full record: signature text, any doc above the header, and the calls made inside.
     for d in iter_defs_with_info_c(tree, source_bytes):
         signature = "\n".join(source_lines[d.header_start - 1:d.header_end]) if d.header_end >= d.header_start else ""
         seen_defs.add(d.qualname)
@@ -733,6 +757,8 @@ def iter_symbols(source_blob: str, source_lines: Chunk) -> List[Symbol]:
             parent_qualname=None, existing_doc=_doc_above_header(source_lines, d.header_start),
             calls=_collect_calls_c(d.node, source_bytes),
         ))
+
+    # Prototypes are added only when the file holds no matching definition, and never carry call lists.
     for d in iter_decls_with_info_c(tree, source_bytes):
         if d.qualname in seen_defs:
             continue   # a definition in the same file already carries the symbol/contract for this name
@@ -742,6 +768,7 @@ def iter_symbols(source_blob: str, source_lines: Chunk) -> List[Symbol]:
             parent_qualname=None, existing_doc=_doc_above_header(source_lines, d.header_start),
             calls=[],
         ))
+
     return symbols
 
 
@@ -756,38 +783,50 @@ _C_BLOCK_OPENERS = {"if_statement", "for_statement", "while_statement", "do_stat
 
 
 def _named_children(n) -> List:
-    """Return the named children of a tree-sitter node as a list."""
+    """
+    Return a node's named tree-sitter children as a list.
+    """
+
     return [n.named_child(i) for i in range(n.named_child_count)]
 
 
 def _is_c_statement(n) -> bool:
-    """Report whether a node is a C statement (a `declaration` or any `*_statement`), filtering out comments etc."""
+    """
+    Report whether a tree-sitter node is a C statement; declarations count as statements so they take part in segmentation.
+    """
+
     return n.type == "declaration" or n.type.endswith("_statement")
 
 
 def _c_suite(node) -> Optional[List]:
     """
-    Return the statement list held by a body/branch node, or None.
+    Normalise a C body node into its list of statement children.
 
-    Unwraps an `else_clause` to the branch inside it; expands a `compound_statement` to its statement children; and
-    treats a single unbraced statement (e.g. the body of `for (...) x++;`) as a one-element suite - the analogue of
-    Python's `_sub_statement_lists` entries.
+    Covers the shapes tree-sitter produces for control-flow bodies: an `else` clause is unwrapped one level (handling both a braced block and a bare `else if`), a compound statement yields its statement children, and a brace-less single statement becomes a one-entry list.
 
     Parameters:
-    - `node`: A body/branch node (or None).
+    - `node`: The tree-sitter node to normalise, or `None`.
 
     Returns:
-    - The statement list, or None if the node holds no statements.
+    - A non-empty list of statement nodes, or `None` when there are no statements.
     """
 
     if node is None:
         return None
+
+    # An `else` clause is only a wrapper: its single child holds the real body.
     if node.type == "else_clause":
+        # Recursing one level covers both a braced block and a bare `else if`.
         kids = _named_children(node)
         return _c_suite(kids[0]) if kids else None
+
+    # A braced block contributes its statement children.
     if node.type == "compound_statement":
+        # An empty block reads as no suite at all (`None`), never an empty list.
         stmts = [c for c in _named_children(node) if _is_c_statement(c)]
         return stmts or None
+
+    # A brace-less body is a single statement, still returned as a one-entry suite.
     if _is_c_statement(node):
         return [node]
     return None
@@ -795,20 +834,21 @@ def _c_suite(node) -> Optional[List]:
 
 def _c_statement_lists(stmt) -> List[List]:
     """
-    Return the statement lists nested directly inside a C compound statement (the analogue of Python suites).
+    Collect the statement suites nested directly inside one C statement.
 
-    Covers the consequence/alternative of an `if`, the body of a `for`/`while`/`do`, each `case` body of a `switch`,
-    and the contents of a bare `{ ... }` block. Used to recurse into a routine body one nesting level at a time.
+    Each control-flow construct contributes its bodies: both branches of an `if`, the body of a loop, one list per `case` of a `switch`, and the contents of a bare braced block.
 
     Parameters:
-    - `stmt`: The statement to inspect.
+    - `stmt`: The tree-sitter statement node to inspect.
 
     Returns:
-    - A list of statement lists (empty for a simple statement).
+    - A list of statement lists, one per non-empty nested suite; empty when the statement nests nothing.
     """
 
     t = stmt.type
     lists: List[List] = []
+
+    # An `if` contributes both branches; a loop contributes its single body.
     if t == "if_statement":
         for fld in ("consequence", "alternative"):
             sl = _c_suite(stmt.child_by_field_name(fld))
@@ -820,6 +860,8 @@ def _c_statement_lists(stmt) -> List[List]:
             lists.append(sl)
     elif t == "switch_statement":
         body = stmt.child_by_field_name("body")
+
+        # A `switch` yields one suite per case so each case body segments on its own; a bare braced block is itself a suite.
         if body is not None:
             for case in _named_children(body):
                 if case.type == "case_statement":
@@ -830,98 +872,115 @@ def _c_statement_lists(stmt) -> List[List]:
         cl = [c for c in _named_children(stmt) if _is_c_statement(c)]
         if cl:
             lists.append(cl)
+
     return lists
 
 
 def _c_span(node) -> int:
-    """Source-line span of a node (its triviality measure for the block-size gate)."""
+    """
+    Return the number of source lines a node spans, counting both end lines.
+    """
+
     return _row_of(node.end_point) - _row_of(node.start_point) + 1
 
 
 def _c_closed_block(prev_node, resume_start: int, body_node) -> Optional[object]:
     """
-    Return the outermost brace block that closed between `prev_node` and a dedent resuming at `resume_start`.
+    Find the outermost block construct that closed before the segmenter's resume line.
 
-    Climbs the parent chain from the previous statement (stopping at the routine body), keeping the outermost block
-    opener that ended before the resuming line - the tree-sitter analogue of `scale_python._seg_closed_block`.
+    Climbs the ancestor chain from the previous statement towards the function body; the highest block-opening ancestor that ends before `resume_start` wins, telling the caller how large a block has just been stepped out of.
 
     Parameters:
-    - `prev_node`: The statement immediately before the dedent.
-    - `resume_start`: The 1-based line the dedent resumes on.
-    - `body_node`: The routine's body block (the climb stops here).
+    - `prev_node`: The statement node preceding the resume point.
+    - `resume_start`: The 1-based source line where processing resumes.
+    - `body_node`: The function-body node that bounds the climb.
 
     Returns:
-    - The outermost closed block node, or None if none closed.
+    - The outermost closed block node, or `None` if no enclosing block closed.
     """
 
     best = None
     n = prev_node.parent
+
+    # Keep overwriting `best` while climbing so the outermost qualifying block wins.
     while n is not None and n is not body_node:
         if n.type in _C_BLOCK_OPENERS and _to_1based(_row_of(n.end_point)) < resume_start:
             best = n
         n = n.parent
+
     return best
 
 
 def _collect_body_c(body_node, source_lines: Chunk) -> Tuple[List[int], Dict[int, str], List[SegStatement]]:
     """
-    Walk a C function body, returning its legal block boundaries, their indentation, and the segmenter records.
+    Walk a C function body and gather everything the structural segmenter needs.
 
-    Mirrors `scale_python._body_boundaries` + `_seg_records`: every statement is recorded at every nesting depth
-    (recursing into nested brace blocks), the first statement of an inner suite is excluded from the boundaries, and
-    a line is a boundary only if it begins exactly one (non-suite-leading) statement at its first non-blank column -
-    which naturally drops `a; b;` lines, continuation lines, and inline inner statements. The full statement list
-    (including suite-leading statements) is returned for the segmenter, which needs the body's complete shape to
-    reason about returns and dedents.
+    A recursive walk records every statement with its nesting depth, pairs a lone trailing `return` with the statement just above it so the two segment together, and forces a paragraph break after a long leading run of declarations. The recorded lines are then filtered to safe comment-insertion points (lines that start exactly one statement, preceded only by indentation) and each statement is turned into a `SegStatement` carrying its span, any block it opens, and the size of any block that has just closed before it.
 
     Parameters:
-    - `body_node`: The function's `compound_statement` body node.
-    - `source_lines`: The full source split into lines.
+    - `body_node`: The tree-sitter compound-statement node for the function body.
+    - `source_lines`: The full source as a list of lines, used for indentation checks.
 
     Returns:
-    - A tuple `(boundary_lines, indent_of, seg_statements)`.
+    - A tuple of sorted boundary line numbers, a map from boundary line to its indentation string, and the `SegStatement` list in line order.
     """
 
+    # State the recursive walk fills in: per-line tallies plus the merge and forced-break special cases.
     line_count: Dict[int, int] = {}
     line_col: Dict[int, int] = {}
     recorded: List[Tuple[int, int, object, bool]] = []  # (start, depth, node, first_in_scope)
     merge_map: Dict[int, int] = {}                       # return line -> anchor (preceding statement) line
     force_break_lines: set = set()                       # first real statement after a leading declaration run
 
+    # The walk tags every statement with depth and scope, pairs a lone trailing return with its anchor, and forces a break after a leading declaration run.
     def walk(stmts: List, is_top: bool, depth: int) -> None:
-        """Record each statement and recurse into its nested suites, tracking depth and suite position."""
-        # A suite that is exactly `[simple_stmt, return]` is one paragraph: anchor it at the leading statement so the
-        # comment pass sees both lines (a return alone gives it nothing to describe).
+        """
+        Recursively record segmentation bookkeeping for one C statement list.
+
+        Notes a work-then-return pair so the two merge into one paragraph, forces a break after a sufficiently long run of leading declarations, and tallies where each statement starts before descending into nested suites.
+
+        Parameters:
+        - `stmts`: The statement nodes at this nesting level.
+        - `is_top`: `True` when this list is the function's top-level body.
+        - `depth`: The current nesting depth, recorded alongside each statement.
+        """
+
+        # A short work-then-return body reads as one thought, so map the return's line back to merge the pair into a single paragraph.
         if (len(stmts) == 2 and stmts[1].type == "return_statement"
                 and stmts[0].type not in _C_BLOCK_OPENERS):
             a = _to_1based(_row_of(stmts[0].start_point))
             r = _to_1based(_row_of(stmts[1].start_point))
             if a != r:
                 merge_map[r] = a
-        # Leading-declaration heuristic: a scope opening with a run of declarations gets its first real statement
-        # paragraphed off, so the declarations read as their own block (a `return` first statement is left to the
-        # merge / trailing-return rules).
+
+        # A long enough run of leading declarations is a prologue in its own right: force a break at the first real statement (unless that is just the return).
         ndecl = 0
         while ndecl < len(stmts) and stmts[ndecl].type == "declaration":
             ndecl += 1
         if ndecl >= SEG_MIN_LEADING_DECLS and ndecl < len(stmts) and stmts[ndecl].type != "return_statement":
             force_break_lines.add(_to_1based(_row_of(stmts[ndecl].start_point)))
+
+        # Catalogue every statement so the segmenter knows which lines genuinely begin one.
         for idx, stmt in enumerate(stmts):
             skip = (not is_top) and idx == 0  # the first line of an inner suite is never a block start
             start = _to_1based(_row_of(stmt.start_point))
+
+            # Tally statement starts and columns per line so the segmenter can spot lines hosting more than one statement.
             if not skip:
                 line_count[start] = line_count.get(start, 0) + 1
                 line_col[start] = _col_of(stmt.start_point)
+
+            # Remember the statement with its depth, then descend into any nested statement lists.
             recorded.append((start, depth, stmt, is_top and idx == 0))
             for sub in _c_statement_lists(stmt):
                 walk(sub, False, depth + 1)
 
     top_stmts = [c for c in _named_children(body_node) if _is_c_statement(c)]
     walk(top_stmts, True, 0)
-
-    # Boundary lines: exactly one statement start, at the line's first non-blank column.
     boundary_lines: List[int] = []
     indent_of: Dict[int, str] = {}
+
+    # Only lines that start exactly one statement, preceded by nothing but indentation, are safe comment-insertion points.
     for line, count in line_count.items():
         if count != 1 or not (1 <= line <= len(source_lines)):
             continue
@@ -931,25 +990,28 @@ def _collect_body_c(body_node, source_lines: Chunk) -> Tuple[List[int], Dict[int
         indent_of[line] = text[: len(text) - len(text.lstrip())]
         boundary_lines.append(line)
 
-    # A `[stmt; return]` anchor is the first statement of its suite (normally excluded); make it an addressable
-    # boundary so the merged paragraph can be commented there.
+    # Return-merge anchors must always be boundaries, even when the count filter rejected them.
     for anchor in set(merge_map.values()):
         if 1 <= anchor <= len(source_lines) and anchor not in indent_of:
             text = source_lines[anchor - 1]
             indent_of[anchor] = text[: len(text) - len(text.lstrip())]
             boundary_lines.append(anchor)
-    boundary_lines.sort()
 
-    # Segmenter records, in source order, with depth/return/block-span/dedent annotations.
+    boundary_lines.sort()
     recorded.sort(key=lambda r: r[0])
     seg_statements: List[SegStatement] = []
+
+    # Second pass: turn each recorded node into the segmenter's per-statement facts.
     for i, (start, depth, node, first_in_scope) in enumerate(recorded):
         end = _to_1based(_row_of(node.end_point))
         opens = _c_span(node) if node.type in _C_BLOCK_OPENERS else 0
         closed = 0
+
+        # A drop in depth means a block just closed; measure it so the segmenter can weigh the dedent.
         if i > 0 and recorded[i - 1][1] > depth:
             blk = _c_closed_block(recorded[i - 1][2], start, body_node)
             closed = _c_span(blk) if blk is not None else 0
+
         seg_statements.append(SegStatement(
             start=start, end=end, depth=depth,
             is_return=node.type == "return_statement", is_def=False,
@@ -963,21 +1025,19 @@ def _collect_body_c(body_node, source_lines: Chunk) -> Tuple[List[int], Dict[int
 
 def _doc_above_header(source_lines: Chunk, header_start: int) -> str:
     """
-    Return the documentation text of the comment block immediately above a function header (or "" if there is none).
+    Return the prose of any comment block sitting immediately above a C function header.
 
-    This is the C analogue of Python's `ast.get_docstring`: the block provider parses the (possibly def-pass-
-    annotated) source, so the `/* ... */` or `//` doc block the definition pass wrote above the function is read
-    back here and fed to the block-comment pass as the routine's purpose - giving C the same per-routine context
-    Python gets from a docstring.
+    Both comment styles are handled: a `/* */` block yields its first comment body, while a run of `//` lines is stripped of its markers and rejoined.
 
     Parameters:
-    - `source_lines`: The source split into lines (the same text the provider parses).
-    - `header_start`: The 1-based line of the function header.
+    - `source_lines`: The file's source lines.
+    - `header_start`: 1-based line number of the function header.
 
     Returns:
-    - The doc text with comment delimiters/gutters stripped, or "" when no comment block sits above the header.
+    - The comment text with its delimiters stripped, or an empty string if no comment precedes the header.
     """
 
+    # Cope with both comment styles: take the first /* */ body, or strip the // markers and rejoin the lines as prose.
     rng = _scan_existing_comment_block_above(source_lines, header_start)
     if rng is None:
         return ""
@@ -985,7 +1045,6 @@ def _doc_above_header(source_lines: Chunk, header_start: int) -> str:
     block = "\n".join(source_lines[s - 1:e])
     if "/*" in block:
         return _extract_first_c_comment_block(block)
-    # A `//` run: strip the leading slashes from each line.
     return "\n".join(ln.strip()[2:].strip() if ln.strip().startswith("//") else ln.strip()
                      for ln in block.split("\n")).strip()
 
@@ -996,38 +1055,32 @@ def iter_block_targets_c(
     doc_override: Optional[Callable[[str], Optional[str]]] = None,
 ) -> List[BlockTarget]:
     """
-    Build the within-function block targets for a C source file.
+    Build the block-pass targets for every function in a C source file.
 
-    Each function body becomes one `BlockTarget` carrying its header/body line spans, the lines that may legally
-    begin a block, and the deterministic structural segmentation (so the block pass needs no model to segment). This
-    is the C implementation of the language-agnostic provider interface consumed by `scale_blocks.annotate_blocks`.
-    C has no nested functions, so the after-def / first-in-scope (post-docstring) rules are disabled.
+    Each function with a compound body is structurally segmented; its doc is taken from `doc_override` when that supplies one, otherwise from any comment block above the header.
 
     Parameters:
-    - `source_blob`: The complete source text (parsed with Tree-sitter C).
-    - `source_lines`: The same source split into individual lines.
-    - `doc_override`: Optional `name -> Optional[str]` lookup (the `--doc-site` header doc). When it returns a doc for
-      a function, that becomes the routine's `BlockTarget.doc` instead of the comment above the header - so an
-      implementation whose docstring was redirected to its header still has its contract in the block-comment context.
+    - `source_blob`: The full source text.
+    - `source_lines`: The source split into lines.
+    - `doc_override`: Optional callback mapping a qualname to a replacement doc; may return `None` to fall back.
 
     Returns:
-    - A list of `BlockTarget`, one per function, in source order.
+    - A list of `BlockTarget` records, one per function with a body.
     """
 
     tree, source_bytes = _parse_c(source_blob)
     targets: List[BlockTarget] = []
 
+    # An override doc takes precedence; otherwise fall back to whatever comment already sits above the header.
     for info in iter_defs_with_info_c(tree, source_bytes):
         body_node = info.node.child_by_field_name("body")
         if body_node is None or body_node.type != "compound_statement":
             continue
-
         boundary_lines, indent_of, seg_statements = _collect_body_c(body_node, source_lines)
         top_stmts = [c for c in _named_children(body_node) if _is_c_statement(c)]
         if not top_stmts:
             continue
         body_start = _to_1based(_row_of(top_stmts[0].start_point))
-
         segments = structural_breaks(
             seg_statements, has_doc=False, boundary_lines=tuple(boundary_lines), body_end=info.end,
             allow_after_def=False, allow_first_in_scope=False,
@@ -1047,8 +1100,6 @@ def iter_block_targets_c(
                 indent_of=indent_of,
                 depth=0,
                 doc=doc,
-                # The manifest re-binding identity: a hash of the routine's verbatim span. Shift-proof (content, not
-                # line numbers), and the doc comment sits above the header so the def-pass apply does not disturb it.
                 sig=routine_text_hash(_get_text_for_lines(source_lines, info.header_start, info.end)),
                 segments=segments,
             )
@@ -1061,25 +1112,26 @@ def iter_block_targets_c(
 
 def assemble_snippet_for_c(source_lines: Chunk, info: DefInfoC) -> str:
     """
-    Assemble a snippet of C code for the function, including its header and body.
-
-    This method does not attempt to suppress inner functions, as C does not support nested functions.
+    Reassemble a C function's full source snippet from its header and body line ranges.
 
     Parameters:
-    - `source_lines`: The input source code lines.
-    - `info`: A DefInfoC object containing metadata about the function definition.
+    - `source_lines`: The file's source lines.
+    - `info`: The definition info giving the header and body line extents.
 
     Returns:
-    - A string representing the assembled snippet of C code.
+    - The header and body joined as a single string.
     """
 
     header_text = _get_text_for_lines(source_lines, info.header_start, info.header_end)
     body_text = _get_text_for_lines(source_lines, info.header_end + 1, info.end)
     parts: List[str] = [header_text]
+
+    # Insert the joining newline only when the header lacks its own, so the reassembled snippet stays faithful to the source.
     if body_text:
         if header_text and not header_text.endswith("\n"):
             parts.append("\n")
         parts.append(body_text)
+
     return "".join(parts)
 
 
@@ -1097,43 +1149,53 @@ def assemble_snippet_for_c(source_lines: Chunk, info: DefInfoC) -> str:
 
 @dataclass
 class CFileDocPlan:
-    """
-    The per-file slice of a `CDocPlan` handed to the C worker for one source file.
 
-    Attributes:
-    - `skip`: Definition names in this file whose docstring should be skipped (redirected to a header).
-    - `header_names`: Prototype names in this file to document (the header documentation site).
-    - `_plan`: The owning `CDocPlan` (for the cross-file impl-snippet and header-doc recording).
+    """
+    A single file's view of the run-wide C doc-site plan.
+
+    `skip` and `header_names` hold this file's slices; snippet lookups and header-doc recording delegate to the shared `CDocPlan`, so anything recorded here is visible across the run.
     """
 
+    # The sets are this file's slice of the run-wide plan; lookups go through the shared CDocPlan underneath.
     skip: Set[str]
     header_names: Set[str]
     _plan: "CDocPlan"
 
     def impl_snippet(self, name: str) -> Optional[str]:
-        """The implementation-body snippet to generate a header prototype's prose from, or None (use the prototype)."""
+        """
+        Return the implementation snippet for a function via the shared plan.
+
+        Parameters:
+        - `name`: The function name to look up.
+
+        Returns:
+        - The implementation source snippet, or `None` if no body is recorded.
+        """
+
         return self._plan.impl_snippet(name)
 
     def record_header_doc(self, name: str, doc: str) -> None:
-        """Record the full doc generated for a header prototype (so the paired impl's block pass can reuse it)."""
+        """
+        Record a header doc for a function in the shared plan.
+
+        Parameters:
+        - `name`: The function name.
+        - `doc`: The doc text to record.
+        """
+
         self._plan.record_header_doc(name, doc)
 
 
 @dataclass
 class CDocPlan:
-    """
-    The run-wide header/implementation documentation plan (model-free), produced by `plan_doc_sites_c`.
 
-    Attributes:
-    - `skip`: file key -> definition names to leave undocumented (their docs go to a header instead).
-    - `header_names`: file key -> prototype names to document at that file's declarations.
-    - `impl_body`: function name -> `(impl source_lines, def info)` used to generate a header's prose from the body.
-    - `impl_file`: function name -> the impl file key (used to propagate the generated contract to the def's symbol).
-    - `pairs`: `(header_file_key, impl_file_key)` ordering constraints (a header is documented before its impl's
-      block pass runs); only present when both sides are targets.
-    - `header_docs`: function name -> the full doc generated for its prototype (the block-pass `doc_override` source).
+    """
+    The run-wide plan for the C header/implementation doc-site.
+
+    The skip, header-name and body maps are keyed per file, recording which names each file omits, which it declares, and where each implementation lives; `header_docs` accumulates the docs written during the run so headers and implementations can share them.
     """
 
+    # The work maps are keyed per file, while header_docs accumulates run-wide as docs are written.
     skip: Dict[str, Set[str]]
     header_names: Dict[str, Set[str]]
     impl_body: Dict[str, Tuple[Chunk, DefInfoC]]
@@ -1141,68 +1203,112 @@ class CDocPlan:
     pairs: List[Tuple[str, str]]
     header_docs: Dict[str, str] = field(default_factory=dict)
 
+    # Each file gets its own slice but keeps delegating to this shared plan, so recorded docs stay visible run-wide.
     def for_file(self, file_key: str) -> CFileDocPlan:
-        """Return the per-file slice (empty sets for a file with no redirected defs or documentable prototypes)."""
+        """
+        Build the per-file view of this plan for one run file.
+
+        Parameters:
+        - `file_key`: The run key of the file whose slice is wanted.
+
+        Returns:
+        - A `CFileDocPlan` carrying that file's skip and header-name sets; files the plan does not mention get empty sets.
+        """
+
+        # Unknown file keys collapse to empty sets, so files outside the plan get a harmless no-op view; `_plan` links back for shared lookups.
         return CFileDocPlan(
             skip=self.skip.get(file_key, set()),
             header_names=self.header_names.get(file_key, set()),
             _plan=self,
         )
 
+    # Snippets are rebuilt on demand from the stored lines rather than kept as pre-rendered text.
     def impl_snippet(self, name: str) -> Optional[str]:
-        """Assemble the implementation body for `name` (a pure read of the captured impl lines), or None."""
+        """
+        Return the assembled source snippet for a function's recorded implementation body.
+
+        Parameters:
+        - `name`: The function name to look up.
+
+        Returns:
+        - The snippet text, or `None` when the plan recorded no unique implementation body for the name.
+        """
+
+        # Only names with a single unique definition in the run were recorded, so a miss is expected for ambiguous names.
         body = self.impl_body.get(name)
         if body is None:
             return None
         lines, info = body
+
         return assemble_snippet_for_c(lines, info)
 
     def record_header_doc(self, name: str, doc: str) -> None:
-        """Store the full doc generated for a header prototype (consumed by the paired impl's block-pass override)."""
+        """
+        Store the generated header documentation text for a function.
+
+        Parameters:
+        - `name`: The function name the documentation belongs to.
+        - `doc`: The documentation text to keep for later splicing at the declaration site.
+        """
+
         self.header_docs[name] = doc
 
     def header_doc(self, name: str) -> Optional[str]:
-        """The full doc generated this run for `name`'s prototype, or None - the block-pass `doc_override` lookup."""
+        """
+        Return the stored header documentation for a function.
+
+        Parameters:
+        - `name`: The function name to look up.
+
+        Returns:
+        - The documentation text, or `None` when none has been recorded for the name.
+        """
+
         return self.header_docs.get(name)
 
+    # Only the skip and header-name sets constitute pending work; recorded docs alone mean nothing is left to do.
     def has_work(self) -> bool:
-        """Whether the plan redirects anything (else the run behaves exactly as without `--doc-site`)."""
+        """
+        Report whether this plan redirects any documentation sites.
+
+        Returns:
+        - `True` if any definition docstrings are to be skipped or any header declarations need documenting, otherwise `False`.
+        """
+
         return bool(self.skip or self.header_names)
 
 
 def plan_doc_sites_c(files: List[Tuple[str, bool, str, Chunk]], policy: str = "auto") -> CDocPlan:
     """
-    Build the run-wide header/implementation documentation plan from every C file's definitions and prototypes.
+    Decide where each C function's documentation should live across a multi-file run.
 
-    Confident-only pairing: a function name is redirected to a header only when it has exactly one definition across
-    the run (ambiguous names - e.g. `static` dupes - are left documented at their definitions and logged). A prototype
-    is only a documentation *site* when it appears in a **target** file (a read-only reference is never written).
-
-    Policy:
-    - `"auto"` (default): each target-header prototype is documented (prose from the unique definition's body when one
-      exists, else from the prototype alone) and the definition's impl docstring is skipped when that `.c` is a target.
-    - `"impl"`: definitions are always documented (legacy behaviour); a target-header prototype is still documented, but
-      from its own prototype text, so a header is not left blank and docs may appear in both places.
+    Every definition and every target-file declaration in the run is indexed first. Under the `auto` policy, a name declared in a target file and defined exactly once anywhere in the run has its documentation redirected to the declaration (header) site, with the prose generated from the implementation body and the definition's own docstring suppressed. Names with several definitions are documented at every site instead, with a warning.
 
     Parameters:
-    - `files`: `(file_key, is_target, source_blob, source_lines)` for every C file in the run (targets and references).
-    - `policy`: `"auto"` or `"impl"`.
+    - `files`: The run's files as `(file_key, is_target, blob, lines)` tuples; non-target files still contribute definitions.
+    - `policy`: Doc-site policy; only `"auto"` enables header redirection.
 
     Returns:
-    - The populated `CDocPlan`.
+    - A `CDocPlan` holding the per-file skip sets, header names, captured implementation bodies, implementation files, and header-before-implementation ordering pairs.
     """
 
+    # Run-wide indexes: definitions may live anywhere, but only target files contribute declaration sites.
     target_keys = {fk for fk, is_target, _blob, _lines in files if is_target}
-
     defs_by_name: Dict[str, List[Tuple[str, Chunk, DefInfoC]]] = {}
     target_decls: Dict[str, List[str]] = {}   # name -> target file keys that declare it (a prototype site)
+
+    # A file that fails to parse simply contributes nothing rather than aborting the whole plan.
     for file_key, is_target, blob, lines in files:
         try:
             tree, sb = _parse_c(blob)
         except Exception:
             continue
+
+        # Definitions from non-target files still count towards the unique-definition test.
         for d in iter_defs_with_info_c(tree, sb):
             defs_by_name.setdefault(d.qualname, []).append((file_key, lines, d))
+
+        # Only declarations in target files become candidate header documentation sites.
         if is_target:
             for d in iter_decls_with_info_c(tree, sb):
                 target_decls.setdefault(d.qualname, []).append(file_key)
@@ -1213,22 +1319,26 @@ def plan_doc_sites_c(files: List[Tuple[str, bool, str, Chunk]], policy: str = "a
     impl_file: Dict[str, str] = {}
     pairs: List[Tuple[str, str]] = []
 
+    # A name defined more than once cannot be redirected safely, so each site keeps its own documentation (with a warning).
     for name, decl_files in target_decls.items():
         defs = defs_by_name.get(name, [])
         unique_def = defs[0] if len(defs) == 1 else None
         if unique_def is None and len(defs) >= 2:
             echo(f"doc-site: '{name}' has {len(defs)} definitions across the run; documenting at each (ambiguous).")
-
-        # Every target prototype of this name becomes a documentation site.
         for dfile in set(decl_files):
             header_names.setdefault(dfile, set()).add(name)
 
+        # Under `auto`, the header prose will be generated from the one unique implementation body.
         if policy == "auto" and unique_def is not None:
             def_file, def_lines, def_info = unique_def
             impl_body[name] = (def_lines, def_info)   # header prose is generated from the body
             impl_file[name] = def_file
+
+            # Suppress the definition's own docstring only when its file is in the run, so the documentation is never written twice.
             if def_file in target_keys:
                 skip.setdefault(def_file, set()).add(name)   # the redirected definition's docstring is skipped
+
+                # Record the ordering constraint: a header must be documented before its implementation's block pass runs.
                 for dfile in set(decl_files):
                     if dfile != def_file:
                         pairs.append((dfile, def_file))      # header documented before the impl's block pass
@@ -1240,126 +1350,127 @@ def plan_doc_sites_c(files: List[Tuple[str, bool, str, Chunk]], policy: str = "a
 
 def _render_c_block_comment(text: str, base_indent: str) -> List[str]:
     """
-    Render a C-style block comment from the provided text.
-
-    This function takes in a string of text and an indentation level, then formats it as a multi-line
-    C-style block comment. If the input text is empty, it will render a placeholder comment instead.
+    Render documentation text as a C block comment at the given indentation.
 
     Parameters:
-    - `text`: The text to be rendered as a block comment.
-    - `base_indent`: The base indentation for the comment lines.
+    - `text`: The prose to wrap; may be empty.
+    - `base_indent`: Whitespace prefix applied to every emitted line.
 
     Returns:
-    - A list of strings representing the rendered C-style block comment.
+    - The comment as a list of lines from the opening `/*` to the closing `*/`, with a placeholder body when `text` is empty.
     """
 
     lines = text.splitlines()
     out = [f"{base_indent}/*"]
+
+    # Blank prose lines are trimmed to a bare ` *`, and empty text still yields a visible placeholder body.
     if lines:
         for ln in lines:
-            # rstrip the whole line, not just the content: a blank doc line would otherwise leave " * " with a
-            # trailing space (the user-visible nuisance this guards against).
             out.append(f"{base_indent} * {ln.rstrip()}".rstrip())
     else:
         out.append(f"{base_indent} * (no documentation)")
+
     out.append(f"{base_indent} */")
+
     return out
 
 
 def _render_c_line_comment(text: str, base_indent: str) -> List[str]:
     """
-    Render a documentation comment as `//` line comments (the line-comment counterpart to `_render_c_block_comment`).
-
-    Used when a file's existing doc comments are `//`-style, so generated docs match the file's prevailing convention
-    instead of always introducing a `/* ... */` block.
+    Render documentation text as C `//` line comments at the given indentation.
 
     Parameters:
-    - `text`: The comment text (possibly multi-line).
-    - `base_indent`: The base indentation for the comment lines.
+    - `text`: The prose to render; may be empty.
+    - `base_indent`: Whitespace prefix applied to every line.
 
     Returns:
-    - A list of `//`-prefixed comment lines.
+    - One `//` line per prose line, or a single placeholder line when `text` is empty.
     """
 
+    # Empty text gets an explicit placeholder so the comment site never silently vanishes.
     lines = text.splitlines()
     if not lines:
         return [f"{base_indent}// (no documentation)"]
-    # rstrip the whole line so a blank doc line is "//" rather than "// " with a trailing space.
     return [f"{base_indent}// {ln.rstrip()}".rstrip() for ln in lines]
 
 
 def _detect_doc_style_c(tree, source_bytes: bytes) -> str:
     """
-    Detect whether a C file documents its code with `//` line comments or `/* ... */` block comments.
+    Detect whether a C file's comments favour line or block style.
 
-    Only the leading file-header banner (the first top-level comment) is ignored - a Doxygen `/** ... */` banner is
-    near-universal even in files whose function docs are all `//` - so every other comment is weighed (including the
-    first function's own doc and any `/* ... */` section dividers in the body). Following the rule "if both styles are
-    present, prefer the block form": the result is `"line"` only when the remaining comments use `//` and no
-    `/* ... */`, otherwise `"block"` (the default, including a file with no other comments).
+    The file's opening banner comment is excluded from the tally, and the result defaults to `block` unless every remaining comment uses the `//` form.
 
     Parameters:
-    - `tree`: The parsed Tree-sitter tree.
-    - `source_bytes`: The source bytes the tree was parsed from.
+    - `tree`: The parsed Tree-sitter syntax tree for the file.
+    - `source_bytes`: The raw source bytes the tree was parsed from.
 
     Returns:
-    - `"line"` or `"block"`.
+    - `"line"` if all non-banner comments are line comments, otherwise `"block"`.
     """
 
+    # Note a leading banner comment so it does not count towards the style tally.
     root = tree.root_node
     banner_start = (root.children[0].start_byte
                     if root.children and root.children[0].type == "comment" else None)
-
     has_line = has_block = False
     stack = [root]
+
     while stack:
         n = stack.pop()
+
+        # Tally line versus block comments across the tree, ignoring the file banner.
         if n.type == "comment" and n.start_byte != banner_start:
             if source_bytes[n.start_byte:n.start_byte + 2] == b"//":
                 has_line = True
             else:
                 has_block = True
+
         for i in range(n.named_child_count):
             stack.append(n.named_child(i))
 
+    # Default to block style unless the file uses line comments exclusively.
     return "line" if (has_line and not has_block) else "block"
 
 
 def _extract_first_c_comment_block(reply: str) -> str:
     """
-    Extract the first C block comment body from the LLM reply.
+    Extract the body of the first C block comment from an LLM reply.
 
-    Supports either explicit '/* ... */' fences or plain text (then we take all, dedented).
-    Returns the inner text only (without '/*' and '*/').
+    The `/* ... */` delimiters and any leading `*` gutter are stripped so the result is bare prose; if no block comment is present, the whole reply is returned trimmed.
 
     Parameters:
-    - `reply`: The LLM reply string to extract the comment from.
+    - `reply`: The raw model reply text.
 
     Returns:
-    - The extracted C block comment body as a string.
+    - The cleaned comment body, or the trimmed reply when no delimiters were found.
     """
 
+    # Find the first delimited comment; the model may bury it in surrounding chatter.
     txt = textwrap.dedent(reply)
-
-    # Prefer fenced block
     start = txt.find("/*")
     end = txt.find("*/", start + 2) if start != -1 else -1
+
+    # Keep only the comment's interior, discarding anything around it.
     if start != -1 and end != -1:
         inner = txt[start + 2:end]
-
-        # strip leading '*' common to C doc blocks
         lines = inner.splitlines()
         cleaned = []
+
         for ln in lines:
             stripped = ln.lstrip()
+
+            # Strip a decorative '*' gutter and the single space that usually follows it.
             if stripped.startswith("*"):
                 stripped = stripped[1:]
                 if stripped.startswith(" "):
                     stripped = stripped[1:]
+
             cleaned.append(stripped.rstrip())
+
+        # Return bare prose, ready to be re-wrapped in whichever style the file uses.
         return "\n".join(cleaned).strip()
 
-    # Fallback: use all text, dedented
+    # No delimiters found: treat the whole reply as the comment body.
     return txt.strip()
 
 
@@ -1378,78 +1489,59 @@ def generate_comments_c(
     verifier=None,
 ) -> Dict[Tuple[int, int], str]:
     """
-    Generate doc comments for each documentable C record (function definitions and, when redirecting, prototypes).
+    Generate a documentation comment for every C routine in a file.
 
-    This function generates documentation comments for a list of C function definitions and (under `--doc-site`)
-    header prototypes. It assembles a snippet of code for each, prompts the language model to generate a comment,
-    extracts the first C block comment from the response, and stores the result in a dictionary keyed by the record's
-    header span. A record that already has a doc comment above its header (which sits outside the snippet) has that
-    text added to the turn as an ingest-and-update seed, so the model refreshes the existing contract instead of
-    re-deriving it blind.
+    Each routine gets one bounded LLM turn (the prompt is popped straight after the reply), optionally seeded with its existing comment and callee contract notes, then passes through the verifier. Failures never drop a routine: an unverified comment is written with a warning, and a placeholder records total generation failure.
 
     Parameters:
-    - `llm`: The language model instance used for generating comments.
-    - `cfg`: The generation configuration.
-    - `messages`: A list of messages exchanged with the language model.
-    - `defs`: A list of function definition information.
-    - `source_blob`: The original source code as a string.
-    - `source_lines`: The source code broken down into chunks.
-    - `doc_order`: Optional call-graph documentation order (qualnames); when given, functions are documented in this
-      order (callees first) instead of source order, falling back to source order for any not listed.
-    - `callee_context`: Optional callback `qualname -> notes` appended to each function's generation turn.
-    - `on_doc`: Optional callback `(qualname, comment)` invoked after each generated comment (updates the contract).
-    - `doc_plan`: Optional per-file `--doc-site` plan: its `skip` names are left undocumented (redirected to a header),
-      and a prototype's prose is generated from the implementation body via `impl_snippet` when available.
-    - `decls`: Optional prototype records to document (the header documentation site); each generated doc is recorded
-      on the plan so the paired implementation's block pass can reuse it.
-    - `verifier`: Optional `scale_verify.Verifier`. When supplied, each generated comment faces the deterministic
-      backtick-grounding gate and the clean-context grounding challenge (one corrective regeneration each); a comment
-      that fails twice is written under a prominent warning.
+    - `llm`: The local chat model used for generation.
+    - `cfg`: Generation settings for each turn.
+    - `messages`: The primed conversation; turns are appended and popped per routine.
+    - `defs`: Function definitions discovered in the file.
+    - `source_blob`: The full source text of the file.
+    - `source_lines`: The pristine source lines used to assemble snippets.
+    - `doc_order`: Optional leaf-first qualname ordering for generation.
+    - `callee_context`: Optional callback returning contract notes for a routine's callees.
+    - `on_doc`: Optional callback invoked with each qualname and doc as it is produced.
+    - `doc_plan`: Optional header/impl doc-site plan; supplies implementation snippets for prototypes and the routines to skip.
+    - `decls`: Header prototypes to document alongside the definitions.
+    - `verifier`: Optional verifier applying the grounding gate and challenge turns.
 
     Returns:
-    - A dictionary mapping each record's header span to its corresponding documentation comment.
+    - A mapping of `(header_start, header_end)` line spans to generated comment bodies.
     """
 
+    # Build the worklist: drop routines the doc-site plan owns, fold in header prototypes, honour any leaf-first ordering.
     doc_map: Dict[Tuple[int, int], str] = {}
-
     skip = doc_plan.skip if doc_plan is not None else set()
     records: List[DefInfoC] = [d for d in defs if d.qualname not in skip]
     if decls:
         records = records + list(decls)
-
-    # C has no nesting; default order is source order. A call-graph `doc_order` documents callees before callers.
     ordered = apply_doc_order(records, lambda d: d.qualname, doc_order, lambda d: d.start) if doc_order else records
+
+    # Per routine: pick the snippet (the implementation body for prototypes), trim it to the context window, and frame the request.
     for info in ordered:
         is_decl = info.kind == "declaration"
-
-        # A redirected prototype's prose is generated from the implementation body (the model needs the body); when
-        # no implementation is available in the run, the prototype text itself is used.
         snippet = None
         if is_decl and doc_plan is not None:
             snippet = doc_plan.impl_snippet(info.qualname)
         if not snippet:
             snippet = assemble_snippet_for_c(source_lines, info)
-
-        # Elide the body if this function is too large for the context window (the patch is unaffected).
         header_lines = max(1, info.header_end - info.header_start + 1)
         snippet, omitted = fit_snippet(llm, cfg, messages, snippet, header_lines, MARKER_C)
         if omitted:
             echo(f"[C] Elided {omitted} body line(s) from '{info.qualname}' to fit the context window")
-
         echo("\n[C] Snippet...\n")
         echo(snippet)
-
         prompt = (
             "Write exactly the documentation comment for this C function. "
             "Return a C block comment suitable to be placed immediately above the function "
             "declaration (no code), describing purpose, parameters and return value.\n\n"
             f"{snippet}\n"
         )
-
-        # Ingest-and-update: a C doc comment sits ABOVE the header, outside the snippet, so surface the routine's own
-        # existing doc as a seed - the model keeps what is still accurate and updates what is stale, rather than
-        # re-deriving the contract blind (the routine-level analogue of the --file-doc description seed).
         existing = _doc_above_header(source_lines, info.header_start)
+
+        # Seed the prompt with the existing comment so accurate institutional detail survives the rewrite.
         if existing:
             prompt += (
                 "\nThe function is already documented as follows. Ingest and update this existing comment - keep "
@@ -1457,25 +1549,39 @@ def generate_comments_c(
                 f"than writing from scratch:\n\n{existing}\n"
             )
 
-        # Inject the one-line contracts of the functions this one calls (call-graph context).
+        # Add callee contract notes when the call graph has any.
         if callee_context is not None:
             notes = callee_context(info.qualname)
             if notes:
                 prompt += "\n" + notes + "\n"
 
+        # One bounded turn: the prompt is popped straight after the reply so context never accumulates.
         messages.append({"role": "user", "content": prompt})
         reply = llm.generate(messages, cfg=cfg)
         echo(f"\n[C] LLM output:\n\n{reply}")
         messages.pop()
-
         body = _extract_first_c_comment_block(reply)
+
+        # Box the reply in a one-element list so the retry closure can rebind it.
         if body and verifier is not None:
-            # Verification (the quality floor): the grounding gate + grounding challenge, each allowing one
-            # corrective regeneration in this function's own context (snippet -> previous answer -> feedback).
             last_reply = [reply]
 
+            # Retry closure: replays the exchange plus the verifier's feedback, then unwinds all three turns.
             def regenerate(feedback: str, _prompt: str = prompt) -> str:
-                """Regenerate the comment with reviewer feedback; '' when the retry is unusable."""
+                """
+                Regenerate the documentation comment after verifier feedback.
+
+                Replays the original prompt and reply with the feedback appended, then pops all three turns so the shared context stays bounded. A usable retry becomes the new baseline for any further round.
+
+                Parameters:
+                - `feedback`: The verifier's complaint to feed back to the model.
+                - `_prompt`: The original request, bound at definition time.
+
+                Returns:
+                - The extracted comment body, or an empty string if the retry produced none.
+                """
+
+                # Replay the original exchange plus the feedback, then pop all three turns to keep the context bounded.
                 messages.append({"role": "user", "content": _prompt})
                 messages.append({"role": "assistant", "content": last_reply[0]})
                 messages.append({"role": "user", "content": feedback})
@@ -1486,20 +1592,23 @@ def generate_comments_c(
                 if not doc:
                     return ""
                 last_reply[0] = retry
+
                 return doc
 
+            # Grounding gate plus challenge turns; may substitute a regenerated comment.
             body, ok = verifier.verify_def(snippet, body, regenerate, label=info.qualname)
+
+            # A twice-failed comment is still written - flagged for human review rather than dropped.
             if not ok:
-                # Failure routing: write the doc under a prominent warning - a visible contract beats a silent gap.
                 error(f"[verify] '{info.qualname}': comment failed verification twice; writing it anyway - "
                       f"review this comment")
+
+        # Always record something for the span - a placeholder on total failure keeps the run complete - then feed the doc to the run model and doc-site plan.
         if not body:
             body = f"function `{info.qualname}` - documentation generation failed."
         doc_map[(info.header_start, info.header_end)] = body
-        # Publish this function's freshly-generated contract for later callers.
         if on_doc is not None:
             on_doc(info.qualname, body)
-        # Record a header prototype's full doc so the paired implementation's block pass can reuse it as context.
         if is_decl and doc_plan is not None:
             doc_plan.record_header_doc(info.qualname, body)
 
@@ -1511,42 +1620,36 @@ def generate_comments_c(
 def patch_comments_textually_c(source_lines: Chunk, defs: List[DefInfoC], doc_map: Dict[Tuple[int, int], str],
                                style: str = "block") -> Chunk:
     """
-    Insert or replace documentation blocks for each C function.
+    Splice generated doc comments into the source lines above each C routine.
 
-    This function updates the source code by inserting or replacing documentation blocks above each C function definition.
-    It checks if a '/* ... */' or contiguous '//' block already exists immediately above the header, and replaces it if so.
-    Otherwise, it inserts a new block immediately above the header.
-
-    The `doc_map` dictionary is used to store the documentation comments for each function definition, with keys being
-    tuples of (header_start, header_end) to distinguish multiple definitions of the same name.
+    Routines are patched bottom-up so insertions never invalidate the line numbers of spans still to be processed; an existing comment block above a header is replaced in place, otherwise the new block is inserted directly above it. Only comment lines are added or replaced - code lines are never touched.
 
     Parameters:
-    - `source_lines`: The original source code as a list of lines.
-    - `defs`: A list of `DefInfoC` objects containing information about each C function definition.
-    - `doc_map`: A dictionary mapping function definition keys to their corresponding documentation comments.
-    - `style`: `"block"` to render each doc as a `/* ... */` block (default) or `"line"` to render it as `//` line
-      comments (chosen to match the file's prevailing doc-comment convention; see `_detect_doc_style_c`).
+    - `source_lines`: The pristine source lines to patch.
+    - `defs`: The routines (definitions and prototypes) whose headers anchor the comments.
+    - `doc_map`: Comment bodies keyed by `(header_start, header_end)` span.
+    - `style`: `"line"` or `"block"`; selects the rendering that matches the file.
 
     Returns:
-    - The updated source code with inserted or replaced documentation blocks.
+    - A new list of lines with the comments spliced in.
     """
 
+    # Match the file's prevailing comment style; patch a copy, never the input.
     render = _render_c_line_comment if style == "line" else _render_c_block_comment
     out_lines = source_lines[:]
 
-    # Edit bottom-up to keep line numbers stable
+    # Patch bottom-up so insertions never shift the line numbers still to be processed.
     for info in sorted(defs, key=lambda d: d.start, reverse=True):
         key = (info.header_start, info.header_end)
         if key not in doc_map:
             continue
-
         doc = doc_map[key].rstrip()
-
         header_line_text = source_lines[info.header_start - 1]
         indent = header_line_text[: len(header_line_text) - len(header_line_text.lstrip())]
         new_block_lines = render(doc, indent)
-
         existing = _scan_existing_comment_block_above(out_lines, info.header_start)
+
+        # Replace an existing doc block in place; otherwise insert directly above the header.
         if existing:
             s_1b, e_1b = existing
             out_lines[s_1b - 1: e_1b] = new_block_lines
@@ -1572,57 +1675,50 @@ def generate_language_comments(
     verifier=None,
 ) -> Chunk:
     """
-    Generate language comments for a given C source code.
+    Run the C definition pass: the shared per-language entry point.
 
-    This function performs the following steps:
-
-    - Parses the C source code using Tree-sitter C.
-    - Collects function definitions (and, under `--doc-site`, header prototypes to document).
-    - Asks the LLM to generate block comment text for each documentable record.
-    - Patches the original source code by inserting or replacing blocks above function headers/prototypes.
-    - Returns the updated source lines.
+    Parses the file with Tree-sitter, gathers definitions (plus any header prototypes redirected here by the doc-site plan), generates one doc comment per routine, and splices them in by patching - the code itself is never re-emitted.
 
     Parameters:
-    - `llm`: The LocalChatModel instance used for generating comments.
-    - `cfg`: The GenerationConfig instance containing configuration settings.
-    - `messages`: The Messages object containing any relevant messages.
-    - `source_blob`: The raw C source code as a string.
-    - `source_lines`: The original source code split into lines.
-    - `doc_order`/`callee_context`/`on_doc`: Optional call-graph hooks (see `generate_comments_c`); absent, behaviour
-      is unchanged.
-    - `doc_plan`: Optional per-file `--doc-site` plan: redirected definitions are left undocumented and any header
-      prototypes it names are documented (prose from the implementation body) above their declarations.
+    - `llm`: The local chat model.
+    - `cfg`: Generation settings.
+    - `messages`: The primed conversation shared across the run.
+    - `source_blob`: The full source text to parse.
+    - `source_lines`: The pristine source lines used for snippets and patching.
+    - `doc_order`: Optional leaf-first ordering of qualnames.
+    - `callee_context`: Optional callback supplying callee contract notes.
+    - `on_doc`: Optional callback invoked per generated doc.
+    - `doc_plan`: Optional C header/impl doc-site plan.
+    - `verifier`: Optional verifier enforcing the local quality floor.
 
     Returns:
-    - The updated source lines with generated comments.
+    - The patched source lines with the new comments in place.
     """
 
+    # Parse once with Tree-sitter and harvest the function definitions.
     echo("Parsing C source with Tree-sitter...")
     tree, source_bytes = _parse_c(source_blob)
     defs = iter_defs_with_info_c(tree, source_bytes)
     echo(f"Found {len(defs)} C function definition(s)")
-
-    # Under --doc-site, also document the file's prototypes the plan has chosen as documentation sites.
     decls: List[DefInfoC] = []
+
+    # The doc-site plan redirects selected prototypes here so their docs land at the header.
     if doc_plan is not None and doc_plan.header_names:
         decls = [d for d in iter_decls_with_info_c(tree, source_bytes) if d.qualname in doc_plan.header_names]
         echo(f"Documenting {len(decls)} prototype(s) at the header (doc-site redirect)")
 
-    # Match the file's prevailing doc-comment convention (a header whose function docs are `//` should not be given
-    # `/* ... */` blocks); the leading Doxygen banner is ignored, and a mix prefers the block form.
+    # Match the file's comment style, prime the model with #include context, then run the definition pass.
     style = _detect_doc_style_c(tree, source_bytes)
     echo(f"Doc-comment style for this file: {style}")
-
-    # Provide a list of #includes to the LLM (if there are any)
     echo("Identifying #includes...")
     describe_includes_c(llm, cfg, messages, tree, source_bytes)
-
     echo("Generating C comments...\n")
     doc_map = generate_comments_c(llm, cfg, messages, defs, source_blob, source_lines,
                                   doc_order=doc_order, callee_context=callee_context, on_doc=on_doc,
                                   doc_plan=doc_plan, decls=decls, verifier=verifier)
-
     echo("Applying C patches...\n")
+
+    # Comments are spliced into the pristine lines by patching; code is never re-emitted.
     return patch_comments_textually_c(source_lines, defs + decls, doc_map, style=style)
 
 
@@ -1631,31 +1727,29 @@ def generate_language_comments(
 
 def collect_def_requests_c(source_blob: str, source_lines: Chunk, escalation, doc_plan: Optional[CFileDocPlan] = None) -> int:
     """
-    Record every documentable C record as a deferred doc-comment request (the online emit phase) - model-free.
+    Collect every C routine in a file into the online run manifest.
 
-    Mirrors what `generate_comments_c` documents: the file's function definitions minus any the `--doc-site` plan
-    redirects to a header, plus the prototypes the plan names as documentation sites. A prototype's snippet is the
-    paired implementation body (the prose source), falling back to the prototype text when no implementation is in
-    the run; run-level slimming later collapses the duplicate impl text to a `snippet_ref`.
+    Model-free counterpart to the offline definition pass: the same skip set and doc-site redirects apply, and each routine is recorded once with its snippet and a span hash used to re-bind the answer at apply time.
 
     Parameters:
-    - `source_blob`: The complete source text (parsed with Tree-sitter C).
-    - `source_lines`: The same source split into individual lines.
-    - `escalation`: The `scale_escalate.Escalation` collector for this target file.
-    - `doc_plan`: Optional per-file `--doc-site` plan (skips redirected definitions, names header prototypes).
+    - `source_blob`: The full source text to parse.
+    - `source_lines`: The pristine source lines used to assemble snippets.
+    - `escalation`: The manifest collector receiving one record per routine.
+    - `doc_plan`: Optional doc-site plan supplying skips, header prototypes, and implementation snippets.
 
     Returns:
-    - The number of records recorded.
+    - The number of routines recorded, used by the completeness counter.
     """
 
+    # Mirror the offline worklist - same skip set and header redirects - so both modes cover identical routines.
     tree, source_bytes = _parse_c(source_blob)
     defs = iter_defs_with_info_c(tree, source_bytes)
-
     skip = doc_plan.skip if doc_plan is not None else set()
     records: List[DefInfoC] = [d for d in defs if d.qualname not in skip]
     if doc_plan is not None and doc_plan.header_names:
         records += [d for d in iter_decls_with_info_c(tree, source_bytes) if d.qualname in doc_plan.header_names]
 
+    # Each routine crosses the wire once: its snippet plus a span hash to re-bind the answer at apply time.
     for info in records:
         snippet = None
         if info.kind == "declaration" and doc_plan is not None:
@@ -1664,6 +1758,8 @@ def collect_def_requests_c(source_blob: str, source_lines: Chunk, escalation, do
             snippet = assemble_snippet_for_c(source_lines, info)
         span_hash = routine_text_hash(_get_text_for_lines(source_lines, info.header_start, info.end))
         escalation.record_def(qualname=info.qualname, kind=info.kind, sig_hash=span_hash, snippet=snippet)
+
+    # The caller's completeness counter relies on this count.
     return len(records)
 
 
@@ -1672,17 +1768,18 @@ def collect_def_requests_c(source_blob: str, source_lines: Chunk, escalation, do
 
 def _clean_c_comment_answer(text: str) -> str:
     """
-    Strip any code fence or comment delimiters a stronger model wrapped a C answer in, leaving bare prose.
+    Normalise a manifest answer for a C routine to bare comment prose.
 
-    The patcher renders the comment in the file's own doc style, so the answer must be the comment body alone.
+    Strips a wrapping Markdown code fence and, if the answer arrived as a `/* ... */` or `//` comment, removes the delimiters so only the body remains.
 
     Parameters:
-    - `text`: The raw answer from the manifest.
+    - `text`: The raw answer text from the manifest.
 
     Returns:
-    - The cleaned comment body (may be empty).
+    - The cleaned comment body, possibly empty.
     """
 
+    # Tolerate answers wrapped in code fences or comment delimiters; reduce them all to bare prose.
     body = (text or "").strip()
     fence = re.match(r"^```[^\n]*\n(.*)\n```$", body, flags=re.DOTALL)
     if fence:
@@ -1694,31 +1791,26 @@ def _clean_c_comment_answer(text: str) -> str:
 
 def apply_manifest_c(source_lines: Chunk, manifest: dict) -> Chunk:
     """
-    Patch a stronger model's answers from a run manifest into C source (the online apply phase).
+    Apply a filled run manifest's answers to C source, patching comments only.
 
-    The model-free apply phase for C. Each request is re-bound to its record by `(qualname, span hash)` - the hash of
-    the routine's verbatim text (`routine_text_hash`), which survives the line shifts between emit and apply because a
-    deferred routine is left untouched. Definition/prototype docs are patched first (rendered in the file's prevailing
-    doc style), then the text is re-parsed and the block answers placed by boundary index, exactly as the Python apply
-    does. Everything goes through the same insertion-only patchers and code-preservation guard as the local passes.
+    The def phase re-binds each answered request to its routine by qualified name plus a hash of the routine's current text, cleans the answer and splices the header docs textually. The block phase then inserts per-chunk comments at the recorded boundary lines, accepting a routine's edits only when the preservation guard confirms the code is otherwise byte-for-byte intact. Unanswered or unmatched requests leave their routines untouched.
 
     Parameters:
-    - `source_lines`: The emit-phase output source split into individual lines.
-    - `manifest`: The parsed manifest dictionary, with this file's requests' `answer` slots filled in.
+    - `source_lines`: The file's source as a list of lines.
+    - `manifest`: The filled run-manifest dictionary for this file.
 
     Returns:
-    - The fully annotated source split into individual lines.
+    - The patched list of source lines; only comments differ from the input.
     """
 
+    # Split the manifest into def and block work; both phases patch the same evolving line list.
     from scale_blocks import SLASH_LINE_STYLE, _apply_edits, code_preserved, _parse_comment_reply
-
     requests = manifest.get("requests", [])
     def_reqs = [r for r in requests if r.get("def") is not None]
     block_reqs = [r for r in requests if r.get("blocks") is not None]
-
     out_lines = source_lines
 
-    # ---- 1. Definition/prototype answers (a doc block above each header, in the file's own style) ----
+    # Def phase: re-parse the current text and key the requests by (qualname, span hash) so answers re-bind by content, not stale line numbers.
     if def_reqs:
         tree, sb = _parse_c("\n".join(out_lines))
         records = iter_defs_with_info_c(tree, sb) + iter_decls_with_info_c(tree, sb)
@@ -1727,39 +1819,56 @@ def apply_manifest_c(source_lines: Chunk, manifest: dict) -> Chunk:
         doc_map: Dict[Tuple[int, int], str] = {}
         used: set = set()
         matched: List[DefInfoC] = []
+
+        # Re-hash each parsed routine to find its request; `used` stops one answer landing twice.
         for info in records:
             key = (info.qualname, routine_text_hash(_get_text_for_lines(out_lines, info.header_start, info.end)))
             req = wanted.get(key)
             if req is None or key in used:
                 continue
             answer = req["def"].get("answer")
+
+            # An unfilled answer leaves the routine untouched rather than inventing a doc.
             if not answer or not str(answer).strip():
                 echo(f"[apply] Def request '{req['id']}' has no answer; leaving the record untouched")
                 continue
+
+            # Strip any code fences or comment delimiters the answering model may have added.
             doc = _clean_c_comment_answer(str(answer))
+
+            # Bind the cleaned doc to its header span ready for the textual patcher.
             if doc:
                 doc_map[(info.header_start, info.header_end)] = doc
                 used.add(key)
                 matched.append(info)
+
+        # All matched docs land in one textual patch over the pristine lines.
         out_lines = patch_comments_textually_c(out_lines, matched, doc_map, style=style)
 
-    # ---- 2. Block answers (re-parse so spans/boundaries reflect the inserted doc blocks) ----
+    # Block phase: re-locate the block targets in the now-patched text and gather edits file-wide.
     if block_reqs:
         targets = iter_block_targets_c("\n".join(out_lines), out_lines)
         by_key = {(t.qualname, t.sig): t for t in targets}
-
         all_edits: List[Tuple[int, Optional[str], str]] = []
+
+        # Re-bind each block request to its routine by qualname and signature hash.
         for req in block_reqs:
             target = by_key.get((req["qualname"], req["sig_hash"]))
             chunks = req["blocks"].get("chunks", [])
+
+            # A vanished or changed routine is skipped with a notice, never guessed at.
             if target is None:
                 echo(f"[apply] No match for block request '{req['id']}'; skipping")
                 continue
+
+            # A wholly unanswered request leaves its routine untouched.
             if all(c.get("answer") is None for c in chunks):
                 echo(f"[apply] Block request '{req['id']}' has no answers; leaving routine untouched")
                 continue
 
             edits: List[Tuple[int, Optional[str], str]] = []
+
+            # Turn each answered chunk into an insertion at its recorded boundary line, with matching indent; stale indices are dropped.
             for chunk in chunks:
                 bidx = chunk["bidx"]
                 if not (0 <= bidx < len(target.boundary_lines)):
@@ -1768,13 +1877,16 @@ def apply_manifest_c(source_lines: Chunk, manifest: dict) -> Chunk:
                 comment = _parse_comment_reply(chunk.get("answer") or "", SLASH_LINE_STYLE)
                 edits.append((boundary, comment, target.indent_of.get(boundary, "")))
 
-            # Per-routine guard: keep this routine's edits only if simulating them preserves its code.
+            # Trial-apply this routine's edits alone so a bad batch can be rejected without poisoning the rest.
             trial = _apply_edits(out_lines, edits, SLASH_LINE_STYLE)
+
+            # The preservation guard is the gate: edits that would alter anything but comments are discarded wholesale.
             if code_preserved(out_lines, trial, SLASH_LINE_STYLE):
                 all_edits.extend(edits)
             else:
                 echo(f"[apply] Skipped '{req['qualname']}': block edit would alter code; keeping original")
 
+        # One final pass lands every accepted edit at once.
         out_lines = _apply_edits(out_lines, all_edits, SLASH_LINE_STYLE)
 
     return out_lines

@@ -11,17 +11,12 @@ Unless required by applicable law or agreed to in writing, software distributed 
 "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
 language governing permissions and limitations under the License.
 
-This module provides a basic logging and verbosity control system for the application. It defines three main functions:
-`echo`, `error`, and `set_verbosity`. The `echo` function writes messages to stdout if the verbosity level is enabled,
-while the `error` function writes error messages to stderr. The `set_verbosity` function allows the user to toggle the
-verbosity level globally.
+SCALE's minimal logging layer, shared by every module in the tool. `echo` prints progress messages only when verbose
+mode is enabled, forcing a flush so output keeps pace with long model runs, while `error` writes to stderr regardless
+of verbosity.
 
-The module uses a global variable `VERBOSE` to track the current verbosity level. This variable is used by the `echo`
-function to determine whether to print messages or not. The `error` function, on the other hand, always writes error
-messages to stderr, regardless of the verbosity level.
-
-The `set_verbosity` function updates the global `VERBOSE` variable directly, which is a simple but effective way to
-control the verbosity level throughout the application.
+`set_verbosity` flips the module-level switch for the whole process, so the CLI's verbose flag controls progress
+output everywhere without logger objects to thread through.
 """
 
 from __future__ import annotations
@@ -34,18 +29,14 @@ VERBOSE = False
 
 def echo(*args, **kwargs):
     """
-    Write messages to stdout if the verbosity level is enabled.
+    Print a progress message when verbose mode is enabled.
 
     Parameters:
-    - `*args`: The message(s) to be printed.
-    - `**kwargs`: Additional keyword arguments to pass to the `print` function.
-
-    Notes:
-    The verbosity level is controlled by the global variable `VERBOSE`. If `VERBOSE` is `True`, the
-    message will be printed to stdout. The `flush` argument is always set to `True` to ensure timely
-    output.
+    - `args`: Positional values forwarded to `print`.
+    - `kwargs`: Keyword options forwarded to `print`; `flush` is always forced on.
     """
 
+    # Force a flush so progress lines appear promptly even when output is piped.
     if VERBOSE:
         kwargs["flush"] = True
         print(*args, **kwargs)
@@ -53,22 +44,13 @@ def echo(*args, **kwargs):
 
 def error(*args, **kwargs):
     """
-    Writes an error message to stderr.
+    Write an error message to stderr, regardless of verbosity.
 
     Parameters:
-    - `*args`: Variable number of arguments to be joined into a single error message string.
-    - `**kwargs`: Not used.
-
-    Returns:
-    - None
-
-    Notes:
-    This function always writes to stderr, regardless of the current verbosity level. The error message
-    is constructed by joining the provided arguments with spaces in between. The resulting message is
-    then written to stderr followed by a newline character. The underlying file descriptor is flushed
-    after writing to ensure the message is immediately visible.
+    - `args`: Values joined with spaces to form the message.
     """
 
+    # Bypasses the verbosity gate and flushes immediately so errors are never lost.
     msg = " ".join(str(a) for a in args)
     sys.stderr.write(msg + "\n")
     sys.stderr.flush()
@@ -76,15 +58,11 @@ def error(*args, **kwargs):
 
 def set_verbosity(state: bool):
     """
-    Enable or disable program verbosity.
+    Enable or disable verbose progress output.
 
     Parameters:
-    - `state`: Set verbosity state to enabled (`True`) or disabled (`False`).
-
-    Notes:
-    This updates the global `VERBOSE` variable directly, which controls the verbosity level throughout the application.
+    - `state`: Set verbose output to enabled (`True`) or disabled (`False`).
     """
 
     global VERBOSE
-
     VERBOSE = state

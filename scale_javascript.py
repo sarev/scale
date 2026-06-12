@@ -11,29 +11,20 @@ Unless required by applicable law or agreed to in writing, software distributed 
 "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
 language governing permissions and limitations under the License.
 
-This Python program is a tool for generating JSDoc comments for JavaScript code using a large language model (LLM)
-as a content generator.
+The JavaScript language worker: it parses source with tree-sitter (shimmed over both the 0.21 and 0.22 binding APIs),
+discovers every function, class and method - including arrow and function expressions bound to variables and methods
+inside object literals - and supplies the per-language pieces the shared pipeline needs: the definition pass, the
+block-pass segmenter, the symbol scanner, and the file-doc target.
 
-It leverages the Tree-sitter library to parse and analyse the JavaScript source code, identifying definition-like constructs
-such as functions, classes, methods, and variables. The LLM is then used to generate documentation comments for these
-definitions in a deepest-first order, ensuring that parents see child stubs. Finally, the program applies textual patches to
-insert or replace existing comment blocks above headers, resulting in an updated source code with generated JSDoc comments.
+The definition pass works deepest-first: each routine is shown to the model with its direct children collapsed to
+their already-generated JSDoc blocks, so a parent's prompt is informed by child documentation without re-sending child
+code. Imports (ES and CommonJS alike) are described into the chat context first, existing comments are ingested and
+updated rather than discarded, and `patch_comments_textually_js` splices the results in bottom-up, matching the file's
+`//` or JSDoc style.
 
-# Highlights of Internal Workings
-
-1. **Tree-sitter Setup**: The program initialises Tree-sitter by loading the JavaScript language and parser using the
-   `tree_sitter_javascript` library.
-2. **DefInfo Collection**: It defines a data class `DefInfoJS` to represent information about each definition-like construct,
-   including its name, node, kind, start and end lines, header start and end lines, depth, parent ID, and children IDs. The
-   program then uses Tree-sitter to parse the JavaScript source code and collect DefInfo instances for each definition.
-3. **LLM-driven JSDoc Generation**: The program generates JSDoc comments for each definition using the LLM. It prompts the
-   LLM with a snippet of the code, asking it to produce exactly the documentation comment for that specific JavaScript
-   program chunk. The LLM output is then processed to extract the first comment block.
-4. **Textual Patching**: The program applies textual patches to insert or replace existing comment blocks above headers.
-   It scans for existing comment blocks immediately above each header and replaces them with the generated JSDoc comments
-   if found. Otherwise, it inserts a new JSDoc block above the header.
-5. **Orchestrator**: The `generate_language_comments` function orchestrates the entire process, from parsing and DefInfo
-   collection to LLM-driven JSDoc generation and textual patching.
+For the online mode, `collect_def_requests_js` records each routine in the run manifest keyed by a comment-stripped
+span hash (`_js_span_hash`), so `apply_manifest_js` can re-bind answers to code unchanged since emit; every edit must
+pass the preservation guard before it is kept.
 """
 
 from __future__ import annotations
@@ -66,17 +57,18 @@ ParserT = object
 
 def _load_js_language_and_parser() -> Tuple[Language, Parser]:
     """
-    Load the JavaScript language and parser.
+    Load the tree-sitter JavaScript grammar and a parser bound to it, tolerating both old and new binding APIs.
 
-    This function initialises the JavaScript language and parser, handling different API versions.
+    The `tree-sitter` package changed both the `Language` and `Parser` construction APIs between 0.21 and 0.22; this shim tries the new form first and falls back to the old one, so either installed version works.
 
     Returns:
-        A tuple containing the loaded `Language` instance and the initialised `Parser` instance.
+    - A `(Language, Parser)` tuple ready to parse JavaScript source.
     """
 
+    # The grammar binding hands back either a ready Language or a raw pointer, depending on the installed tree-sitter version.
     ptr_or_lang: Any = js_language()
 
-    # Wrap capsule -> Language, or accept Language directly.
+    # Wrap a raw pointer with whichever Language constructor this version accepts: the one-arg form (>= 0.22) first, then the old 0.21 two-arg form.
     if isinstance(ptr_or_lang, Language):
         lang = ptr_or_lang
     else:
@@ -85,12 +77,11 @@ def _load_js_language_and_parser() -> Tuple[Language, Parser]:
         except TypeError:
             lang = Language(ptr_or_lang, "JavaScript")   # old 0.21 API (second arg is a label)
 
-    # Create a parser using whichever API this wheel exposes
+    # Parser binding changed across versions too: prefer the classic set_language call, falling back to passing the language at construction.
     try:
         p = Parser()
         p.set_language(lang)              # classic API
     except AttributeError:
-        # Fallback: some builds use Parser(Language) ctor
         p = Parser(lang)
 
     return lang, p
@@ -101,21 +92,21 @@ JS_LANGUAGE, JS_PARSER = _load_js_language_and_parser()
 
 def _parse_js(source_blob: str) -> Tuple[Any, bytes]:
     """
-    Normalise line endings and parse JavaScript source once.
+    Parse JavaScript source with tree-sitter and return the tree alongside the exact bytes that were parsed.
 
-    Tree-sitter counts rows by '\\n' only, whereas the source may use '\\r' or '\\r\\n'. Line endings are normalised to
-    '\\n' so that node rows line up with the caller's line-split source. The same normalised bytes are returned and used
-    for any node-text extraction, keeping byte offsets self-consistent with the parse tree.
+    Line endings are normalised to LF before encoding, so node rows and byte offsets always index into the returned bytes rather than the caller's original text.
 
     Parameters:
-    - `source_blob`: The JavaScript source code as a string.
+    - `source_blob`: The JavaScript source text.
 
     Returns:
-    - A tuple of the parsed tree and the normalised source bytes it was parsed from.
+    - A `(tree, source_bytes)` tuple; node offsets refer to `source_bytes`.
     """
 
+    # Fold CRLF/CR to plain LF before encoding so node coordinates map cleanly onto line numbers.
     norm = source_blob.replace("\r\n", "\n").replace("\r", "\n")
     source_bytes = norm.encode("utf-8", errors="replace")
+
     return JS_PARSER.parse(source_bytes), source_bytes
 
 
@@ -124,25 +115,14 @@ def _parse_js(source_blob: str) -> Tuple[Any, bytes]:
 
 @dataclass(frozen=True)
 class DefInfoJS:
+
     """
-    Represents information about a JavaScript definition-like construct.
+    One JavaScript definition (function, method or class) discovered in the parse tree.
 
-    Attributes:
-        qualname (str): The qualified name of the definition, e.g. "foo", "ClassName.method", "obj.method".
-        node (object): The Tree-sitter node representing the definition.
-        kind (str): The type of definition, e.g. "function", "class", "method", "var_func", "var_arrow", "obj_method".
-        start (int): The 1-based line number where the definition starts.
-        end (int): The 1-based line number where the definition ends (inclusive).
-        header_start (int): The 1-based line number where the definition's header starts (same as `start`).
-        header_end (int): The 1-based line number where the definition's header ends (line before body block begins).
-        depth (int): The nesting depth of the definition, with 0 indicating a module-level definition.
-        parent_id (Optional[int]): The ID of the parent node, or `None` if this is a top-level definition.
-        children_ids (Tuple[int, ...]): A tuple of IDs of child nodes.
-
-    Note:
-        This class abstracts over various types of JavaScript definitions, including functions, classes, methods, and variables.
+    Line numbers are 1-based. `parent_id` and `children_ids` link nested definitions by index into the flat discovery list, so nesting can be walked without revisiting tree-sitter nodes.
     """
 
+    # `start`/`end` cover the whole definition while the header pair spans just the signature line(s).
     qualname: str
     node: object
     kind: str
@@ -160,13 +140,7 @@ class DefInfoJS:
 
 def _to_1based(row0: int) -> int:
     """
-    Convert a 0-based row index to a 1-based index.
-
-    Parameters:
-    - `row0`: The 0-based row index to convert.
-
-    Returns:
-    - The corresponding 1-based row index.
+    Convert a 0-based tree-sitter row index to a 1-based source line number.
     """
 
     return row0 + 1
@@ -174,10 +148,7 @@ def _to_1based(row0: int) -> int:
 
 def _line_span_from_node(n) -> Tuple[int, int]:
     """
-    Convert a Tree-sitter node to its corresponding line span.
-
-    Returns:
-    - A tuple of two integers representing the 1-based line numbers for the start and end points of the node.
+    Return a tree-sitter node's extent as a 1-based inclusive (start, end) line span.
     """
 
     return _to_1based(_row_of(n.start_point)), _to_1based(_row_of(n.end_point))
@@ -185,14 +156,7 @@ def _line_span_from_node(n) -> Tuple[int, int]:
 
 def _node_field(n, field: str):
     """
-    Get the child node of a Tree-sitter node by its field name.
-
-    Parameters:
-    - `n`: The parent Tree-sitter node.
-    - `field`: The name of the field to retrieve.
-
-    Returns:
-    - The child node with the specified field name, or `None` if not found.
+    Fetch a tree-sitter node's child by field name; `None` when the field is absent.
     """
 
     return n.child_by_field_name(field)
@@ -200,17 +164,7 @@ def _node_field(n, field: str):
 
 def _node_text(source_bytes: bytes, n) -> str:
     """
-    Extract the text content of a Tree-sitter node from the source code bytes.
-
-    This function returns a string representation of the text within the specified node, replacing any invalid UTF-8
-    sequences with a replacement character.
-
-    Parameters:
-    - `source_bytes`: The raw bytes of the source code.
-    - `n`: The Tree-sitter node to extract the text from.
-
-    Returns:
-    - A string containing the text content of the node, or an error message if decoding fails.
+    Decode the slice of source bytes spanned by a tree-sitter node, replacing any undecodable bytes.
     """
 
     return source_bytes[n.start_byte:n.end_byte].decode("utf-8", errors="replace")
@@ -218,17 +172,16 @@ def _node_text(source_bytes: bytes, n) -> str:
 
 def _string_value(s: str) -> str:
     """
-    Best-effort unquote of a JS string literal's contents.
-
-    Leaves the original text if it is not a simple quoted literal.
+    Strip one pair of matching quotes from a string literal's text.
 
     Parameters:
-    - `s`: The input string to be unquoted.
+    - `s`: The literal text, possibly still wrapped in single, double or backtick quotes.
 
     Returns:
-    - The unquoted string, or the original string if it is not a simple quoted literal.
+    - The unquoted contents, or the trimmed input unchanged if it is not quote-wrapped.
     """
 
+    # Only a matching outer quote pair (single, double or backtick) is removed; escapes inside are left untouched.
     s = s.strip()
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"', "`"):
         return s[1:-1]
@@ -237,19 +190,7 @@ def _string_value(s: str) -> str:
 
 def _get_text_for_lines(source_lines: Chunk, a: int, b: int) -> str:
     """
-    Extract a contiguous range of lines from the source code.
-
-    This function extracts a range of lines from the input `source_lines` chunk, starting from line `a`
-    (inclusive) and ending at line `b` (inclusive). The range is clipped to ensure that `a` is not less
-    than 1 and `b` does not exceed the total number of lines in the chunk.
-
-    Parameters:
-    - `source_lines`: The input chunk containing the source code.
-    - `a`: The starting line index (inclusive).
-    - `b`: The ending line index (inclusive).
-
-    Returns:
-    - A string representation of the specified lines, or an empty string if the range is invalid.
+    Return the source text spanned by an inclusive, 1-based line range.
     """
 
     a = max(1, a)
@@ -261,13 +202,7 @@ def _get_text_for_lines(source_lines: Chunk, a: int, b: int) -> str:
 
 def _leading_spaces_count(line: str) -> int:
     """
-    Count the number of leading spaces in a line.
-
-    Parameters:
-    - `line`: The input string to count leading spaces from.
-
-    Returns:
-    - An integer representing the number of leading spaces.
+    Count the leading space characters at the start of a line.
     """
 
     return len(line) - len(line.lstrip(" "))
@@ -275,17 +210,16 @@ def _leading_spaces_count(line: str) -> int:
 
 def _row_of(point) -> int:
     """
-    Return the 0-based row from a tree-sitter point.
-
-    This function supports both object and tuple representations of points. For objects with a `.row` attribute,
-    it directly returns the row value. For tuples, it extracts the first element (the row) and returns it.
+    Return the row of a tree-sitter point, whichever shape the binding uses.
 
     Parameters:
-    - `point`: The tree-sitter point from which to extract the row.
+    - `point`: Either a Point-like object exposing `.row` or a plain `(row, column)` tuple.
 
     Returns:
-    - The 0-based row of the point as an integer.
+    - The zero-based row as an `int`.
     """
+
+    # Bridges tree-sitter binding versions: older ones return plain (row, column) tuples instead of Point objects.
     try:
         return point.row            # object with .row
     except AttributeError:
@@ -294,14 +228,16 @@ def _row_of(point) -> int:
 
 def _col_of(point) -> int:
     """
-    Return the 0-based column from a tree-sitter point, tolerating both the object (`.column`) and tuple (`[1]`) forms.
+    Return the column of a tree-sitter point, whichever shape the binding uses.
 
     Parameters:
-    - `point`: The tree-sitter point from which to extract the column.
+    - `point`: Either a Point-like object exposing `.column` or a plain `(row, column)` tuple.
 
     Returns:
-    - The 0-based column of the point as an integer.
+    - The zero-based column as an `int`.
     """
+
+    # Same binding-version bridge as the row accessor: the point may be an object or a plain tuple.
     try:
         return point.column         # object with .column
     except AttributeError:
@@ -313,107 +249,111 @@ def _col_of(point) -> int:
 
 def _collect_imports_js(tree, source_bytes: bytes) -> List[Tuple[int, str]]:
     """
-    Collect a plain-English list of import/require statements in source order.
+    Collect a one-line description of every import in a JavaScript syntax tree.
 
-    This function supports ES module imports and CommonJS require(...) calls.
-    It returns a list of tuples, where each tuple contains the line number and a description of the import/require statement.
+    An iterative walk recognises three shapes: ES `import` statements (side-effect, default, namespace and named clauses, including aliases), CommonJS `require(...)` declarators (identifier or destructuring bindings), and bare `require(...)` calls made purely for side effects. Module paths that are not string literals are reported as `<unknown>`.
 
     Parameters:
-    - `tree`: The parsed Tree-sitter tree for the source.
-    - `source_bytes`: The (normalised) source bytes the tree was parsed from.
+    - `tree`: The parsed tree-sitter syntax tree for the file.
+    - `source_bytes`: The raw source bytes the tree was parsed from.
 
     Returns:
-    - A list of tuples, where each tuple contains the line number and a description of the import/require statement.
+    - A list of `(line, description)` tuples sorted by 1-based source line.
     """
+
     out: List[Tuple[int, str]] = []
     src_b = source_bytes
     root = tree.root_node
 
+    # Findings carry their 1-based source line so the final report can be sorted into file order.
     def add(n, text: str) -> None:
         """
-        Add a line of text to the output.
+        Record one import description against its 1-based source line.
 
         Parameters:
-        - `n`: The node to determine the line number from.
-        - `text`: The text to append to the output.
-
-        Returns:
-        - None
+        - `n`: The tree-sitter node the description was derived from.
+        - `text`: The ready-formatted description line.
         """
 
+        # Tree-sitter rows are zero-based; the report wants 1-based line numbers.
         ln = _to_1based(_row_of(n.start_point))
         out.append((ln, text))
 
-    # Walk everything; imports can appear anywhere at top-level in ESM, and
-    # require(...) can appear nested.
+    # Iterative stack walk of the whole tree, so deep sources cannot hit the recursion limit.
     stack = [root]
+
     while stack:
         n = stack.pop()
         t = n.type
 
-        # ---- ES module: import ----
-        # Tree-sitter JavaScript/TypeScript use 'import_statement'.
-        # Be tolerant and also accept 'import_declaration' in case of grammar variants.
+        # ES-module `import` statements: identify the module string, then describe each binding in the clause.
         if t in ("import_statement", "import_declaration"):
             src_node = _node_field(n, "source")
+
+            # Some grammar versions expose no `source` field; fall back to a trailing string child.
             if src_node is None:
-                # Fallback: some versions expose the string as the last named child
                 cand = n.named_children[-1] if n.named_child_count else None
                 src_node = cand if cand and cand.type == "string" else None
-            module_text = _string_value(_node_text(src_b, src_node)) if src_node else "<unknown>"
 
+            module_text = _string_value(_node_text(src_b, src_node)) if src_node else "<unknown>"
             clause = _node_field(n, "import_clause")
+
+            # One report line per binding: side-effect-only, default, namespace and each named specifier.
             if clause is None:
-                # import 'mod';
                 add(n, f"- Imports {module_text} for side effects")
             else:
-                # default import: identifier directly under clause
                 for c in (clause.named_children or []):
                     if c.type in ("identifier",):
                         local = _node_text(src_b, c)
                         add(n, f"- Imports default from {module_text} as {local}")
                     elif c.type == "namespace_import":
-                        # import * as ns from 'mod'
                         name = _node_field(c, "name")
                         local = _node_text(src_b, name) if name else "<namespace>"
                         add(n, f"- Imports everything from {module_text} as {local}")
                     elif c.type == "named_imports":
-                        # import { a, b as c } from 'mod'
                         for spec in (c.named_children or []):
                             if spec.type != "import_specifier":
                                 continue
                             orig = _node_field(spec, "name") or _node_field(spec, "imported_name")
                             alias = _node_field(spec, "alias")
                             otext = _node_text(src_b, orig) if orig else "<unknown>"
+
+                            # Aliased specifiers record both the exported and local names.
                             if alias:
                                 atext = _node_text(src_b, alias)
                                 add(n, f"- Imports {otext} from {module_text} as {atext}")
                             else:
                                 add(n, f"- Imports {otext} from {module_text}")
-                # fall through: do not descend into children of import declarations further
+
+            # Nothing of further interest below an import node, so its children are skipped.
             continue
 
-        # ---- CommonJS: const X = require('mod') / const {a: b} = require('mod') ----
+        # CommonJS bindings: declarators whose initialiser is a `require(...)` call.
         if t == "variable_declarator":
             init = _node_field(n, "value")
             callee = _node_field(init, "function") if init and init.type == "call_expression" else None
+
+            # The callee is matched by literal text, so only direct `require` calls are recognised.
             if callee and _node_text(src_b, callee) == "require":
-                # Extract module name from the first argument if it is a string literal
                 mod = "<unknown>"
                 args = _node_field(init, "arguments")
+
+                # Only a literal string argument yields a module name; dynamic paths stay `<unknown>`.
                 if args and args.named_child_count >= 1:
                     arg0 = args.named_child(0)
                     if arg0 and arg0.type == "string":
                         mod = _string_value(_node_text(src_b, arg0))
 
-                # Binding side: identifier or object_pattern
                 name_node = _node_field(n, "name")
+
+                # A plain identifier binds the whole module; an object pattern is unpacked below.
                 if name_node is not None and name_node.type == "identifier":
                     local = _node_text(src_b, name_node)
                     add(n, f"- Requires {mod} as {local}")
                 elif name_node is not None and name_node.type == "object_pattern":
-                    # const {a, b: c} = require('mod')
                     props: List[str] = []
+
+                    # Both `{a: b}` renaming pairs and shorthand `{a}` properties feed the destructured-name list.
                     for k in (name_node.named_children or []):
                         if k.type == "pair":
                             k_name = _node_field(k, "key")
@@ -423,33 +363,40 @@ def _collect_imports_js(tree, source_bytes: bytes) -> List[Tuple[int, str]]:
                             props.append(f"{oname} as {aname}" if aname != oname else oname)
                         elif k.type in ("identifier", "shorthand_property_identifier_pattern"):
                             props.append(_node_text(src_b, k))
+
+                    # A pattern with no readable names still earns a bare module line.
                     if props:
                         add(n, f"- Requires {mod} (destructured: {', '.join(props)})")
                     else:
                         add(n, f"- Requires {mod}")
                 else:
                     add(n, f"- Requires {mod}")
-                # do not descend further into this declarator
+
+                # Handled, so do not descend and re-report the inner call as a side-effect require.
                 continue
 
-        # ---- CommonJS: bare require('mod') ----
+        # Bare `require(...)` calls reached outside a declarator count as side-effect imports.
         if t == "call_expression":
             callee = _node_field(n, "function")
+
             if callee and _node_text(src_b, callee) == "require":
                 args = _node_field(n, "arguments")
                 mod = "<unknown>"
+
                 if args and args.named_child_count >= 1:
                     arg0 = args.named_child(0)
                     if arg0 and arg0.type == "string":
                         mod = _string_value(_node_text(src_b, arg0))
-                add(n, f"- Requires {mod} for side effects")
-                # still descend, but not necessary; continue to keep traversal simple
 
-        # generic DFS
+                add(n, f"- Requires {mod} for side effects")
+
+        # Children are pushed in reverse so the stack pops them in source order.
         for i in range(n.named_child_count - 1, -1, -1):
             stack.append(n.named_child(i))
 
+    # Sorting by line keeps the report in file order whatever the traversal did.
     out.sort(key=lambda t: t[0])
+
     return out
 
 
@@ -461,38 +408,30 @@ def describe_imports_js(
     source_bytes: bytes
 ) -> None:
     """
-    Build a list of imports/requires from the JavaScript source code and feed it to the LLM as extra context.
+    Prime the conversation with a summary of the file's imports.
 
-    This function mirrors the Python flow by echoing the imports, pushing a short 'OK' acknowledgement prompt,
-    and then generating LLM output with the provided context.
+    Collects every ES and CommonJS import and, when any exist, appends the list as a user turn followed by a canned assistant acknowledgement; no model call is made. Files with no imports leave the conversation untouched.
 
     Parameters:
-    - `llm`: The LocalChatModel instance.
-    - `cfg`: The GenerationConfig instance.
-    - `messages`: The Messages instance.
-    - `tree`: The parsed Tree-sitter tree for the source.
-    - `source_bytes`: The (normalised) source bytes the tree was parsed from.
-
-    Notes:
-    - If no imports are found, this function returns immediately.
-    - The LLM output is echoed and appended to the messages list.
+    - `llm`: The local chat model (unused; present for the shared provider signature).
+    - `cfg`: The generation configuration (unused; present for the shared provider signature).
+    - `messages`: The running conversation the priming turns are appended to.
+    - `tree`: The parsed tree-sitter syntax tree for the file.
+    - `source_bytes`: The raw source bytes the tree was parsed from.
     """
 
+    # Priming only: the list is appended with a canned acknowledgement, so no model call is made here.
     items = _collect_imports_js(tree, source_bytes)
     if not items:
         return
-
     lines = [text for _, text in items]
     payload = "\n".join(lines)
-
     echo(f"\n[JS] Imports...\n{payload}")
     prompt = (
         "For additional context, here is a list of imports within this program:\n\n"
         f"{payload}"
     )
     messages.append({"role": "user", "content": prompt})
-    # A fixed acknowledgement we supply ourselves (not a model-generated "OK") - saves a generation call and avoids
-    # conditioning a small model to answer the first real request with "OK" too (see PRIMING_ACK).
     messages.append({"role": "assistant", "content": PRIMING_ACK})
 
 
@@ -501,17 +440,16 @@ def describe_imports_js(
 
 def _ident_text(source_bytes: bytes, n) -> Optional[str]:
     """
-    Extract the text of an identifier or string node from the source code.
+    Return the textual name carried by an identifier-like node, if any.
 
-    This function takes a bytes representation of the source code and a node to extract the text from.
-    It returns the extracted text as a string, or `None` if the node is not an identifier or string.
+    Accepts plain, property and private (`#name`) identifiers, plus string nodes, whose surrounding quotes or backticks are stripped. Safe with `None`.
 
     Parameters:
-    - `source_bytes`: The bytes representation of the source code.
-    - `n`: The node to extract the text from.
+    - `source_bytes`: The raw source bytes the node was parsed from.
+    - `n`: The tree-sitter node to read, or `None`.
 
     Returns:
-    - The extracted text as a string, or `None` if the node is not an identifier or string.
+    - The name as a string, or `None` when the node carries no usable name.
     """
 
     if n is None:
@@ -520,30 +458,28 @@ def _ident_text(source_bytes: bytes, n) -> Optional[str]:
         return _node_text(source_bytes, n)
     if n.type == "private_property_identifier":  # #method
         return _node_text(source_bytes, n)
+
+    # String keys count as names too: strip a matching quote or backtick pair when present.
     if n.type == "string":
-        # object literal key: "foo"
         s = _node_text(source_bytes, n).strip()
         if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"', "`"):
             return s[1:-1]
         return s
+
     return None
 
 
 def _qual_name(source_bytes: bytes, n, scope: List[str]) -> str:
     """
-    Build a fully qualified name for any declaration-like node that exposes a 'name' field (functions,
-    classes, methods, variable declarators).
-
-    The identifier is read from the node's 'name' field; if absent, '<anonymous>' is used. The resulting
-    name is prefixed by the dot-joined scope if provided.
+    Build the dot-separated qualified name for a definition node.
 
     Parameters:
-    - source_bytes: Source text as bytes (used by _ident_text).
-    - n: Tree-sitter node for the declaration.
-    - scope: Enclosing scope components, outermost to innermost.
+    - `source_bytes`: The raw source bytes the tree was parsed from.
+    - `n`: The tree-sitter node whose `name` field supplies the leaf identifier.
+    - `scope`: Enclosing scope names, outermost first.
 
     Returns:
-    - Qualified name string, e.g. 'Outer.Inner.func' or '<anonymous>'.
+    - The dotted qualified name; the leaf is `<anonymous>` when the node carries no name.
     """
 
     name = _ident_text(source_bytes, _node_field(n, "name")) or "<anonymous>"
@@ -552,28 +488,27 @@ def _qual_name(source_bytes: bytes, n, scope: List[str]) -> str:
 
 def _qual_name_for_obj_method(source_bytes: bytes, pair_or_method, scope: List[str], enclosing_obj: Optional[str]) -> str:
     """
-    Construct a qualified name for an object method.
-
-    This function generates a string representing the fully qualified name of an object method.
-    It takes into account whether the method is enclosed within another object and constructs
-    the name accordingly.
+    Build the qualified name for a method defined inside an object literal.
 
     Parameters:
-    - `source_bytes`: The source code bytes containing the method definition.
-    - `pair_or_method`: The object literal method or pair with a function value.
-    - `scope`: A list of strings representing the current scope.
-    - `enclosing_obj`: The name of the enclosing object, if any.
+    - `source_bytes`: The raw source bytes the tree was parsed from.
+    - `pair_or_method`: The object `pair` or `method_definition` node naming the method.
+    - `scope`: Enclosing scope names, outermost first.
+    - `enclosing_obj`: Name of the variable holding the object literal, or `None` when unknown.
 
     Returns:
-    - A string representing the fully qualified name of the object method.
+    - The dotted qualified name, including the owning object's name when available.
     """
 
+    # Object pairs name the method under `key`; method definitions carry it under `name`.
     key_node = _node_field(pair_or_method, "name") or _node_field(pair_or_method, "key")
     method = _ident_text(source_bytes, key_node) or "<anonymous>"
+
     if enclosing_obj:
         parts = scope + [enclosing_obj, method]
     else:
         parts = scope + [method]
+
     return ".".join(parts) if parts else method
 
 
@@ -582,29 +517,32 @@ def _qual_name_for_obj_method(source_bytes: bytes, pair_or_method, scope: List[s
 
 def _header_end_for_function_like(n) -> int:
     """
-    Determine the line number of the end of a function-like header.
+    Return the 1-based line on which a function-like node's header ends.
 
-    For statement blocks, the header ends on the line before the block's start.
-    For arrow functions with expression body, the header is on the function line.
-    For method definitions, if the value has a statement block, the header ends on the line before the block's start.
-    Otherwise, the header ends on the line of the method definition.
+    The header runs up to, but not including, the line where the statement or class body opens; nodes without a recognisable body report their own first line.
 
     Parameters:
-    - `n`: The Tree-sitter node representing the function-like construct.
+    - `n`: The tree-sitter function, class, or method node.
 
     Returns:
-    - The 1-based line number of the end of the function-like header.
+    - The 1-based line number of the last header line.
     """
 
+    # The header ends on the line just before the statement or class body opens.
     body = _node_field(n, "body") if n.type != "method_definition" else _node_field(n, "body")
     if body and body.type in ("statement_block", "class_body"):
         return _to_1based(_row_of(body.start_point)) - 1
+
+    # Method bodies hang off the nested `value` function node rather than the method node itself.
     if n.type == "method_definition":
         val = _node_field(n, "value")
+
         if val:
             blk = _node_field(val, "body")
             if blk and blk.type == "statement_block":
                 return _to_1based(_row_of(blk.start_point)) - 1
+
+    # No recognisable body, so the header collapses to the node's own first line.
     return _to_1based(_row_of(n.start_point))
 
 
@@ -613,15 +551,13 @@ def _header_end_for_function_like(n) -> int:
 
 def _iter_children(n) -> Iterable:
     """
-    Yield the named children of a node.
-
-    This generator iterates over the named child nodes of the given node, yielding each child in turn.
+    Yield the named children of a tree-sitter node, skipping anonymous tokens.
 
     Parameters:
-    - `n`: The node to iterate over its named children.
+    - `n`: The tree-sitter node to iterate.
 
-    Yields:
-    - Each named child node of the given node.
+    Returns:
+    - An iterable over the node's named child nodes.
     """
 
     for i in range(n.named_child_count):
@@ -630,22 +566,20 @@ def _iter_children(n) -> Iterable:
 
 def iter_defs_with_info_js(tree, source_bytes: bytes) -> List[DefInfoJS]:
     """
-    Collect definition-like constructs from the given JavaScript source code.
+    Collect every function, class, and method definition in a JavaScript parse tree.
 
-    This function walks a parsed JS module and identifies functions, classes, methods, variables, and object methods.
-    It creates DefInfoJS instances for each definition, which contain information such as the qualified name, type,
-    start and end lines, header start and end lines, depth, parent ID, and children IDs.
+    Recognised forms include declarations, class methods, function and arrow expressions bound to variables, and methods inside object literals. Each record carries the qualified name, line span, header extent, nesting depth, and parent/child links.
 
     Parameters:
-    - `tree`: The parsed Tree-sitter tree for the source.
-    - `source_bytes`: The (normalised) source bytes the tree was parsed from.
+    - `tree`: The tree-sitter parse tree for the file.
+    - `source_bytes`: The raw source bytes the tree was parsed from.
 
     Returns:
-    - A sorted list of DefInfoJS instances representing the definition-like constructs in the source code.
+    - A list of `DefInfoJS` records sorted by start line.
     """
 
+    # Scope stacks plus an id()-keyed child map let the walk build qualified names and parent/child links as it goes.
     root = tree.root_node
-
     results: List[DefInfoJS] = []
     children_map: Dict[int, List[int]] = {}
     scope_names: List[str] = []
@@ -653,18 +587,11 @@ def iter_defs_with_info_js(tree, source_bytes: bytes) -> List[DefInfoJS]:
 
     def add_child(parent_node: Optional[object], child_node: object) -> None:
         """
-        Add a child node to the parent's children map.
+        Record a parent-to-child link in the shared children map.
 
         Parameters:
-        - `parent_node`: The parent node to add the child to. If `None`, do nothing.
-        - `child_node`: The child node to be added.
-
-        Returns:
-        - None
-
-        Notes:
-        This method updates the internal children map, which is used to keep track of node relationships.
-        The `children_map` dictionary is keyed by parent node IDs and contains lists of child node IDs.
+        - `parent_node`: The enclosing definition node, or `None` for top-level definitions (in which case nothing is recorded).
+        - `child_node`: The definition node to register under the parent.
         """
 
         if parent_node is None:
@@ -673,45 +600,33 @@ def iter_defs_with_info_js(tree, source_bytes: bytes) -> List[DefInfoJS]:
 
     def walk(node) -> None:
         """
-        Collects information about definition-like constructs in the JavaScript source code.
+        Recursively visit a node and record every definition form it matches.
 
-        This function recursively traverses the abstract syntax tree (AST), identifying and processing functions, classes,
-        methods, variables, and object methods. It creates DefInfoJS instances for each definition, which contain
-        information such as the qualified name, type, start and end lines, header start and end lines, depth, parent ID,
-        and children IDs.
+        Function and class declarations push a naming scope before descending; methods, variable-bound functions, and object-literal methods record themselves without opening one. Unmatched nodes are simply descended into.
 
         Parameters:
-        - `node`: The current node in the AST being processed.
-
-        Notes:
-        - This function uses a recursive approach to traverse the AST.
-        - It relies on other functions (e.g. `_qual_name`, `_header_end_for_function_like`) to extract relevant information
-          from the node and its context.
+        - `node`: The tree-sitter node to visit.
         """
 
         t = node.type
 
         def mk_info(qualname: str, kind: str) -> DefInfoJS:
             """
-            Create a DefInfoJS instance for the given definition.
+            Build a `DefInfoJS` record for the node currently being visited.
+
+            Captures the line span, header extent, and the depth and identity of the enclosing scope at the time of the call; `children_ids` is filled in after the walk completes.
 
             Parameters:
-            - `qualname`: The qualified name of the definition.
-            - `kind`: The type of definition (e.g. function, class, variable).
+            - `qualname`: The dotted qualified name for the definition.
+            - `kind`: The definition kind label, e.g. `function`, `class`, or `method`.
 
             Returns:
-            - A DefInfoJS instance containing information about the definition, including its node, kind, start and end lines,
-              header start and end lines, depth, parent ID, and children IDs.
-
-            Notes:
-            - The `start_1b` and `end_1b` values are obtained from the `_line_span_from_node` function.
-            - The `header_end` value is obtained from the `_header_end_for_function_like` function.
-            - The `depth` value represents the nesting level of the definition within the current scope.
-            - The `parent_id` value is the ID of the parent node in the scope, or `None` if the definition is at the top level.
+            - A `DefInfoJS` describing the node.
             """
 
             start_1b, end_1b = _line_span_from_node(node)
             header_end = _header_end_for_function_like(node)
+
             return DefInfoJS(
                 qualname=qualname,
                 node=node,
@@ -724,7 +639,7 @@ def iter_defs_with_info_js(tree, source_bytes: bytes) -> List[DefInfoJS]:
                 parent_id=id(scope_nodes[-1]) if scope_nodes else None,
             )
 
-        # ---- function_declaration ----
+        # Function declarations open a naming scope so nested definitions are qualified beneath them.
         if t == "function_declaration":
             qual = _qual_name(source_bytes, node, scope_names)
             info = mk_info(qual, "function")
@@ -736,9 +651,10 @@ def iter_defs_with_info_js(tree, source_bytes: bytes) -> List[DefInfoJS]:
                 walk(c)
             scope_names.pop()
             scope_nodes.pop()
+
             return
 
-        # ---- class_declaration ----
+        # Class declarations scope the same way, putting members under the class name.
         if t == "class_declaration":
             qual = _qual_name(source_bytes, node, scope_names)
             info = mk_info(qual, "class")
@@ -750,9 +666,10 @@ def iter_defs_with_info_js(tree, source_bytes: bytes) -> List[DefInfoJS]:
                 walk(c)
             scope_names.pop()
             scope_nodes.pop()
+
             return
 
-        # ---- method_definition (class body) ----
+        # Methods are recorded without opening a scope, so helpers nested inside one qualify under the class rather than the method.
         if t == "method_definition":
             qual = _qual_name(source_bytes, node, scope_names)
             info = mk_info(qual, "method")
@@ -762,11 +679,11 @@ def iter_defs_with_info_js(tree, source_bytes: bytes) -> List[DefInfoJS]:
                 walk(c)
             return
 
-        # ---- variable_declarator with function/arrow ----
+        # Variable bindings only count as definitions when initialised with a function or arrow expression.
         if t == "variable_declarator":
             init = _node_field(node, "value")
+
             if init and init.type in ("function", "function_expression", "arrow_function"):
-                # Node types vary slightly across grammar versions. Be permissive.
                 qual = _qual_name(source_bytes, node, scope_names)
                 kind = "var_arrow" if init.type == "arrow_function" else "var_func"
                 info = mk_info(qual, kind)
@@ -776,20 +693,22 @@ def iter_defs_with_info_js(tree, source_bytes: bytes) -> List[DefInfoJS]:
                     walk(c)
                 return
 
-        # ---- object property as method ----
-        # Two shapes appear: 'method_definition' inside object, or 'pair' with value function/arrow
+        # Object-literal methods: find the variable the literal is bound to so the qualified name carries the owning object.
         if t == "pair" or (t == "method_definition" and node.parent and node.parent.type == "object"):
             enclosing = None
-            # If parent chain is a variable_declarator, use its id as object name
             p = node.parent
+
             while p is not None and p.type not in ("program",):
                 if p.type == "variable_declarator":
                     enclosing = _ident_text(source_bytes, _node_field(p, "name"))
                     break
+
                 p = p.parent
-            # Identify if this is a method-like construct
+
+            # A plain key/value pair only counts when its value is actually a function.
             value = _node_field(node, "value")
             is_method = (node.type == "method_definition") or (value and value.type in ("function", "function_expression", "arrow_function"))
+
             if is_method:
                 qual = _qual_name_for_obj_method(source_bytes, node, scope_names, enclosing)
                 info = mk_info(qual, "obj_method")
@@ -799,65 +718,76 @@ def iter_defs_with_info_js(tree, source_bytes: bytes) -> List[DefInfoJS]:
                     walk(c)
                 return
 
-        # Generic descent
+        # Default case: keep descending so definitions nested inside arbitrary constructs are still found.
         for c in _iter_children(node):
             walk(c)
 
     walk(root)
-
-    # Finalise children_ids immutably
     completed: List[DefInfoJS] = []
+
+    # children_ids can only be known once the walk has finished, so back-fill each frozen record via replace().
     for info in results:
         kids = tuple(children_map.get(id(info.node), []))
         completed.append(replace(info, children_ids=kids))
 
+    # Sorting guarantees source order regardless of the order the walk visited branches.
     return sorted(completed, key=lambda d: d.start)
 
 
 def _collect_calls_js(node, source_bytes: bytes, def_node_ids: set) -> List[Tuple[str, str, int]]:
     """
-    Collect a JS routine's own call sites for the call-graph resolver, without descending into nested routines.
+    Collect the calls made directly by a JavaScript routine.
 
-    The walk starts at the routine node and descends through everything *except* the subtrees of other recognised
-    definitions (any node whose id is in `def_node_ids`, except this routine's own node) - so a nested function/class/
-    function-valued binding is opaque and resolved as its own routine. This id-set approach is precise where a
-    type-based skip would not be: a `const f = () => {...}` is recorded as a `variable_declarator`, so its arrow value
-    is *not* a separate def node and is correctly walked. Each `call_expression` is classified by its callee:
-      - `f(...)` -> `("f", "free", line)`;
-      - `this.m(...)` -> `("m", "self", line)`;
-      - any other `obj.m(...)` -> `("m", "method", line)`.
-    The `line` is the call's 1-based source line - resolution ignores it; the block pass's read-side call annotations
-    use it.
+    Walks the routine's subtree recording each call expression as a `(name, kind, line)` tuple, where `kind` is `free` for a bare identifier, `self` for a call through `this`, and `method` for any other member access. Subtrees that are themselves routine definitions are skipped, so calls inside nested functions are attributed to those functions rather than to this one.
 
     Parameters:
-    - `node`: The routine's tree-sitter node.
-    - `source_bytes`: The source bytes the tree was parsed from.
-    - `def_node_ids`: The ids of every routine node in the file (used to treat nested routines as opaque).
+    - `node`: The tree-sitter node of the routine to scan.
+    - `source_bytes`: The encoded source the tree was parsed from.
+    - `def_node_ids`: Node ids of every routine definition in the file, used to recognise nested routines.
 
     Returns:
-    - The call sites as `(name, kind, line)` triples.
+    - A list of `(callee_name, kind, line)` tuples in source order, with 1-based line numbers.
     """
 
+    # The root's own id is noted so the walker below can exempt it from the nested-routine skip.
     root_id = node.id
     calls: List[Tuple[str, str, int]] = []
 
+    # Walker: record each call as (name, kind, line), classed as a free name, a `this` method, or a foreign-object method.
     def visit(n) -> None:
-        """Record `n` if it is a call site, then descend - skipping the subtree of any *other* recognised definition."""
+        """
+        Recursively scan one subtree, appending any call expressions found to the enclosing `calls` list.
+
+        Nested routine definitions are not descended into - they are opaque here and resolved on their own - with the root node itself as the one exception.
+
+        Parameters:
+        - `n`: The tree-sitter node to scan.
+        """
+
+        # tree-sitter rows are 0-based; calls are reported with 1-based source lines.
         if n.type == "call_expression":
             fn = n.child_by_field_name("function")
             line = n.start_point[0] + 1
+
+            # A bare identifier is a free call; member expressions need the receiver inspected before classifying.
             if fn is not None:
                 if fn.type == "identifier":
                     calls.append((_node_text(source_bytes, fn), "free", line))
                 elif fn.type == "member_expression":
                     obj = fn.child_by_field_name("object")
                     prop = fn.child_by_field_name("property")
+
+                    # The callee name is the property alone - any object path is deliberately dropped.
                     if prop is not None:
                         name = _node_text(source_bytes, prop)
+
+                        # Calls through `this` are the object's own methods; any other receiver makes it a plain method call.
                         if obj is not None and obj.type == "this":
                             calls.append((name, "self", line))
                         else:
                             calls.append((name, "method", line))
+
+        # Descend into children, leaving nested routine bodies to be analysed as their own symbols.
         for i in range(n.named_child_count):
             child = n.named_child(i)
             if child.id in def_node_ids and child.id != root_id:
@@ -865,38 +795,37 @@ def _collect_calls_js(node, source_bytes: bytes, def_node_ids: set) -> List[Tupl
             visit(child)
 
     visit(node)
+
     return calls
 
 
 def iter_symbols(source_blob: str, source_lines: Chunk) -> List[Symbol]:
     """
-    Extract the call-graph `Symbol` for every routine in a JS file (the model-free pre-pass per-file step).
+    Extract the documentable symbols from JavaScript source.
 
-    Reuses `iter_defs_with_info_js` for the definition records, then attaches each routine's parent qualname, header
-    signature, the existing doc comment above it (the seed contract, via `_doc_above_header_js`) and its classified
-    call sites (`_collect_calls_js`, which treats nested routines as opaque). Returns `[]` if the file cannot be parsed.
+    Parses the source with tree-sitter and builds one `Symbol` per routine or class, carrying its header signature text, its parent's qualified name, any existing doc comment above the header, and the calls it makes. Unparseable source yields an empty list rather than raising.
 
     Parameters:
-    - `source_blob`: The complete source text.
-    - `source_lines`: The same source split into lines.
+    - `source_blob`: The full source text.
+    - `source_lines`: The source split into lines, used to recover header text.
 
     Returns:
-    - One `Symbol` per definition (the `file` field is left blank for `build_project_graph` to stamp).
+    - A list of `Symbol` records in definition order, or an empty list if the source cannot be parsed.
     """
 
+    # Unparseable source means no symbols, never an exception.
     try:
         tree, source_bytes = _parse_js(source_blob)
     except Exception:
         return []
 
+    # Two lookups: parent qualnames keyed by node identity, and the def-node id set the call collector uses to skip nested routines.
     defs = iter_defs_with_info_js(tree, source_bytes)
-    # `iter_defs_with_info_js` keys parent/child relationships by Python `id()` of the node objects it captured; reuse
-    # that for parent lookup. For the call walk (a fresh descent that yields new node wrappers) use the tree-stable
-    # `node.id` instead, since Python `id()` is not stable across separate node accesses.
     qual_by_pyid: Dict[int, str] = {id(d.node): d.qualname for d in defs}
     def_node_ids = {d.node.id for d in defs}
-
     symbols: List[Symbol] = []
+
+    # Assemble one Symbol per definition: header text, parent link, any existing doc above the header, and its outgoing calls.
     for d in defs:
         signature = "\n".join(source_lines[d.header_start - 1:d.header_end]) if d.header_end >= d.header_start else ""
         parent_qualname = qual_by_pyid.get(d.parent_id) if d.parent_id is not None else None
@@ -905,6 +834,7 @@ def iter_symbols(source_blob: str, source_lines: Chunk) -> List[Symbol]:
             parent_qualname=parent_qualname, existing_doc=_doc_above_header_js(source_lines, d.header_start),
             calls=_collect_calls_js(d.node, source_bytes, def_node_ids),
         ))
+
     return symbols
 
 
@@ -920,64 +850,83 @@ _JS_FUNCTION_VALUES = {"arrow_function", "function", "function_expression", "gen
 
 
 def _named_children(n) -> List:
-    """Return the named children of a tree-sitter node as a list."""
+    """
+    Return a tree-sitter node's named children as a list.
+    """
+
     return [n.named_child(i) for i in range(n.named_child_count)]
 
 
 def _is_js_statement(n) -> bool:
-    """Report whether a node is a JS statement (`*_statement`, `*_declaration`, or a bare `{ }` block)."""
+    """
+    Report whether a tree-sitter node is a JavaScript statement or declaration.
+
+    Parameters:
+    - `n`: The tree-sitter node to test.
+
+    Returns:
+    - `True` for any statement, declaration or statement-block node, otherwise `False`.
+    """
+
+    # Suffix matching covers every *_statement and *_declaration node type without enumerating the grammar.
     t = n.type
     return t.endswith("_statement") or t.endswith("_declaration") or t == "statement_block"
 
 
 def _js_is_def_stmt(node) -> bool:
     """
-    Report whether a body statement introduces a nested definition (so it is opaque to the parent's block pass).
+    Report whether a statement introduces a routine or class definition.
 
-    Covers `function`/`class` declarations and a `const`/`let`/`var` whose initialiser is a function or arrow - the
-    same constructs `iter_defs_with_info_js` treats as their own routines. Such a statement is one boundary and is
-    not descended into; its body is annotated when it is processed as its own target.
+    Covers plain function, generator and class declarations, plus `const`/`let`/`var` declarations whose initialiser is a function-valued expression.
 
     Parameters:
     - `node`: The statement node to test.
 
     Returns:
-    - True if the statement is or introduces a nested definition.
+    - `True` if the statement defines a routine or class, otherwise `False`.
     """
 
     if node.type in ("function_declaration", "generator_function_declaration", "class_declaration"):
         return True
+
+    # A `const f = () => ...` style binding also counts: any declarator with a function-valued initialiser.
     if node.type in ("lexical_declaration", "variable_declaration"):
         for d in _named_children(node):
             if d.type == "variable_declarator":
                 val = _node_field(d, "value")
                 if val is not None and val.type in _JS_FUNCTION_VALUES:
                     return True
+
     return False
 
 
 def _js_suite(node) -> Optional[List]:
     """
-    Return the statement list held by a body/branch node, or None.
+    Normalise a node into the list of statements it contains, if any.
 
-    Unwraps an `else_clause` to the branch inside it; expands a `statement_block` to its statement children; and
-    treats a single unbraced statement (e.g. `if (x) return;`) as a one-element suite.
+    Accepts a bare statement (yielding a one-element list), a statement block, or an else clause (unwrapped recursively to whatever it holds). Empty blocks and non-statement nodes yield `None`.
 
     Parameters:
-    - `node`: A body/branch node (or None).
+    - `node`: The candidate suite node, or `None`.
 
     Returns:
-    - The statement list, or None if the node holds no statements.
+    - A non-empty list of statement nodes, or `None` if there is no suite.
     """
 
     if node is None:
         return None
+
+    # An else clause wraps either a block or an `else if`; unwrap to whichever it holds.
     if node.type == "else_clause":
         kids = _named_children(node)
         return _js_suite(kids[0]) if kids else None
+
     if node.type == "statement_block":
+        # Empty blocks count as having no suite at all.
         stmts = [c for c in _named_children(node) if _is_js_statement(c)]
         return stmts or None
+
+    # A braceless single-statement body becomes a one-element suite.
     if _is_js_statement(node):
         return [node]
     return None
@@ -985,21 +934,21 @@ def _js_suite(node) -> Optional[List]:
 
 def _js_statement_lists(stmt) -> List[List]:
     """
-    Return the statement lists nested directly inside a JS compound statement (the analogue of Python suites).
+    List the statement suites nested directly inside one compound statement.
 
-    Covers an `if`'s consequence/alternative, a loop body, a `try`'s block / catch / finally, each `case`/`default`
-    of a `switch`, and the contents of a bare `{ }` block. Nested definitions are handled by the caller (opaque), so
-    they are not expanded here.
+    Each branch or body (if/else arms, loop bodies, try/catch/finally bodies, switch cases, bare blocks) becomes one list of statement nodes. Only the immediate level is returned; callers recurse into the returned statements themselves.
 
     Parameters:
-    - `stmt`: The statement to inspect.
+    - `stmt`: The statement node to inspect.
 
     Returns:
-    - A list of statement lists (empty for a simple statement).
+    - A list of statement-node lists, one per non-empty nested suite; empty if the statement nests none.
     """
 
     t = stmt.type
     lists: List[List] = []
+
+    # Field-addressed suites: if/else arms, loop bodies and try parts - catch and finally clauses must first be unwrapped to their inner block.
     if t == "if_statement":
         for fld in ("consequence", "alternative"):
             sl = _js_suite(_node_field(stmt, fld))
@@ -1021,6 +970,8 @@ def _js_statement_lists(stmt) -> List[List]:
                 lists.append(sl)
     elif t == "switch_statement":
         body = _node_field(stmt, "body")
+
+        # Switch cases and bare blocks carry their statements as direct children rather than named fields.
         if body is not None:
             for case in _named_children(body):
                 if case.type in ("switch_case", "switch_default"):
@@ -1031,68 +982,122 @@ def _js_statement_lists(stmt) -> List[List]:
         cl = [c for c in _named_children(stmt) if _is_js_statement(c)]
         if cl:
             lists.append(cl)
+
     return lists
 
 
 def _is_js_decl(node) -> bool:
-    """Report whether a node is a plain variable declaration (a `let`/`const`/`var` that is not a function binding)."""
+    """
+    Report whether a node is a plain `let`/`const`/`var` declaration.
+
+    Parameters:
+    - `node`: The tree-sitter statement node to test.
+
+    Returns:
+    - `True` for variable and lexical declarations that do not bind a function; `False` otherwise.
+    """
+
     return node.type in ("lexical_declaration", "variable_declaration") and not _js_is_def_stmt(node)
 
 
 def _js_span(node) -> int:
-    """Source-line span of a node (its triviality measure for the block-size gate)."""
+    """
+    Count the source lines a node spans, inclusive of both ends.
+
+    Parameters:
+    - `node`: The tree-sitter node to measure.
+
+    Returns:
+    - The number of lines from the node's start row to its end row.
+    """
+
     return _row_of(node.end_point) - _row_of(node.start_point) + 1
 
 
 def _js_opens_block(node) -> int:
-    """Return the block span this statement opens (control block or nested def), or 0 if it opens none."""
+    """
+    Return the line span of a statement that opens a nested block, or 0.
+
+    Parameters:
+    - `node`: The tree-sitter statement node to test.
+
+    Returns:
+    - The node's inclusive line span when it is a compound statement or function definition, otherwise `0`.
+    """
+
+    # The span doubles as the truth value, so callers get the block's weight for free.
     if node.type in _JS_BLOCK_OPENERS or _js_is_def_stmt(node):
         return _js_span(node)
     return 0
 
 
 def _js_closed_block(prev_node, resume_start: int, body_node) -> Optional[object]:
-    """Return the outermost brace block that closed between `prev_node` and a dedent resuming at `resume_start`."""
+    """
+    Find the outermost block around a statement that closes before segmentation resumes.
+
+    Walks the ancestor chain from `prev_node` up to (but excluding) `body_node`, keeping the highest block-opening ancestor whose end row falls before `resume_start`.
+
+    Parameters:
+    - `prev_node`: The last statement recorded before the dedent.
+    - `resume_start`: 1-based line on which the next statement begins.
+    - `body_node`: The function body node that bounds the upward search.
+
+    Returns:
+    - The outermost qualifying block node, or `None` when no enclosing block closed before `resume_start`.
+    """
+
     best = None
     n = prev_node.parent
+
+    # Keep climbing so `best` ends up as the outermost block that closed before the resume line.
     while n is not None and n is not body_node:
         if (n.type in _JS_BLOCK_OPENERS or _js_is_def_stmt(n)) and _to_1based(_row_of(n.end_point)) < resume_start:
             best = n
         n = n.parent
+
     return best
 
 
 def _js_body_block(node):
-    """Return the `statement_block` body of a function-like def node (or None for an expression-bodied arrow)."""
+    """
+    Locate the statement block that forms a function-like node's body.
+
+    Parameters:
+    - `node`: The tree-sitter node of a function, method or declaration.
+
+    Returns:
+    - The `statement_block` node, taken directly from the `body` field or from the declarator's `value` for declaration-bound functions, or `None` when there is none (e.g. an expression-bodied arrow).
+    """
+
     b = _node_field(node, "body")
     if b is not None and b.type == "statement_block":
         return b
     val = _node_field(node, "value")
+
+    # Declaration-bound functions (`const f = ...`) nest the block one level down, under the declarator's value.
     if val is not None:
         b = _node_field(val, "body")
         if b is not None and b.type == "statement_block":
             return b
+
     return None
 
 
 def _collect_body_js(body_node, source_lines: Chunk) -> Tuple[List[int], Dict[int, str], List[SegStatement]]:
     """
-    Walk a JS function body, returning its legal block boundaries, their indentation, and the segmenter records.
+    Gather segmentation facts for one JavaScript function body.
 
-    Mirrors `scale_python._body_boundaries` + `_seg_records`: every statement is recorded at every nesting depth
-    (recursing into nested brace blocks but treating a nested definition as one opaque boundary), the first
-    statement of an inner suite is excluded from the boundaries, and a line is a boundary only if it begins exactly
-    one (non-suite-leading) statement at its first non-blank column - which drops `a; b;`, continuation lines, and
-    inline inner statements.
+    Recursively walks the body's statement tree, tallying where statements start, which lines may act as paragraph boundaries, return-statement merge anchors, and any forced break after a leading run of declarations. Nested function definitions are recorded but never descended into.
 
     Parameters:
-    - `body_node`: The function's `statement_block` body node.
-    - `source_lines`: The full source split into lines.
+    - `body_node`: The tree-sitter `statement_block` of the function being segmented.
+    - `source_lines`: The pristine source lines of the file.
 
     Returns:
-    - A tuple `(boundary_lines, indent_of, seg_statements)`.
+    - A tuple of sorted candidate boundary lines, a map from boundary line to its indentation string, and the `SegStatement` records in source order.
     """
 
+    # Shared state filled in by the nested walker below.
     line_count: Dict[int, int] = {}
     line_col: Dict[int, int] = {}
     recorded: List[Tuple[int, int, object, bool]] = []  # (start, depth, node, first_in_scope)
@@ -1100,39 +1105,55 @@ def _collect_body_js(body_node, source_lines: Chunk) -> Tuple[List[int], Dict[in
     force_break_lines: set = set()                       # first real statement after a leading declaration run
 
     def walk(stmts: List, is_top: bool, depth: int) -> None:
-        """Record each statement and recurse into its nested suites; nested definitions are opaque (not descended)."""
-        # A suite that is exactly `[simple_stmt, return]` is one paragraph: anchor it at the leading statement so the
-        # comment pass sees both lines (a return alone gives it nothing to describe).
+        """
+        Record segmentation facts for one statement list, recursing into nested suites.
+
+        Mutates the enclosing collectors (`line_count`, `line_col`, `recorded`, `merge_map`, `force_break_lines`) rather than returning anything.
+
+        Parameters:
+        - `stmts`: The statements of the current suite, in source order.
+        - `is_top`: `True` only for the function body's own statement list.
+        - `depth`: Nesting depth of the suite, zero at the body itself.
+        """
+
+        # A body of one plain statement plus its return reads as a single thought, so mark the pair for merging.
         if (len(stmts) == 2 and stmts[1].type == "return_statement"
                 and stmts[0].type not in _JS_BLOCK_OPENERS and not _js_is_def_stmt(stmts[0])):
             a = _to_1based(_row_of(stmts[0].start_point))
             r = _to_1based(_row_of(stmts[1].start_point))
             if a != r:
                 merge_map[r] = a
-        # Leading-declaration heuristic: a scope opening with a run of `let`/`const`/`var` declarations gets its first
-        # real statement paragraphed off, so the declarations read as their own block.
+
+        # A long enough leading run of declarations is cut off, so the first real statement opens a fresh paragraph.
         ndecl = 0
         while ndecl < len(stmts) and _is_js_decl(stmts[ndecl]):
             ndecl += 1
         if ndecl >= SEG_MIN_LEADING_DECLS and ndecl < len(stmts) and stmts[ndecl].type != "return_statement":
             force_break_lines.add(_to_1based(_row_of(stmts[ndecl].start_point)))
+
         for idx, stmt in enumerate(stmts):
             skip = (not is_top) and idx == 0  # the first line of an inner suite is never a block start
             start = _to_1based(_row_of(stmt.start_point))
+
+            # Tally start lines: a line claimed by more than one statement can never be a clean boundary.
             if not skip:
                 line_count[start] = line_count.get(start, 0) + 1
                 line_col[start] = _col_of(stmt.start_point)
+
+            # Nested function definitions are recorded but not entered - they are segmented on their own.
             recorded.append((start, depth, stmt, is_top and idx == 0))
             if _js_is_def_stmt(stmt):
                 continue
             for sub in _js_statement_lists(stmt):
                 walk(sub, False, depth + 1)
 
+    # Walk the whole body first; everything below derives boundaries from the tallies.
     top_stmts = [c for c in _named_children(body_node) if _is_js_statement(c)]
     walk(top_stmts, True, 0)
-
     boundary_lines: List[int] = []
     indent_of: Dict[int, str] = {}
+
+    # Only a line holding exactly one statement, with nothing but whitespace before it, may open a paragraph.
     for line, count in line_count.items():
         if count != 1 or not (1 <= line <= len(source_lines)):
             continue
@@ -1142,23 +1163,28 @@ def _collect_body_js(body_node, source_lines: Chunk) -> Tuple[List[int], Dict[in
         indent_of[line] = text[: len(text) - len(text.lstrip())]
         boundary_lines.append(line)
 
-    # A `[stmt; return]` anchor is the first statement of its suite (normally excluded); make it an addressable
-    # boundary so the merged paragraph can be commented there.
+    # Return-merge anchors must be boundaries even when the single-statement filter rejected them.
     for anchor in set(merge_map.values()):
         if 1 <= anchor <= len(source_lines) and anchor not in indent_of:
             text = source_lines[anchor - 1]
             indent_of[anchor] = text[: len(text) - len(text.lstrip())]
             boundary_lines.append(anchor)
-    boundary_lines.sort()
 
+    # Restore source order before deriving the per-statement segmentation facts.
+    boundary_lines.sort()
     recorded.sort(key=lambda r: r[0])
     seg_statements: List[SegStatement] = []
+
+    # Translate each recorded statement into the language-neutral form the segmenter consumes.
     for i, (start, depth, node, first_in_scope) in enumerate(recorded):
         end = _to_1based(_row_of(node.end_point))
         closed = 0
+
+        # A dedent since the previous statement means a block just closed; measure its size.
         if i > 0 and recorded[i - 1][1] > depth:
             blk = _js_closed_block(recorded[i - 1][2], start, body_node)
             closed = _js_span(blk) if blk is not None else 0
+
         seg_statements.append(SegStatement(
             start=start, end=end, depth=depth,
             is_return=node.type == "return_statement", is_def=_js_is_def_stmt(node),
@@ -1172,20 +1198,17 @@ def _collect_body_js(body_node, source_lines: Chunk) -> Tuple[List[int], Dict[in
 
 def _doc_above_header_js(source_lines: Chunk, header_start: int) -> str:
     """
-    Return the documentation text of the comment block immediately above a definition header (or "" if none).
-
-    The JS analogue of Python's `ast.get_docstring`: the block provider parses the (possibly def-pass-annotated)
-    source, so the JSDoc / `//` block the definition pass wrote above the routine is read back here and fed to the
-    block-comment pass as the routine's purpose - giving JS the same per-routine context Python gets from a docstring.
+    Extract the prose of any comment block sitting directly above a function header.
 
     Parameters:
-    - `source_lines`: The source split into lines (the same text the provider parses).
-    - `header_start`: The 1-based line of the definition header.
+    - `source_lines`: The source lines of the file.
+    - `header_start`: 1-based line number of the function header.
 
     Returns:
-    - The doc text with comment delimiters/gutters stripped, or "" when no comment block sits above the header.
+    - The comment text with `/* */` or `//` decoration stripped, or an empty string when no comment precedes the header.
     """
 
+    # Both comment styles are reduced to bare prose so the rewriter can reuse the wording.
     rng = _scan_existing_comment_block_above(source_lines, header_start)
     if rng is None:
         return ""
@@ -1193,64 +1216,54 @@ def _doc_above_header_js(source_lines: Chunk, header_start: int) -> str:
     block = "\n".join(source_lines[s - 1:e])
     if "/*" in block:
         return _extract_first_comment_block(block)
-    # A `//` run: strip the leading slashes from each line.
     return "\n".join(ln.strip()[2:].strip() if ln.strip().startswith("//") else ln.strip()
                      for ln in block.split("\n")).strip()
 
 
 def file_doc_target_js(source_blob: str, source_lines: Chunk) -> Optional[FileDocTarget]:
     """
-    Build the file-level header doccomment target for a JavaScript source file.
-
-    JS file headers are the same shape as C's - a leading run of `/* ... */` and/or `//` comment blocks (after an
-    optional `#!/usr/bin/env node` shebang) before the first code - so this delegates to the shared brace-language
-    scanner. The description is rendered/updated as a `/* ... */` block.
+    Locate the top-of-file documentation zone in JavaScript source.
 
     Parameters:
-    - `source_blob`: The complete source text (unused; accepted for provider-signature symmetry).
-    - `source_lines`: The source split into individual lines.
+    - `source_blob`: The full source text (unused; kept for interface parity with the other languages).
+    - `source_lines`: The source split into lines.
 
     Returns:
-    - A `FileDocTarget`, or None if the file is empty.
+    - A `FileDocTarget` describing the leading comment zone, or `None` if no suitable zone was found.
     """
 
+    # The zone scan is shared with the other brace languages; only the slash comment styles here are JS-specific.
     return scan_brace_leading_zone(source_lines, SLASH_BLOCK_STYLE)
 
 
 def iter_block_targets_js(source_blob: str, source_lines: Chunk) -> List[BlockTarget]:
     """
-    Build the within-function block targets for a JavaScript source file.
+    Collect block-comment targets for every function in the JavaScript source.
 
-    Each function, method, and function/arrow-valued binding with a brace body becomes one `BlockTarget` carrying
-    its header/body line spans, the lines that may legally begin a block, and the deterministic structural
-    segmentation. Class bodies (which hold member definitions, not statements) are skipped - their methods are
-    targeted individually. Nested definitions are opaque within a parent and annotated as their own targets, so JS
-    keeps the after-def paragraph rule (unlike C). This is the JS implementation of the provider interface consumed
-    by `scale_blocks.annotate_blocks`.
+    Each definition with a non-empty body yields a `BlockTarget` carrying its header and body line ranges, structural segment breaks, any existing doc comment, and a comment-stripped span hash used to re-bind the target after the file is edited.
 
     Parameters:
-    - `source_blob`: The complete source text (parsed with Tree-sitter JavaScript).
-    - `source_lines`: The same source split into individual lines.
+    - `source_blob`: The full JavaScript source text.
+    - `source_lines`: The source split into lines.
 
     Returns:
-    - A list of `BlockTarget`, one per routine body, in source order.
+    - A list of `BlockTarget` records, one per definition with at least one body statement.
     """
 
     tree, source_bytes = _parse_js(source_blob)
     targets: List[BlockTarget] = []
 
+    # Build one target per definition that has at least one body statement; the recorded span hash is comment-stripped so later insertions still re-bind.
     for info in iter_defs_with_info_js(tree, source_bytes):
         body_node = _js_body_block(info.node)
         if body_node is None:
             continue
-
         boundary_lines, indent_of, seg_statements = _collect_body_js(body_node, source_lines)
         top_stmts = [c for c in _named_children(body_node) if _is_js_statement(c)]
         if not top_stmts:
             continue
         body_start = _to_1based(_row_of(top_stmts[0].start_point))
         body_end = _to_1based(_row_of(body_node.end_point))
-
         segments = structural_breaks(
             seg_statements, has_doc=False, boundary_lines=tuple(boundary_lines), body_end=body_end,
             allow_after_def=True, allow_first_in_scope=False,
@@ -1267,9 +1280,6 @@ def iter_block_targets_js(source_blob: str, source_lines: Chunk) -> List[BlockTa
                 indent_of=indent_of,
                 depth=info.depth,
                 doc=_doc_above_header_js(source_lines, info.header_start),
-                # The manifest re-binding identity, over the SAME `header_start..info.end` convention as the
-                # def-side recording (`collect_def_requests_js`) - a mismatch would silently split one routine
-                # into two manifest requests. Comment/blank-invariant: see `_js_span_hash`.
                 sig=_js_span_hash(source_lines, info.header_start, info.end),
                 segments=segments,
             )
@@ -1283,22 +1293,16 @@ def iter_block_targets_js(source_blob: str, source_lines: Chunk) -> List[BlockTa
 
 def deepest_first_js(defs: List[DefInfoJS]) -> List[DefInfoJS]:
     """
-    Sort the definitions in a deepest-first order.
-
-    This function takes a list of `DefInfoJS` instances and returns them sorted by depth, start line, and end line.
-    The sorting is stable, meaning that equal elements maintain their original order. The sort key is defined as:
-
-    - Depth (deepest first)
-    - Start line (earlier lines come first)
-    - End line (later lines come first)
+    Order JavaScript definitions so the most deeply nested come first.
 
     Parameters:
-    - `defs`: A list of `DefInfoJS` instances to be sorted.
+    - `defs`: The definitions to order.
 
     Returns:
-    - A sorted list of `DefInfoJS` instances.
+    - A new list sorted by descending depth, with later and more tightly enclosed spans ahead of those that contain them.
     """
 
+    # Deeper, later spans sort first so inner bodies are patched before the regions that enclose them.
     return sorted(defs, key=lambda d: (d.depth, d.start, -d.end), reverse=True)
 
 
@@ -1307,154 +1311,154 @@ def deepest_first_js(defs: List[DefInfoJS]) -> List[DefInfoJS]:
 
 def _render_jsdoc_block(text: str, base_indent: str) -> List[str]:
     """
-    Render a JSDoc comment block with the given text and base indentation.
-
-    This function formats a string of text as a JSDoc comment block, including a leading `/**` marker
-    and a trailing `*/` terminator. If the input text is empty, it displays a message indicating that
-    there is no documentation.
+    Render comment text as an indented JSDoc-style block.
 
     Parameters:
-    - `text`: The input text to be formatted as a JSDoc comment block.
-    - `base_indent`: The base indentation string for the comment block.
+    - `text`: The comment body; each line becomes one gutter line.
+    - `base_indent`: Whitespace prefix applied to every emitted line.
 
     Returns:
-    - A list of strings representing the formatted JSDoc comment block.
+    - The complete block as a list of lines, delimiters included; empty text yields a `(no documentation)` placeholder.
     """
 
     lines = text.splitlines()
     out = [f"{base_indent}/**"]
+
+    # Empty text still gets a visible placeholder line; the outer rstrip leaves blank body lines as a bare gutter with no trailing space.
     if lines:
         for ln in lines:
-            # rstrip the whole line: a blank doc line would otherwise leave " * " with a trailing space.
             out.append(f"{base_indent} * {ln.rstrip()}".rstrip())
     else:
         out.append(f"{base_indent} * (no documentation)")
+
     out.append(f"{base_indent} */")
+
     return out
 
 
 def _render_js_line_comment(text: str, base_indent: str) -> List[str]:
     """
-    Render a documentation comment as `//` line comments (the line-comment counterpart to `_render_jsdoc_block`).
-
-    Used when a file's existing doc comments are `//`-style, so generated docs match the file's convention instead of
-    always introducing a `/** ... */` JSDoc block.
+    Render comment text as `//` line comments at the given indentation.
 
     Parameters:
-    - `text`: The comment text (possibly multi-line).
-    - `base_indent`: The base indentation for the comment lines.
+    - `text`: The comment body.
+    - `base_indent`: Whitespace prefix for each emitted line.
 
     Returns:
-    - A list of `//`-prefixed comment lines.
+    - One `//` line per input line, or a single `(no documentation)` placeholder when the text is empty.
     """
 
+    # Empty text yields a placeholder rather than nothing; blank lines collapse to a bare `//` via the outer rstrip.
     lines = text.splitlines()
     if not lines:
         return [f"{base_indent}// (no documentation)"]
-    # rstrip the whole line so a blank doc line is "//" rather than "// " with a trailing space.
     return [f"{base_indent}// {ln.rstrip()}".rstrip() for ln in lines]
 
 
 def _detect_doc_style_js(tree, source_bytes: bytes) -> str:
     """
-    Detect whether a JS file documents its code with `//` line comments or `/* ... */` (JSDoc) block comments.
+    Detect whether the file's existing comments favour line or block style.
 
-    Only the leading file-header banner (the first top-level comment) is ignored, so every other comment is weighed
-    (including the first definition's own doc). Following "if both styles are present, prefer the block form", the
-    result is `"line"` only when the remaining comments use `//` and no `/* ... */`, otherwise `"block"` (the default,
-    including a file with no other comments).
+    The first comment in the file is treated as a banner and excluded, and block style wins unless every remaining comment is a `//` line.
 
     Parameters:
-    - `tree`: The parsed Tree-sitter tree.
-    - `source_bytes`: The source bytes the tree was parsed from.
+    - `tree`: The parsed tree-sitter tree for the source.
+    - `source_bytes`: The source as bytes, used to inspect each comment's prefix.
 
     Returns:
-    - `"line"` or `"block"`.
+    - `"line"` if only line comments are present, otherwise `"block"`.
     """
 
+    # Note the position of any leading banner comment so a block-style licence header cannot decide the verdict.
     root = tree.root_node
     banner_start = (root.children[0].start_byte
                     if root.children and root.children[0].type == "comment" else None)
-
     has_line = has_block = False
     stack = [root]
+
     while stack:
         n = stack.pop()
+
+        # The first two bytes decide the flavour; anything that is not `//` counts as a block comment.
         if n.type == "comment" and n.start_byte != banner_start:
             if source_bytes[n.start_byte:n.start_byte + 2] == b"//":
                 has_line = True
             else:
                 has_block = True
+
         for i in range(n.named_child_count):
             stack.append(n.named_child(i))
 
+    # Block wins any mix: only a file whose comments are exclusively line-style reports `line`.
     return "line" if (has_line and not has_block) else "block"
 
 
 def _strip_jsdoc_gutters(block: List[str]) -> str:
     """
-    Strip the leading JSDoc gutter from each line of a comment block and join the result.
+    Strip the leading `*` gutters from the lines of a JSDoc comment body.
 
-    Only a single leading '*' (and one following space) is removed per line, so genuine content such as a
-    '* bullet' is preserved rather than eaten.
+    Only one space after each `*` is removed, so indentation that belongs to the comment text is preserved.
 
     Parameters:
-    - `block`: The comment-body lines (without the surrounding '/**' and '*/' fences).
+    - `block`: The comment lines, excluding the `/**` and `*/` delimiter rows.
 
     Returns:
-    - The cleaned comment text as a single, stripped string.
+    - The de-guttered text joined with newlines and trimmed of blank edges.
     """
 
     cleaned: List[str] = []
+
     for ln in block:
         s = ln.lstrip()
+
+        # Only the gutter `*` and a single following space are eaten, so deliberate indentation inside the comment survives.
         if s.startswith("*"):
             s = s[1:]
             if s.startswith(" "):
                 s = s[1:]
+
         cleaned.append(s.rstrip())
+
+    # The final strip drops the blank edge lines left where the delimiters were removed.
     return "\n".join(cleaned).strip()
 
 
 def _extract_first_comment_block(reply: str) -> str:
     """
-    Extract the documentation body from an LLM reply, tolerant of how the model wrapped it.
+    Extract the first comment block from a model reply.
 
-    The model does not always honour the request for a bare JSDoc block, so several shapes are accepted, in order
-    of preference:
-
-    1. A JSDoc `/** ... */` block (the requested form).
-    2. A fenced code block ``` ... ``` (optionally tagged, e.g. ```js), using its contents.
-    3. As a last resort, the whole reply treated as the comment body.
+    Tries, in order: a `/** ... */` JSDoc block (tolerating a missing terminator), a fenced code block, and finally the whole reply. Gutters are stripped from whichever form is found.
 
     Parameters:
-    - `reply`: The raw text returned by the LLM.
+    - `reply`: The raw model reply text.
 
     Returns:
-    - The extracted comment text, or an empty string only if the reply is effectively empty.
+    - The extracted comment text with gutters removed and blank edges trimmed.
     """
 
+    # Dedent first so a uniformly indented reply still has its `/**` opener recognised.
     lines = textwrap.dedent(reply).split("\n")
     stripped = [ln.strip() for ln in lines]
 
-    # 1. Preferred: a JSDoc '/** ... */' block.
+    # First preference is a real JSDoc block; a missing opener raises ValueError and falls through to the fence path.
     try:
         start_idx = stripped.index("/**") + 1
+
+        # An unterminated block is tolerated: everything to the end of the reply counts as the comment.
         for end_idx in range(start_idx, len(lines)):
             if "*/" in lines[end_idx]:
                 break
         else:
             end_idx = len(lines)
+
         return _strip_jsdoc_gutters(lines[start_idx:end_idx])
     except ValueError:
         pass
 
-    # 2. Fallback: a fenced code block ``` ... ``` (the tag line, if any, is dropped).
+    # Fenced code is the second choice; as a last resort the whole reply is taken, so a comment is never silently dropped.
     fence_idxs = [i for i, s in enumerate(stripped) if s.startswith("```")]
     if len(fence_idxs) >= 2:
         return _strip_jsdoc_gutters(lines[fence_idxs[0] + 1:fence_idxs[1]])
-
-    # 3. Last resort: treat the whole reply as the comment body.
     return _strip_jsdoc_gutters(lines)
 
 
@@ -1465,38 +1469,32 @@ def assemble_snippet_for_js(
     docs_by_id: Dict[int, str]
 ) -> str:
     """
-    Assemble a snippet of JavaScript code for a given node ID.
+    Assemble the prompt snippet for a JS definition, eliding the bodies of its direct children.
 
-    This function generates a snippet by splicing together the header and body of the source code.
-    The header is obtained from the `source_lines` chunk, spanning from `header_start` to `header_end`.
-    The body is constructed by replacing direct children with their corresponding JSDoc comments and headers,
-    and preserving other lines. A forward cursor walks the body in source order, copying the gap before each
-    child verbatim and emitting the child's stub (its already-generated doc plus header) in its place.
+    The definition's own header and loose body code are kept verbatim, but each direct child is collapsed to its already-generated JSDoc block plus its header line(s). Generation runs deepest-first, so every child's doc exists by the time its parent is assembled - the parent's prompt is informed by child documentation without re-sending child code.
 
     Parameters:
-    - `info_by_id`: A dictionary mapping node IDs to `DefInfoJS` objects.
-    - `source_lines`: A chunk of source code lines.
-    - `node_id`: The ID of the node for which to assemble the snippet.
-    - `docs_by_id`: A dictionary mapping node IDs to their corresponding JSDoc comments.
+    - `info_by_id`: Map from `id()` of a definition's node to its `DefInfoJS`.
+    - `source_lines`: The pristine source lines of the file.
+    - `node_id`: The `id()` of the definition to assemble.
+    - `docs_by_id`: Docs generated so far, keyed by `id()` of each node.
 
     Returns:
-    - A string representing the assembled snippet of JavaScript code.
+    - The assembled snippet text for the definition.
     """
 
+    # Collect the routine's header and its direct children, sorted so one forward cursor can walk the body.
     info = info_by_id[node_id]
-
     header_text = _get_text_for_lines(source_lines, info.header_start, info.header_end)
     body_chunks: List[str] = []
-
     direct_children = [info_by_id[cid] for cid in info.children_ids]
     direct_children.sort(key=lambda d: d.start)  # body order: the forward cursor splices gap, stub, gap, stub...
-
     cursor = info.header_end + 1
+
+    # Each child is reduced to its JSDoc plus header line - bodies are dropped to keep the parent's snippet small.
     for child in direct_children:
         if cursor <= child.start - 1:
             body_chunks.append(_get_text_for_lines(source_lines, cursor, child.start - 1))
-        # child stub. In the common brace-on-signature-line style the body block starts on the header line, making
-        # `header_end` come out as `header_start - 1`; clamp so the stub still carries the signature line.
         hdr_end = max(child.header_end, child.header_start)
         header_last_line = source_lines[hdr_end - 1] if 1 <= hdr_end <= len(source_lines) else ""
         indent = " " * _leading_spaces_count(header_last_line)
@@ -1506,14 +1504,17 @@ def assemble_snippet_for_js(
         body_chunks.append(jsdoc_block + ("\n" if jsdoc_block and child_header else "") + child_header)
         cursor = child.end + 1
 
+    # Flush any code remaining after the last child.
     if cursor <= info.end:
         body_chunks.append(_get_text_for_lines(source_lines, cursor, info.end))
-
     parts: List[str] = [header_text]
+
+    # Guard against gluing the body straight onto a header that lacks a trailing newline.
     if body_chunks:
         if header_text and not header_text.endswith("\n"):
             parts.append("\n")
         parts.append("\n".join(ch for ch in body_chunks if ch))
+
     return "".join(parts)
 
 
@@ -1533,50 +1534,47 @@ def generate_comments_js(
     verifier=None,
 ) -> Dict[int, str]:
     """
-    Generate JSDoc content for JS definitions in a deepest-first order, ensuring parents see child stubs.
+    Generate a JSDoc body for every JavaScript definition, deepest-first.
 
-    This function orchestrates the generation of JSDoc comments for JavaScript definitions by:
-
-    1.  Assembling snippets of code for each definition.
-    2.  Prompting the LLM to generate documentation comments for these snippets.
-    3.  Processing the LLM output to extract the first comment block.
-    4.  Storing the generated comments in dictionaries keyed by qualification name and node ID.
+    Each definition is shown to the model as its header plus a body in which direct children are collapsed to their already-generated docs. Existing comments are ingested and updated rather than discarded, callee notes are appended when a provider is given, and every generation turn is popped from `messages` afterwards so the shared context never grows. When a verifier is supplied each doc must pass it; a doc that fails twice is still written but flagged for review, and a routine whose generation fails outright receives a visible placeholder.
 
     Parameters:
-        - `llm`: The LocalChatModel instance used to interact with the LLM.
-        - `cfg`: The GenerationConfig instance containing configuration settings.
-        - `messages`: A list of messages exchanged with the LLM.
-        - `defs`: A list of DefInfoJS instances representing JavaScript definitions.
-        - `source_blob`: The source code as a string.
-        - `source_lines`: A Chunk object containing the source code lines.
+    - `llm`: The local chat model used for generation.
+    - `cfg`: Generation settings for each turn.
+    - `messages`: The primed chat history; restored to its original length after every turn.
+    - `defs`: All definitions discovered in the file.
+    - `source_blob`: The full source text.
+    - `source_lines`: The pristine source lines used for snippet assembly.
+    - `doc_order`: Optional qualname ordering that overrides the deepest-first default.
+    - `callee_context`: Optional callback returning project-level notes about a routine's callees.
+    - `on_doc`: Optional callback invoked with each qualname and doc as it is produced.
+    - `verifier`: Optional verification floor applied to every generated doc.
 
     Returns:
-        - A dictionary mapping qualification names to generated JSDoc comments.
+    - A dict mapping `id()` of each definition's node to its generated doc text.
     """
 
     docs_by_node_id: Dict[int, str] = {}
     info_by_id: Dict[int, DefInfoJS] = {id(d.node): d for d in defs}
 
-    # Default order is deepest-first (children before parents, so a parent sees its child stubs). A call-graph
-    # `doc_order` overrides it (callees/children first), still keeping children ahead of parents via the fallback key.
+    # Deepest-first by default, so a child's doc always exists before its parent's snippet is assembled; a call-graph order can override this.
     if doc_order:
         ordered = apply_doc_order(defs, lambda d: d.qualname, doc_order, lambda d: (-d.depth, d.start, -d.end))
     else:
         ordered = deepest_first_js(defs)
 
+    # Build the definition's snippet with child bodies collapsed to their docs, then crop it to the model's context budget.
     for info in ordered:
         node_id = id(info.node)
         snippet = assemble_snippet_for_js(info_by_id, source_lines, node_id, docs_by_node_id)
-
-        # Elide the body if this routine is too large for the context window (the patch is unaffected).
         header_lines = max(1, info.header_end - info.header_start + 1)
         snippet, omitted = fit_snippet(llm, cfg, messages, snippet, header_lines, MARKER_JS)
         if omitted:
             echo(f"[JS] Elided {omitted} body line(s) from '{info.qualname}' to fit the context window")
-
         echo("\n[JS] Snippet...\n")
         echo(snippet)
 
+        # Classes get a dedicated prompt: summarise the abstraction as a whole rather than parroting one method.
         if info.kind == "class":
             prompt = (
                 "Write exactly the documentation comment for this JavaScript class. "
@@ -1593,10 +1591,9 @@ def generate_comments_js(
                 f"{snippet}\n"
             )
 
-        # Ingest-and-update: a JS doc comment sits ABOVE the header, outside the snippet, so surface the routine's own
-        # existing doc as a seed - the model keeps what is still accurate and updates what is stale, rather than
-        # re-deriving the contract blind (the routine-level analogue of the --file-doc description seed).
         existing = _doc_above_header_js(source_lines, info.header_start)
+
+        # Ingest-and-update: an existing comment is fed back so accurate institutional knowledge survives the rewrite.
         if existing:
             prompt += (
                 "\nThe routine is already documented as follows. Ingest and update this existing comment - keep "
@@ -1604,25 +1601,38 @@ def generate_comments_js(
                 f"than writing from scratch:\n\n{existing}\n"
             )
 
-        # Inject the one-line contracts of the routines this one calls (call-graph context).
+        # Fold in project-layer notes about this routine's callees, when a provider was supplied.
         if callee_context is not None:
             notes = callee_context(info.qualname)
             if notes:
                 prompt += "\n" + notes + "\n"
 
+        # The generation turn is popped straight after the reply - the shared history never grows.
         messages.append({"role": "user", "content": prompt})
         reply = llm.generate(messages, cfg=cfg)
         echo(f"\n[JS] LLM output:\n\n{reply}")
         messages.pop()
-
         doc = _extract_first_comment_block(reply)
+
+        # last_reply is a one-cell list so the retry closure can swap in each newer reply.
         if doc and verifier is not None:
-            # Verification (the quality floor): the grounding gate + grounding challenge, each allowing one
-            # corrective regeneration in this routine's own context (snippet -> previous answer -> feedback).
             last_reply = [reply]
 
             def regenerate(feedback: str, _prompt: str = prompt) -> str:
-                """Regenerate the comment with reviewer feedback; '' when the retry is unusable."""
+                """
+                Regenerate the doc-comment in response to verification feedback.
+
+                Replays the original prompt and the previous reply, appends the feedback as a fresh user turn, then pops all three so the shared history is left untouched. A successful extraction becomes the new previous reply for any further round.
+
+                Parameters:
+                - `feedback`: The verifier's complaint for the model to address.
+                - `_prompt`: The original generation prompt, bound at definition time.
+
+                Returns:
+                - The regenerated comment text, or an empty string if no comment block could be extracted.
+                """
+
+                # Replay the prompt, the previous reply, and the feedback as a throwaway exchange - all three turns are popped before returning.
                 messages.append({"role": "user", "content": _prompt})
                 messages.append({"role": "assistant", "content": last_reply[0]})
                 messages.append({"role": "user", "content": feedback})
@@ -1633,16 +1643,20 @@ def generate_comments_js(
                 if not d:
                     return ""
                 last_reply[0] = retry
+
                 return d
 
             doc, ok = verifier.verify_def(snippet, doc, regenerate, label=info.qualname)
+
+            # Verification failure is non-fatal: the doc is still written, but flagged for human review.
             if not ok:
                 error(f"[verify] '{info.qualname}': comment failed verification twice; writing it anyway - "
                       f"review this comment")
+
+        # Record a visible placeholder rather than skipping the routine, then feed the doc to the run-level store.
         if not doc:
             doc = f"{info.kind} `{info.qualname}` - documentation generation failed."
         docs_by_node_id[node_id] = doc
-        # Publish this routine's freshly-generated contract for later callers.
         if on_doc is not None:
             on_doc(info.qualname, doc)
 
@@ -1654,41 +1668,52 @@ def generate_comments_js(
 
 def _scan_existing_comment_block_above(source_lines: Chunk, header_start_line_1b: int) -> Optional[Tuple[int, int]]:
     """
-    Detect an existing comment block immediately above the header.
+    Locate any existing comment block sitting directly above a definition header.
 
-    This function scans the source code lines above the specified header start line to identify either:
-    - a block comment '/* ... */' whose last line ends just above the header, or
-    - a contiguous run of '//' lines immediately above the header (no blank line).
+    Recognises either a `/* ... */` block whose closing line is immediately above the header, or an unbroken run of `//` line comments touching it; a blank line breaks adjacency, so detached comments are never claimed.
 
-    Returns a tuple containing the start and end line numbers of the existing comment block, or `None` if no such block is found.
+    Parameters:
+    - `source_lines`: The lines of the file being patched.
+    - `header_start_line_1b`: The 1-based line number of the definition header.
+
+    Returns:
+    - A 1-based inclusive `(start, end)` line range for the existing block, or `None` if there is none.
     """
 
+    # Bail out when the header sits on the first line - there is nothing above it.
     i = header_start_line_1b - 2  # zero-based line just above header
     if i < 0:
         return None
 
-    # Case A: block comment ending above
+    # A line ending in */ directly above means a block comment owns the slot.
     if source_lines[i].rstrip().endswith("*/"):
         j = i
+
+        # Walk upwards to the matching /* opener; the whole block becomes the replace range.
         while j >= 0:
             if source_lines[j].lstrip().startswith("/*"):
                 return (j + 1, i + 1)
             j -= 1
-        # malformed; fall through
 
-    # Case B: contiguous '//' lines
+    # Otherwise look for an unbroken run of // line comments touching the header.
     j = i
     saw_slash = False
+
     while j >= 0:
         stripped = source_lines[j].lstrip()
+
         if stripped.startswith("//"):
             saw_slash = True
             j -= 1
             continue
+
+        # A blank line (or any code) ends the run - only comments adjacent to the header count.
         if stripped == "":
             break  # blank breaks adjacency
         break
+
     if saw_slash:
+        # The loop overshoots by one line, so +2 converts back to the 1-based first comment line.
         start_1b = j + 2
         return (start_1b, i + 1)
 
@@ -1698,39 +1723,36 @@ def _scan_existing_comment_block_above(source_lines: Chunk, header_start_line_1b
 def patch_comments_textually_js(source_lines: Chunk, defs: List[DefInfoJS], doc_map: Dict[int, str],
                                 style: str = "block") -> Chunk:
     """
-    Insert or replace documentation blocks for each JS definition.
+    Insert or replace a comment block above each documented definition.
 
-    This function iterates over the definitions in a deepest-first order and inserts or replaces
-    documentation blocks above their corresponding headers. If an existing block comment or contiguous
-    '//' block is found immediately above the header, it is replaced with a new JSDoc block. Otherwise,
-    a new JSDoc block is inserted immediately above the header.
+    Definitions are patched bottom-up so insertions never invalidate the line numbers of those still to be processed. A comment block already sitting against a header is replaced in place; otherwise the new block is inserted with a separating blank line. Indentation is copied from the header line, and definitions absent from `doc_map` are left untouched.
 
     Parameters:
-    - `source_lines`: The input source code as a list of lines.
-    - `defs`: A list of `DefInfoJS` objects representing the definitions to be processed.
-    - `doc_map`: A dictionary mapping definition names to their corresponding documentation strings.
-    - `style`: `"block"` to render each doc as a `/** ... */` JSDoc block (default) or `"line"` to render it as `//`
-      line comments (chosen to match the file's prevailing doc-comment convention; see `_detect_doc_style_js`).
+    - `source_lines`: The pristine source lines.
+    - `defs`: The definitions discovered in the file.
+    - `doc_map`: Doc text keyed by `id()` of each definition's node.
+    - `style`: `"line"` for `//` comments, anything else for JSDoc blocks.
 
     Returns:
-    - The modified source code with inserted or replaced documentation blocks.
+    - A new list of lines with the comments applied; the input list is not modified.
     """
 
+    # Pick the renderer matching the file's comment style, and patch a copy - never the input.
     render = _render_js_line_comment if style == "line" else _render_jsdoc_block
     out_lines = source_lines[:]
 
+    # Patch bottom-up so earlier insertions cannot shift the line numbers of definitions still to come.
     for info in sorted(defs, key=lambda d: d.start, reverse=True):
         node_id = id(info.node)
         if node_id not in doc_map:
             continue
         doc = doc_map[node_id]
-
         header_line_text = source_lines[info.header_start - 1]
         indent = header_line_text[: len(header_line_text) - len(header_line_text.lstrip())]
-
         new_block_lines = render(doc, indent)
-
         existing = _scan_existing_comment_block_above(out_lines, info.header_start)
+
+        # Replace an existing comment block in place; otherwise insert the new block with a separating blank line.
         if existing:
             s_1b, e_1b = existing
             out_lines[s_1b - 1: e_1b] = new_block_lines
@@ -1756,49 +1778,40 @@ def generate_language_comments(
     verifier=None,
 ) -> Chunk:
     """
-    Generate JSDoc comments for a JavaScript source code chunk.
+    Run the full JavaScript definition pass and return the patched lines.
 
-    This function orchestrates the end-to-end process of generating JSDoc comments for a given JavaScript source code:
-
-    1. Parse the JavaScript source using Tree-sitter.
-    2. Collect information about definition-like constructs (e.g., functions, classes, methods, variables) in the source code.
-    3. Generate JSDoc comments for each definition using a large language model (LLM), following a deepest-first order to ensure
-       that parent definitions see child stubs.
-    4. Textually patch the source code by inserting or replacing existing comment blocks above headers with the generated JSDoc comments.
+    This is the shared per-language entry point: it parses the source with Tree-sitter, matches the file's existing doc-comment style, primes the chat by describing the imports, generates a JSDoc body for every definition, and finally patches the comments into the pristine source lines.
 
     Parameters:
-    - `llm`: The local chat model used for generating JSDoc comments.
-    - `cfg`: The generation configuration.
-    - `messages`: The messages object.
-    - `source_blob`: The JavaScript source code as a string.
-    - `source_lines`: The source code chunk.
-    - `doc_order`/`callee_context`/`on_doc`: Optional call-graph hooks (see `generate_comments_js`); absent, behaviour
-      is unchanged.
+    - `llm`: The local chat model used for generation.
+    - `cfg`: Generation settings for each turn.
+    - `messages`: The primed chat history shared across the run.
+    - `source_blob`: The full source text handed to the parser.
+    - `source_lines`: The pristine source lines that patching works from.
+    - `doc_order`: Optional qualname ordering from the project call graph.
+    - `callee_context`: Optional callback returning notes about a routine's callees.
+    - `on_doc`: Optional callback invoked with each qualname and doc produced.
+    - `verifier`: Optional verification floor passed through to generation.
 
     Returns:
-    - The updated source code chunk with generated JSDoc comments.
+    - The source lines with doc comments inserted or updated.
     """
 
     echo("Parsing JavaScript source with Tree-sitter...")
     tree, source_bytes = _parse_js(source_blob)
     defs = iter_defs_with_info_js(tree, source_bytes)
     echo(f"Found {len(defs)} JS definitions")
-
-    # Match the file's prevailing doc-comment convention (a file whose docs are `//` should not be given `/** */`
-    # JSDoc blocks); the leading banner is ignored, and a mix prefers the block form.
     style = _detect_doc_style_js(tree, source_bytes)
     echo(f"Doc-comment style for this file: {style}")
-
-    # Provide a list of imports/requires to the LLM (if there are any)
     echo("Identifying imports/requires...")
     describe_imports_js(llm, cfg, messages, tree, source_bytes)
-
     echo("Generating JSDoc comments...\n")
     doc_map = generate_comments_js(llm, cfg, messages, defs, source_blob, source_lines,
                                    doc_order=doc_order, callee_context=callee_context, on_doc=on_doc,
                                    verifier=verifier)
-
     echo("Applying JS patches...\n")
+
+    # Patching works from the pristine source lines, never from anything the model emitted.
     return patch_comments_textually_js(source_lines, defs, doc_map, style=style)
 
 
@@ -1807,52 +1820,52 @@ def generate_language_comments(
 
 def _js_span_hash(source_lines: Chunk, header_start: int, end: int) -> str:
     """
-    Hash a JS routine's `header_start..end` span over its CODE lines only - the manifest re-binding identity.
+    Hash a JavaScript routine's source span for manifest re-binding.
 
-    Unlike C (which hashes the verbatim span), JS has nested definitions: applying a nested function's JSDoc inserts
-    comment lines INSIDE the parent's span, so a verbatim hash taken at emit would no longer match at apply time.
-    Stripping blank and pure-comment lines first (the same normalisation as the code-preservation guard) makes the
-    identity invariant to every edit SCALE can make - doc blocks, block comments, paragraphing blanks - while any
-    genuine code change still changes it. All four hash sites (the def recording, the block provider's `sig`, and
-    both apply re-derivations) share this one function; a mismatch would silently split a routine into two requests.
+    The span is reduced to its comment-stripped code signature before hashing, so a routine still matches its manifest answer after comments are inserted or rewritten around it.
 
     Parameters:
-    - `source_lines`: The source split into lines.
-    - `header_start`/`end`: The routine's 1-based inclusive span.
+    - `source_lines`: The full file as a list of lines.
+    - `header_start`: 1-based line number of the routine's header.
+    - `end`: 1-based inclusive line number of the routine's last line.
 
     Returns:
-    - A short hex digest.
+    - The hex digest string identifying the routine's code.
     """
 
+    # Late import avoids a circular dependency; the slice bounds are 1-based and inclusive.
     from scale_blocks import _code_signature
     span = source_lines[header_start - 1:end]
+
+    # Hash only the comment-stripped signature so inserting docs cannot break later re-binding.
     return routine_text_hash("\n".join(_code_signature(span, SLASH_BLOCK_STYLE)))
 
 
 def collect_def_requests_js(source_blob: str, source_lines: Chunk, escalation) -> int:
     """
-    Record every JS definition as a deferred doc-comment request (the online emit phase) - model-free.
+    Record one manifest def request for every JavaScript routine in the file.
 
-    Every definition-like construct `iter_defs_with_info_js` finds - functions, classes, methods, and function/arrow
-    bindings - is recorded with its verbatim `header_start..end` span as the snippet and the span's code-line hash
-    (`_js_span_hash`) as the re-binding identity. That convention is shared with `iter_block_targets_js`'s `sig` and
-    both apply re-derivations.
+    Each routine's verbatim text crosses into the manifest once, keyed by qualname and comment-stripped span hash so the apply phase can re-bind answers to unchanged code.
 
     Parameters:
-    - `source_blob`: The complete source text (parsed with Tree-sitter JavaScript).
-    - `source_lines`: The same source split into individual lines.
-    - `escalation`: The `scale_escalate.Escalation` collector for this target file.
+    - `source_blob`: The full source text.
+    - `source_lines`: The same source as a list of lines.
+    - `escalation`: The run-manifest collector that receives the def requests.
 
     Returns:
-    - The number of definitions recorded.
+    - The number of routines recorded.
     """
 
     tree, source_bytes = _parse_js(source_blob)
     defs = iter_defs_with_info_js(tree, source_bytes)
+
+    # Key each routine by its comment-stripped span hash so the apply phase can re-bind answers to unchanged code.
     for info in defs:
         span = _get_text_for_lines(source_lines, info.header_start, info.end)
         escalation.record_def(qualname=info.qualname, kind=info.kind,
                               sig_hash=_js_span_hash(source_lines, info.header_start, info.end), snippet=span)
+
+    # The count feeds the manifest completeness counter.
     return len(defs)
 
 
@@ -1861,59 +1874,56 @@ def collect_def_requests_js(source_blob: str, source_lines: Chunk, escalation) -
 
 def _clean_js_comment_answer(text: str) -> str:
     """
-    Strip any code fence or comment delimiters a stronger model wrapped a JS answer in, leaving bare prose.
+    Normalise a model's JavaScript comment reply to bare prose.
 
-    The patcher renders the comment in the file's own doc style, so the answer must be the comment body alone.
+    Strips any surrounding Markdown code fence, then removes `//` or `/* ... */` comment delimiters if the model answered in comment syntax, leaving only the comment text for later re-wrapping.
 
     Parameters:
-    - `text`: The raw answer from the manifest.
+    - `text`: The raw model reply, possibly fenced or formatted as a JS comment.
 
     Returns:
-    - The cleaned comment body (may be empty).
+    - The cleaned comment body; may be an empty string.
     """
 
+    # Models often fence their reply; unwrap a single whole-body Markdown fence first.
     body = (text or "").strip()
     fence = re.match(r"^```[^\n]*\n(.*)\n```$", body, flags=re.DOTALL)
     if fence:
         body = fence.group(1).strip()
+
+    # Accept replies already written as // or /* */ comments, reducing them to bare prose for re-wrapping.
     if body.startswith("/*") or body.startswith("//"):
         if body.startswith("//"):
-            # A `//` run: strip the leading slashes from each line.
             body = "\n".join(ln.strip()[2:].strip() if ln.strip().startswith("//") else ln.strip()
                              for ln in body.split("\n")).strip()
         else:
             body = _extract_first_comment_block(body)
+
     return body.strip()
 
 
 def apply_manifest_js(source_lines: Chunk, manifest: dict) -> Chunk:
     """
-    Patch a stronger model's answers from a manifest into JavaScript source (the model-free apply phase for JS).
+    Apply a filled run manifest's answers to JavaScript source lines.
 
-    Each request is re-bound to its routine by `(qualname, span hash)` - the comment/blank-invariant code-line hash
-    of the routine's `header_start..end` span (`_js_span_hash`), which survives both the line shifts between emit and
-    apply and the JSDoc blocks this very phase inserts inside a parent's span for its nested definitions. Definition
-    docs are patched first (rendered in the file's prevailing doc style); then the text is re-parsed and the block
-    answers placed by boundary index, exactly as the Python/C applies do. Everything goes through the same
-    insertion-only patchers and code-preservation guard as the local passes.
+    Def answers are re-bound to routines by qualname plus comment-stripped span hash, so docs only attach to code unchanged since emit. Block answers become insertion-only edits, and a routine's edits are kept only if the preservation guard proves the code byte-identical; unmatched or unanswered requests leave their routines untouched.
 
     Parameters:
-    - `source_lines`: The emit-phase source split into individual lines.
-    - `manifest`: The parsed manifest dictionary, with this file's requests' `answer` slots filled in.
+    - `source_lines`: The current source as a list of lines.
+    - `manifest`: The filled manifest dictionary holding the `requests` list.
 
     Returns:
-    - The fully annotated source split into individual lines.
+    - The patched list of source lines.
     """
 
+    # Split the manifest into def and block requests; the two phases patch the same running line list in turn.
     from scale_blocks import SLASH_LINE_STYLE, _apply_edits, code_preserved, _parse_comment_reply
-
     requests = manifest.get("requests", [])
     def_reqs = [r for r in requests if r.get("def") is not None]
     block_reqs = [r for r in requests if r.get("blocks") is not None]
-
     out_lines = source_lines
 
-    # ---- 1. Definition answers (a doc block above each header, in the file's own style) ----
+    # Def phase: re-parse the current text, detect the file's existing doc style, and index answered requests by qualname plus span hash.
     if def_reqs:
         tree, sb = _parse_js("\n".join(out_lines))
         records = iter_defs_with_info_js(tree, sb)
@@ -1922,39 +1932,55 @@ def apply_manifest_js(source_lines: Chunk, manifest: dict) -> Chunk:
         doc_map: Dict[int, str] = {}
         used: set = set()
         matched: List[DefInfoJS] = []
+
+        # Re-bind by recomputing each routine's comment-stripped hash; a miss means the code changed since emit.
         for info in records:
             key = (info.qualname, _js_span_hash(out_lines, info.header_start, info.end))
             req = wanted.get(key)
             if req is None or key in used:
                 continue
             answer = req["def"].get("answer")
+
+            # An empty answer leaves the routine untouched rather than splicing a blank doc.
             if not answer or not str(answer).strip():
                 echo(f"[apply] Def request '{req['id']}' has no answer; leaving the definition untouched")
                 continue
+
             doc = _clean_js_comment_answer(str(answer))
+
+            # A literal NONE reply is the model declining; marking the key used stops duplicate spans matching twice.
             if doc and doc.upper() != "NONE":
                 doc_map[id(info.node)] = doc
                 used.add(key)
                 matched.append(info)
+
+        # All accepted docs go in via one insertion-only textual patch.
         out_lines = patch_comments_textually_js(out_lines, matched, doc_map, style=style)
 
-    # ---- 2. Block answers (re-parse so spans/boundaries reflect the inserted doc blocks) ----
+    # Block phase: re-enumerate targets against the already def-patched text so boundary line numbers are current.
     if block_reqs:
         targets = iter_block_targets_js("\n".join(out_lines), out_lines)
         by_key = {(t.qualname, t.sig): t for t in targets}
-
         all_edits: List[Tuple[int, Optional[str], str]] = []
+
+        # Re-bind each block request to its current target by qualname and signature hash.
         for req in block_reqs:
             target = by_key.get((req["qualname"], req["sig_hash"]))
             chunks = req["blocks"].get("chunks", [])
+
+            # A missing target means the routine changed since emit; skip rather than guess a placement.
             if target is None:
                 echo(f"[apply] No match for block request '{req['id']}'; skipping")
                 continue
+
+            # A wholly unanswered request is left alone so partially filled manifests stay harmless.
             if all(c.get("answer") is None for c in chunks):
                 echo(f"[apply] Block request '{req['id']}' has no answers; leaving routine untouched")
                 continue
 
             edits: List[Tuple[int, Optional[str], str]] = []
+
+            # Map each chunk's index to the target's current boundary line; out-of-range indices are dropped silently.
             for chunk in chunks:
                 bidx = chunk["bidx"]
                 if not (0 <= bidx < len(target.boundary_lines)):
@@ -1963,13 +1989,16 @@ def apply_manifest_js(source_lines: Chunk, manifest: dict) -> Chunk:
                 comment = _parse_comment_reply(chunk.get("answer") or "", SLASH_LINE_STYLE)
                 edits.append((boundary, comment, target.indent_of.get(boundary, "")))
 
-            # Per-routine guard: keep this routine's edits only if simulating them preserves its code.
+            # Trial-apply this routine's edits in isolation so the guard can vet them.
             trial = _apply_edits(out_lines, edits, SLASH_LINE_STYLE)
+
+            # Keep the edits only if the guard proves the code byte-identical; otherwise the whole routine's edits are dropped.
             if code_preserved(out_lines, trial, SLASH_LINE_STYLE):
                 all_edits.extend(edits)
             else:
                 echo(f"[apply] Skipped '{req['qualname']}': block edit would alter code; keeping original")
 
+        # Apply every vetted edit in one batch so boundary line numbers stay valid.
         out_lines = _apply_edits(out_lines, all_edits, SLASH_LINE_STYLE)
 
     return out_lines

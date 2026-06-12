@@ -11,19 +11,20 @@ Unless required by applicable law or agreed to in writing, software distributed 
 "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
 language governing permissions and limitations under the License.
 
-The language-agnostic engine for SCALE's file-level header doccomment pass (`--file-doc`).
+The engine behind SCALE's top-of-file description pass. `annotate_file_doc` runs the offline flow over one file: a
+classification turn decides which existing header lines form the current description, the summary provider writes the
+new prose (updating the old text rather than starting from nothing), and `splice_description` performs the edit -
+replacing the classified range in place, extending the surviving comment block, or opening a fresh one.
 
-A source file's existing header often mixes a shebang, copyright/author boilerplate, license text, and a prose
-description of what the file does. Only the description should be (re)written; everything else - especially the license -
-must survive byte-for-byte. Telling those apart is genuine judgement, so the local model is used to *classify* which line
-range is the description, but it is never trusted to re-emit the preserved text: a deterministic patcher slices every
-kept line from the original source and only ever inserts or replaces comment lines. Two independent safety nets back the
-classification up - a license-keyword veto (`looks_legal`) that refuses to overwrite anything legal-looking, and a
-preservation guard (`file_doc_preserved`) that turns any edit which would touch code into a no-op.
+The model only classifies and writes; safety lives in the deterministic machinery around it. `looks_legal` vetoes any
+range that resembles licence or legal boilerplate, `_sanitise_description` strips fences and comment markup from the
+model's prose, and `file_doc_preserved` proves the splice changed nothing but comment and blank lines before the edit
+is accepted.
 
-The per-language adapter (e.g. `scale_c.file_doc_target_c`) supplies a `FileDocTarget` describing the leading-comment
-zone - which may span several contiguous blocks - and the slots where a description can be replaced, appended, or freshly
-inserted. The engine here orchestrates the two model turns (classify, then generate) and the single guarded splice.
+The module also carries the online `scale-filedoc` round: building, writing, reading and completeness-checking the
+filedoc manifest, plus `apply_filedoc_entry`, which re-binds each answer to the live header zone by content and
+applies it through the same guarded splice. `scan_brace_leading_zone` supplies the shared header-zone scanner for the
+brace languages.
 """
 
 from __future__ import annotations
@@ -83,16 +84,13 @@ LICENSE_MARKERS: Tuple[str, ...] = (
 
 def looks_legal(text: str) -> bool:
     """
-    Report whether a line of header text looks like legal/license boilerplate that must not be rewritten.
-
-    A case-insensitive substring match against `LICENSE_MARKERS`. This is the deterministic safety net behind the
-    model's classification: even if the model labels a legal line as "description", this veto keeps it untouched.
+    Heuristically decide whether text looks like licence or legal boilerplate.
 
     Parameters:
-    - `text`: The candidate header line (delimiters already stripped, or not - matching is substring-based).
+    - `text`: The candidate text to test.
 
     Returns:
-    - True if the text contains any known license/legal marker.
+    - `True` if any known licence marker appears in the text (case-insensitively), otherwise `False`.
     """
 
     low = text.lower()
@@ -101,32 +99,22 @@ def looks_legal(text: str) -> bool:
 
 @dataclass
 class FileDocTarget:
+
     """
-    A language-neutral description of a file's leading-comment zone and where its description can be edited.
+    Placement plan for a file's top-of-file description.
 
-    The per-language adapter builds this; the engine consumes it. The leading zone may span several contiguous comment
-    blocks (blank-separated, with no intervening code) - they are gathered together so the description can be found and
-    updated wherever it sits.
-
-    Fields:
-    - `eligible`: The description-candidate comment lines, in order, as `(lineno_1b, prefix, inner)` tuples. `prefix` is
-      the exact leading decoration of the raw line (indent + comment delimiter + spacing, e.g. `" * "` or `"// "`);
-      `inner` is the remaining text. Only pure-content comment lines are eligible - block open/close delimiters,
-      single-line `/* ... */` comments, and blank continuation lines are excluded (and thus always preserved).
-    - `insert_index`: 0-based line index at which a fresh or appended description should be inserted.
-    - `insert_prefix`: The per-line decoration prefix to use when appending into an existing block (ignored when
-      `insert_fresh` is set).
-    - `insert_fresh`: When True, render a brand-new comment block (delimiters and all) via `style` at `insert_index`;
-      when False, append plain `insert_prefix`-decorated lines into an existing block.
-    - `style`: The language `CommentStyle` used to render a fresh block. For Python this is `PYTHON_DOC_STYLE`, which
-      renders a triple-quoted module docstring rather than a comment.
-    - `indent`: Leading whitespace for a freshly inserted block (usually empty at file scope).
-    - `has_zone`: Whether the file already has a leading-comment zone at all.
-    - `preserved`: Optional language-specific preservation guard `(old, new, start, removed, added) -> bool`. When set,
-      the engine uses it instead of the default line-comment `file_doc_preserved` (Python supplies a parse-based guard,
-      since a module docstring's content lines are not recognisable as comments line-by-line).
+    Parameters:
+    - `eligible`: Existing description candidates as `(line number, comment prefix, text)` triples.
+    - `insert_index`: 0-based line index at which a fresh description is spliced in.
+    - `insert_prefix`: Comment prefix to reuse when extending an existing comment block.
+    - `insert_fresh`: `True` to open a brand-new comment block rather than extend one.
+    - `style`: The language's comment style; `None` means no safe target was found.
+    - `indent`: Indentation applied to a freshly inserted block.
+    - `has_zone`: Whether the file already has a recognised header comment zone.
+    - `preserved`: Optional override for the preservation guard used to vet the splice.
     """
 
+    # eligible rows are (line number, comment prefix, text) triples describing the existing header lines.
     eligible: List[Tuple[int, str, str]] = field(default_factory=list)
     insert_index: int = 0
     insert_prefix: str = ""
@@ -145,25 +133,27 @@ PYTHON_DOC_STYLE = CommentStyle(line_prefix="", block_open='"""', block_cont="",
 
 def _parse_classify_range(reply: str, n: int) -> Optional[Tuple[int, int]]:
     """
-    Parse the classify turn's reply into a 1-based inclusive range over the `n` eligible entries.
+    Parse a classifier reply into a 1-based inclusive line range.
 
-    Accepts `START-END`, a single number, or NONE/empty. The range is clamped to `[1, n]` and rejected if inverted.
+    Accepts ranges such as `3-7` or `3 to 7`, or a single line number, tolerating surrounding prose; both ends are clamped to `1..n`.
 
     Parameters:
-    - `reply`: The model's raw reply.
-    - `n`: The number of eligible entries shown to the model.
+    - `reply`: The raw model reply naming the description lines.
+    - `n`: The number of eligible lines on offer.
 
     Returns:
-    - `(start, end)` 1-based inclusive, or None when there is no usable range.
+    - A `(start, end)` tuple of 1-based inclusive indices, or `None` if the reply names no usable range.
     """
 
+    # An empty or none-style reply is the model declining: there is no description block to report.
     if n <= 0:
         return None
     text = reply.strip().lower()
     if not text or text.startswith("none"):
         return None
-
     m = re.search(r"(\d+)\s*(?:-|to|–)\s*(\d+)", text)
+
+    # Fall back to a lone number when the reply names a single line rather than a range.
     if m:
         start, end = int(m.group(1)), int(m.group(2))
     else:
@@ -172,6 +162,7 @@ def _parse_classify_range(reply: str, n: int) -> Optional[Tuple[int, int]]:
             return None
         start = end = int(m.group(0))
 
+    # Clamp both ends into 1..n; a range still inverted after clamping is treated as no answer.
     start = max(1, min(start, n))
     end = max(1, min(end, n))
     if end < start:
@@ -181,64 +172,67 @@ def _parse_classify_range(reply: str, n: int) -> Optional[Tuple[int, int]]:
 
 def _wrap(text: str, prefix: str) -> List[str]:
     """
-    Wrap description prose to the configured width, leaving room for the per-line decoration `prefix`.
+    Wrap description text into comment-width lines.
 
-    Blank lines in the input separate paragraphs and are preserved (rendered as empty strings, which the caller
-    decorates). Each non-blank paragraph is independently filled.
+    Paragraphs (separated by blank lines) are re-flowed individually with a blank entry between them; original line breaks within a paragraph are discarded, and words are never split.
 
     Parameters:
-    - `text`: The description prose (may contain blank-line-separated paragraphs).
-    - `prefix`: The decoration that will be prepended to each output line (its length reduces the wrap width).
+    - `text`: The raw description text.
+    - `prefix`: The comment prefix the lines will sit behind; its length reduces the wrap width.
 
     Returns:
-    - The wrapped lines (without the prefix applied).
+    - The wrapped lines; never empty (a single empty string when the text is blank).
     """
 
+    # Guarantee at least 40 columns of text even when the comment prefix is long.
     width = max(40, WRAP_WIDTH - len(prefix))
     out: List[str] = []
     paragraphs = re.split(r"\n\s*\n", text.strip())
+
+    # Re-flow each paragraph from scratch: the text's original line breaks are deliberately discarded.
     for i, para in enumerate(paragraphs):
         if i:
             out.append("")                       # blank line between paragraphs
         collapsed = " ".join(para.split())
         if collapsed:
-            # Never split hyphenated words: the reword matcher relocates this text by whitespace-collapsed
-            # comparison, and a "role-" / "based" break re-joins as "role- based", which no longer matches.
             out.extend(textwrap.wrap(collapsed, width=width, break_on_hyphens=False, break_long_words=False))
+
+    # Never return an empty list, so callers can always build a comment block.
     return out or [""]
 
 
 def file_doc_preserved(old_lines: Chunk, new_lines: Chunk, start: int, removed: int, added: int,
                        style: CommentStyle) -> bool:
     """
-    Verify a single-region file-doc splice changed only comment/blank lines and left everything else byte-for-byte.
+    Check that a file-doc splice changed nothing but comment and blank lines.
 
-    The splice replaced `old_lines[start:start + removed]` with `added` new lines. This guard confirms three things:
-    the prefix before the region and the suffix after it are identical in both versions; every removed line was blank
-    or a pure comment (so no code was deleted); and every inserted line is blank or a pure comment (so no code was
-    introduced). Any failure means the edit must be abandoned.
+    The guard demands byte-for-byte equality outside the edited window, and that every non-blank line inside the window - in both the old and new text - is a comment in the given style.
 
     Parameters:
-    - `old_lines`: The original lines.
-    - `new_lines`: The candidate edited lines.
-    - `start`: 0-based start index of the spliced region.
-    - `removed`: Number of original lines removed at `start`.
-    - `added`: Number of new lines inserted at `start`.
-    - `style`: The language comment-style descriptor.
+    - `old_lines`: The source lines before the edit.
+    - `new_lines`: The source lines after the edit.
+    - `start`: 0-based index of the first edited line.
+    - `removed`: Number of lines removed from the old text.
+    - `added`: Number of lines added in the new text.
+    - `style`: The comment style used to recognise comment lines.
 
     Returns:
-    - True if the splice is safe (only comment/blank lines touched, code preserved).
+    - `True` if the edit is confined to comments and blank lines, otherwise `False`.
     """
 
+    # Everything outside the edited window must survive byte-for-byte.
     if old_lines[:start] != new_lines[:start]:
         return False
     if old_lines[start + removed:] != new_lines[start + added:]:
         return False
     region_old = old_lines[start:start + removed]
     region_new = new_lines[start:start + added]
+
+    # Inside the window, any non-blank line that is not a comment vetoes the edit.
     for ln in region_old + region_new:
         if ln.strip() and not _is_comment_line(ln, style):
             return False
+
     return True
 
 
@@ -249,26 +243,21 @@ def splice_description(
     description: str,
 ) -> Optional[Chunk]:
     """
-    Splice a file description into the leading zone - the model-free half of the file-doc pass.
+    Splice a file description into the source, guarded against touching anything but comments.
 
-    Three splice shapes: replace the `desc_range` lines in place (re-wrapped in the first line's decoration prefix);
-    insert a fresh comment block at the top (`desc_range` None and `insert_fresh`); or append into the existing block
-    (`desc_range` None, a zone with no description). The deterministic safety nets both run here: the license veto
-    refuses to overwrite any legal-looking line in the range, and the preservation guard (the target's own parse-based
-    guard for Python, the comment-line `file_doc_preserved` otherwise) turns any edit that would touch code into a
-    refusal. Both the offline pass and the online `--apply-filedoc` round go through this one function, so the guards
-    hold regardless of which model wrote the prose.
+    Three placements are supported: replacing an existing description range in place, opening a fresh comment block at the insertion point, or extending the surviving header comment under its own prefix. A range containing licence-like text is vetoed outright, and the result must pass the preservation guard or the edit is abandoned.
 
     Parameters:
-    - `source_lines`: The source split into lines (not mutated).
-    - `target`: The `FileDocTarget` from the language adapter (scanned from these same lines).
-    - `desc_range`: The 1-based inclusive range over `target.eligible` to replace, or None to insert/append.
-    - `description`: The description prose (sanitised here; comment delimiters/fences are stripped).
+    - `source_lines`: The pristine source lines to splice into.
+    - `target`: The placement plan (comment style, insertion point, eligible lines, optional guard override).
+    - `desc_range`: 1-based inclusive range into `target.eligible` naming the existing description, or `None` to insert anew.
+    - `description`: The new description text.
 
     Returns:
-    - The new lines, or None on refusal (no style, empty prose, legal veto, or guard failure).
+    - The new list of source lines, or `None` if the splice was vetoed or failed the guard.
     """
 
+    # Bail out early when there is no comment style to write in or nothing survives sanitisation.
     style = target.style
     if style is None:
         return None
@@ -276,16 +265,17 @@ def splice_description(
     if not description:
         return None
 
-    # Safety veto: refuse to overwrite any legal-looking line, regardless of how the range was classified.
+    # Licence veto: inspect the chosen range before rewriting anything.
     if desc_range is not None:
         lo, hi = desc_range
+
+        # A single legal-looking line anywhere in the range is enough to abandon the rewrite.
         if any(looks_legal(target.eligible[i - 1][2]) for i in range(lo, hi + 1)):
             echo("file-doc: the description range looks like license/legal text; leaving it untouched.")
             return None
 
-    # ---- Build the single splice. ----
+    # Replace the existing description in place, reusing its comment prefix so the block keeps its established look.
     if desc_range is not None:
-        # Replace the existing description lines in place, reusing the first line's decoration prefix.
         lo, hi = desc_range
         start_lineno = target.eligible[lo - 1][0]
         end_lineno = target.eligible[hi - 1][0]
@@ -294,11 +284,10 @@ def splice_description(
         removed = end_lineno - start_lineno + 1
         new_block = [f"{prefix}{ln}".rstrip() for ln in _wrap(description, prefix)]
     elif target.insert_fresh:
-        # No header (or no usable description and no block to extend): insert a fresh comment block at the top. We
-        # render the block form directly rather than via render_comment_lines, which would collapse a one-line
-        # description to a single line comment - a file header wants the block delimiters even when the prose is short.
         start = target.insert_index
         removed = 0
+
+        # No existing description: a fresh insert opens a brand-new comment block, otherwise the text rides under the surviving header's prefix.
         if style.block_open is not None:
             cont = style.block_cont or style.line_prefix
             body = _wrap(description, target.indent + cont)
@@ -311,23 +300,24 @@ def splice_description(
             body = _wrap(description, target.indent + style.line_prefix)
             new_block = [f"{target.indent}{style.line_prefix}{ln}".rstrip() for ln in body] + [""]
     else:
-        # A zone exists but has no description: append one into the existing block, after a blank separator line.
         start = target.insert_index
         removed = 0
         prefix = target.insert_prefix
         new_block = [prefix.rstrip()] + [f"{prefix}{ln}".rstrip() for ln in _wrap(description, prefix)]
 
+    # Build the candidate output; nothing is committed until the guard passes.
     out_lines = source_lines[:start] + new_block + source_lines[start + removed:]
 
-    # The guard is pluggable: brace languages use the line-comment `file_doc_preserved`; Python supplies a parse-based
-    # guard (its docstring content lines are not line-recognisable as comments).
+    # The target may supply its own preservation guard; otherwise the comment-only default applies.
     if target.preserved is not None:
         ok = target.preserved(source_lines, out_lines, start, removed, len(new_block))
     else:
         ok = file_doc_preserved(source_lines, out_lines, start, removed, len(new_block), style)
+
     if not ok:
         echo("file-doc: the edit would have altered code or preserved text; abandoning it.")
         return None
+
     return out_lines
 
 
@@ -344,40 +334,33 @@ def annotate_file_doc(
     on_description: Optional[Callable[[str], None]] = None,
 ) -> Chunk:
     """
-    Run the file-doc pass: classify the existing description (if any), then splice the file summary in as the header.
+    Run the file-doc pass over one brace-language file: classify its existing header, write a description, and splice it in.
 
-    The whole-file summary *is* the file description (see `scale.py`), so there is no separate generate turn - the
-    model only does a deterministic classify turn (when there are eligible header lines) to find which lines are the
-    existing description, then `summary_provider` returns the description prose (seeded with that existing text so the
-    author's wording is incorporated). The model never re-emits any preserved text; the result is applied as one
-    guarded splice, and if the guard rejects it the original lines are returned unchanged.
+    The model is used only to classify which header lines form the current description and (via `summary_provider`) to write the new prose; the actual edit is done by `splice_description`, so every untouched line is preserved byte-for-byte. A classified range that looks like license or legal text is vetoed and left alone, and the existing description (when found) is fed to the writer so it is updated rather than regenerated from nothing.
 
     Parameters:
-    - `llm`: A model exposing `generate`.
-    - `cfg`: The base generation configuration (cloned for the classify turn with a capped reply length).
-    - `base_messages`: The primed context (system prompt). Not mutated.
-    - `source_lines`: The source split into lines.
-    - `target`: The `FileDocTarget` from the language adapter.
-    - `summary_provider`: Callable taking the existing description text (or None) and returning the file-description
-      prose to insert. This is where the whole-file summary is produced/fetched.
-    - `language`: The language identifier, woven into the classify prompt.
-    - `classify_prompt`: Optional classify-prompt override (defaults to the built-in constant).
-    - `on_description`: Optional callback invoked with the (sanitised) description text after a SUCCESSFUL splice -
-      i.e. the exact prose now sitting in the header. The header-reword manifest records it as each file's draft,
-      which its model-free apply later re-finds by exact match.
+    - `llm`: The local chat model used for the classification turn.
+    - `cfg`: Generation settings; the classify turn runs with a reduced token cap and temperature.
+    - `base_messages`: The primed conversation that the classify turn is appended to.
+    - `source_lines`: The file's pristine source lines.
+    - `target`: The scanned header zone with its eligible lines and insertion point.
+    - `summary_provider`: Callback that produces the description text, given the existing description or `None`.
+    - `language`: Language name interpolated into the classify prompt.
+    - `classify_prompt`: Optional override for the classification prompt template.
+    - `on_description`: Optional callback invoked with the final description once it has been applied.
 
     Returns:
-    - The annotated source split into lines (unchanged if there was nothing to do or the guard failed).
+    - The updated source lines, or `source_lines` unchanged if the style is missing, no usable description was produced, or the splice was refused.
     """
 
+    # No comment style means this language cannot host a file description, so bail out before any model work.
     style = target.style
     if style is None:
         return source_lines
-
     classify_tmpl = classify_prompt or CLASSIFY_PROMPT
-
-    # ---- Classify which eligible lines are the existing description (skipped when none are eligible). ----
     desc_range: Optional[Tuple[int, int]] = None
+
+    # Show the model the numbered header lines and ask which range, if any, is the existing description - a tightly capped, low-temperature turn.
     if target.eligible:
         entries = "\n".join(f"{i}. {inner}" for i, (_, _, inner) in enumerate(target.eligible, start=1))
         prompt = _fill(classify_tmpl, language=language, entries=entries)
@@ -387,30 +370,32 @@ def annotate_file_doc(
         reply = llm.generate(messages, cfg=turn_cfg)
         desc_range = _parse_classify_range(reply, len(target.eligible))
 
-        # Safety veto: refuse to treat any legal-looking line as editable description.
         if desc_range is not None:
             lo, hi = desc_range
+
+            # License veto: anything in the range that reads as legal text must never be rewritten, so drop the classification instead.
             if any(looks_legal(target.eligible[i - 1][2]) for i in range(lo, hi + 1)):
                 echo("file-doc: classified range looks like license/legal text; leaving it untouched.")
                 desc_range = None
 
-    # The existing description text we are updating (if any), fed to the summary provider as a seed.
     existing_text = ""
+
+    # Hand the current description to the writer so it updates the prose rather than starting from scratch.
     if desc_range is not None:
         lo, hi = desc_range
         existing_text = " ".join(target.eligible[i - 1][2] for i in range(lo, hi + 1)).strip()
 
-    # ---- Fetch the file-description prose (the whole-file summary, seeded with any existing description). ----
+    # The prose itself comes from the caller's summary provider; strip any comment markup it leaked.
     description = _sanitise_description(summary_provider(existing_text or None))
+
     if not description:
         echo("file-doc: no usable description was produced; leaving the file unchanged.")
         return source_lines
 
-    # ---- The model-free splice (three shapes + veto + guard live in splice_description). ----
+    # The splice is the only step that edits the file; a None result means the preservation guard refused, so keep the original lines.
     out_lines = splice_description(source_lines, target, desc_range, description)
     if out_lines is None:
         return source_lines
-
     echo("file-doc: " + ("updated the existing file description."
                          if desc_range is not None else "inserted a file description."))
     if on_description is not None:
@@ -420,26 +405,28 @@ def annotate_file_doc(
 
 def _sanitise_description(text: str) -> str:
     """
-    Strip any stray comment delimiters or code fences the model may have wrapped the description in.
+    Strip code fences and comment markup from a model-produced file description.
 
-    The generate turn is asked for bare prose, but small models sometimes add `/* */`, leading `*`/`//`, or a ``` fence
-    anyway. We remove those decorations so the patcher controls the rendering, and drop a leading bare file name if the
-    model echoed one.
+    The splicer adds the comment delimiters itself, so any fences, block-comment delimiters or leading `*`/`//`/`#` markers the model emitted are removed to avoid doubled-up syntax.
 
     Parameters:
-    - `text`: The raw generate-turn reply.
+    - `text`: The raw description text returned by the model.
 
     Returns:
-    - The cleaned description prose (possibly empty).
+    - The cleaned plain-prose description, possibly empty.
     """
 
     text = text.strip()
+
+    # Models sometimes wrap the reply in a code fence; peel it off before the line-level cleaning.
     if text.startswith("```"):
         text = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", text)
         text = re.sub(r"\n?```$", "", text).strip()
 
     lines = text.split("\n")
     cleaned: List[str] = []
+
+    # Strip any comment delimiters the model added - the splicer supplies its own markup, so leftovers would double up.
     for ln in lines:
         s = ln.strip()
         if s in ("/*", "*/", "/**"):
@@ -448,6 +435,7 @@ def _sanitise_description(text: str) -> str:
         s = re.sub(r"\s?\*+/$", "", s)
         s = re.sub(r"^(\*|//|#)\s?", "", s)
         cleaned.append(s)
+
     return "\n".join(cleaned).strip()
 
 
@@ -470,20 +458,15 @@ FILEDOC_PROJECT_DOC_CAP = 12000
 
 def filedoc_manifest(description_spec: str, project_doc: str, entries: List[dict]) -> dict:
     """
-    Build the run's file-description manifest from the spec, the project overview, and the per-file entries.
+    Build a run-level filedoc manifest dictionary from its parts.
 
     Parameters:
-    - `description_spec`: The file-description instruction (scale-cfg/summary.txt or the built-in default) the
-      stronger model writes each description to.
-    - `project_doc`: The raw resolved project-overview text (capped by the caller), so descriptions share the big
-      picture.
-    - `entries`: One dict per target file:
-      `{"path", "language", "role", "skeleton", "entries": [...], "answer": {"range": None, "description": None}}`,
-      where `skeleton` is the file's current structural skeleton (or its whole text when it has no symbols) and
-      `entries` are the header zone's eligible inner texts, numbered from 1 for the `range` answer.
+    - `description_spec`: The instructions describing what a good file description contains.
+    - `project_doc`: The project blurb shared by every entry.
+    - `entries`: The per-file entry dictionaries.
 
     Returns:
-    - The manifest dictionary ready to be written as JSON.
+    - The manifest dictionary, stamped with the filedoc tool name and version.
     """
 
     return {
@@ -496,162 +479,183 @@ def filedoc_manifest(description_spec: str, project_doc: str, entries: List[dict
 
 
 def write_filedoc_manifest(path: Path, manifest: dict) -> None:
-    """Write a file-description manifest to disk as indented JSON (UTF-8)."""
+    """
+    Write a filedoc manifest to disk as pretty-printed UTF-8 JSON.
+
+    Parameters:
+    - `path`: Destination file path.
+    - `manifest`: The manifest dictionary to serialise.
+    """
 
     Path(path).write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def read_filedoc_manifest(path: Path) -> dict:
     """
-    Read and lightly validate a file-description manifest.
+    Load a filedoc manifest from disk and validate its identity.
 
     Parameters:
-    - `path`: The manifest file path.
+    - `path`: Path of the manifest JSON file.
 
     Returns:
-    - The parsed manifest dictionary.
+    - The manifest dictionary, with the `files` list guaranteed to be present.
 
-    Raises:
-    - `ValueError`: If the file is not a filedoc manifest of a supported version.
+    Notes:
+    Raises `ValueError` if the file is not a SCALE filedoc manifest of the expected version.
     """
 
     manifest = json.loads(Path(path).read_text(encoding="utf-8"))
+
+    # Reject foreign or wrong-version manifests up front rather than failing obscurely mid-apply.
     if (not isinstance(manifest, dict) or manifest.get("tool") != FILEDOC_TOOL
             or manifest.get("version") != FILEDOC_VERSION):
         raise ValueError(f"{path}: not a SCALE filedoc manifest of version {FILEDOC_VERSION}")
+
+    # Guarantee a files list so callers can iterate without guarding.
     manifest.setdefault("files", [])
+
     return manifest
 
 
 def unfilled_descriptions(manifest: dict) -> List[str]:
     """
-    Return the path of every file entry whose answer pair has not been filled in (the completeness counter).
+    List the manifest files whose description answers are still unfilled.
 
-    An answer needs BOTH halves: `range` ("START-END", a single number, or "NONE" for no existing description) and
-    `description` (the prose, or the explicit "NONE" to decline the file - a deliberate decline counts as filled).
-    A missing/blank half leaves the entry unfilled.
+    An entry only counts as filled when its answer carries both a non-blank `range` and a non-blank `description`; completeness is decided by this count, never by trusting the filler.
 
     Parameters:
-    - `manifest`: The parsed filedoc manifest.
+    - `manifest`: The filedoc manifest dictionary.
 
     Returns:
-    - The unfilled entries' paths.
+    - The paths of every file still awaiting an answer; empty when the manifest is complete.
     """
 
     out: List[str] = []
+
+    # An entry counts as filled only when both the range and the description carry non-blank text.
     for f in manifest.get("files", []):
         answer = f.get("answer") or {}
         if not str(answer.get("range") or "").strip() or not str(answer.get("description") or "").strip():
             out.append(f.get("path", "?"))
+
     return out
 
 
 def apply_filedoc_entry(source_lines: Chunk, target: FileDocTarget, entry: dict) -> Optional[Chunk]:
     """
-    Apply one filedoc manifest entry to a file (the model-free apply phase of the online file-description round).
+    Apply one filedoc manifest answer to a file's source lines.
 
-    The header zone is re-derived by the caller from the CURRENT text and compared against the entry's recorded
-    `entries`: any mismatch means the file's header changed since emit, so the recorded `range` can no longer be
-    trusted and the apply is a safe no-op. The answer's `range` is parsed with the same `_parse_classify_range` the
-    offline classify turn uses, then `splice_description` runs the splice - the license veto and the preservation
-    guard fire locally exactly as offline, so the stronger model's classification is never blindly trusted.
+    The entry is re-bound by content: if the live header zone no longer matches the lines recorded at emit time, the answer is discarded and the file left untouched. Application goes through the same guarded `splice_description` path as the offline pass.
 
     Parameters:
-    - `source_lines`: The file's current lines.
-    - `target`: The file's `FileDocTarget`, freshly scanned from these same lines.
-    - `entry`: The manifest file entry carrying `entries` and the filled `answer` pair.
+    - `source_lines`: The file's pristine source lines.
+    - `target`: The freshly scanned header zone for the file.
+    - `entry`: The manifest entry holding the recorded header lines and the filled answer.
 
     Returns:
-    - The new lines, or None when nothing was (safely) applicable: a zone mismatch, a "NONE"/empty description, or a
-      veto/guard refusal.
+    - The updated source lines, or `None` if the zone has drifted, the answer is empty or `NONE`, or the splice was refused.
     """
 
+    # Re-bind by content: gather the live header lines and what the emit phase recorded, for comparison.
     current = [inner for (_lineno, _prefix, inner) in target.eligible]
     recorded = [str(e) for e in (entry.get("entries") or [])]
+
     if current != recorded:
+        # Any drift since emit makes the answer untrustworthy, so refuse to apply rather than risk a bad splice.
         echo("filedoc: the header zone changed since emit; leaving the file unchanged.")
         return None
 
+    # An empty or explicit NONE answer means no description is wanted; otherwise recover the classified range from the reply text.
     answer = entry.get("answer") or {}
     description = str(answer.get("description") or "").strip()
     if not description or description.upper() == "NONE":
         return None
     desc_range = _parse_classify_range(str(answer.get("range") or ""), len(target.eligible))
+
+    # Application goes through the same guarded splice as the offline pass.
     return splice_description(source_lines, target, desc_range, description)
 
 
 def scan_brace_leading_zone(source_lines: Chunk, style: CommentStyle) -> Optional[FileDocTarget]:
     """
-    Build a `FileDocTarget` for a brace-language file (C, JS) by scanning its leading-comment zone.
+    Scan the leading comment zone of a brace-language file and describe where a file description can live.
 
-    Gathers the entire run of leading comments at the top of the file - which may span several contiguous blocks
-    (mixed `/* ... */` and `//`, separated by blank lines but with no intervening code) - into one target. The scan
-    starts after an optional shebang, collects every comment line until the first real code/preprocessor line, and
-    marks the pure-content comment lines (block continuations and `//` lines) as description-eligible while leaving
-    delimiters, single-line `/* ... */` comments, and blank continuations to be preserved.
+    Walks the top of the file (after any shebang) through `/* ... */` blocks, `//` runs and blank lines until the first real code line. Every non-blank comment line is recorded as eligible for rewriting, together with the prefix needed to re-emit it in place; a one-line `/* ... */` is preserved whole and is never eligible. The scan also tracks the best append point for new text: inside an open block just before its `*/`, or after the last `//` line.
 
     Parameters:
-    - `source_lines`: The source split into individual lines.
-    - `style`: The comment style used to render a fresh block when the file has no leading comments.
+    - `source_lines`: The file's source lines.
+    - `style`: The comment style to use when a fresh description must be inserted.
 
     Returns:
-    - A `FileDocTarget`, or None if the file is empty.
+    - A `FileDocTarget` describing the eligible lines and insertion point; one with `has_zone=False` and a fresh insert position when there are no leading comments, or `None` for an effectively empty file.
     """
 
+    # Empty files have no zone; otherwise skip any shebang and set up the scan state for the leading-comment walk.
     if not source_lines or not any(ln.strip() for ln in source_lines):
         return None
-
     n = len(source_lines)
     i = 0
     if source_lines[0].lstrip().startswith("#!"):     # preserve a shebang (e.g. `#!/usr/bin/env node`) if present
         i = 1
     fresh_index = i
-
     eligible: List[Tuple[int, str, str]] = []
     first_comment = None                 # 0-based index of the first comment line
     last_comment = None                  # 0-based index of the last comment line
     append_index = None                  # 0-based insertion point for an appended description
     append_prefix = ""
     in_block = False
-
     idx = i
+
+    # Walk the leading lines one by one until the first real code line ends the zone.
     while idx < n:
         line = source_lines[idx]
         stripped = line.strip()
         leading_ws = line[: len(line) - len(line.lstrip())]
 
+        # Inside an open block comment every line extends the zone; watch for the closing delimiter.
         if in_block:
             first_comment = idx if first_comment is None else first_comment
             last_comment = idx
             closes = "*/" in stripped
+
             if not closes:
                 body = stripped
+
+                # Remember each line's decoration prefix so a rewrite can be re-emitted with identical formatting.
                 if body.startswith("*"):
                     inner = body.lstrip("*").strip()
                     prefix = leading_ws + "* "
                 else:
                     inner = body
                     prefix = leading_ws
+
+                # Only non-blank lines are rewrite candidates; the closing delimiter fixes where appended text would slot in.
                 if inner:
                     eligible.append((idx + 1, prefix, inner))
             else:
                 in_block = False
                 append_index = idx          # append before this closing delimiter
                 append_prefix = leading_ws + "* "
+
             idx += 1
             continue
 
+        # A new block comment joins the zone whether or not it closes on the same line.
         if stripped.startswith("/*"):
             first_comment = idx if first_comment is None else first_comment
             last_comment = idx
+
+            # A one-line block comment is kept verbatim and never eligible, so any new text must follow it as a line comment.
             if "*/" in stripped[2:]:          # single-line /* ... */ - preserve whole, not eligible
                 append_index = idx + 1
                 append_prefix = "// "
             else:
                 in_block = True
+
             idx += 1
             continue
 
+        # Each line comment is individually eligible; the append point trails the last one so additions extend the run.
         if stripped.startswith("//"):
             first_comment = idx if first_comment is None else first_comment
             last_comment = idx
@@ -671,10 +675,13 @@ def scan_brace_leading_zone(source_lines: Chunk, style: CommentStyle) -> Optiona
         break                                 # first real code / preprocessor line ends the zone
 
     has_zone = first_comment is not None
+
+    # No leading comments at all: report a fresh insertion point just after any shebang.
     if not has_zone:
         return FileDocTarget(eligible=[], insert_index=fresh_index, insert_fresh=True,
                              style=style, indent="", has_zone=False)
 
+    # With a zone, prefer the recorded append point, falling back to just past the last comment line.
     return FileDocTarget(
         eligible=eligible,
         insert_index=append_index if append_index is not None else last_comment + 1,

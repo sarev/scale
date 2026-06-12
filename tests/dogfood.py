@@ -4,8 +4,10 @@ The dogfood harness: SCALE annotating its own source from a cold start.
 
 Every `scale*.py` module is copied into a scratch area and "walled" - module/class/function docstrings, full-line
 `#` comments, and blank lines *inside* function/method bodies are stripped (blank lines between routines and at
-class/module level are kept, so the file shape survives). SCALE is then run over the walled copies so its output can
-be judged against the hand-reviewed originals.
+class/module level are kept, so the file shape survives). Legal boilerplate inside the module docstring is the one
+thing the wall keeps: stripping it would both lose the license from the output and bypass the file-doc pass's
+preservation path, which is exactly what the dogfood run should exercise. SCALE is then run over the walled copies so
+its output can be judged against the hand-reviewed originals.
 
 Two scratch directories are produced under `temp/dogfood/` and both are left in place for review:
 
@@ -41,6 +43,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from scale_filedoc import looks_legal  # noqa: E402  (the same legal-text veto the file-doc pass applies)
+
 DOGFOOD = ROOT / "temp" / "dogfood"
 WALLED = DOGFOOD / "walled"
 ANNOTATED = DOGFOOD / "annotated"
@@ -48,11 +53,14 @@ MANIFEST = DOGFOOD / "scale-manifest.json"
 FILEDOC = DOGFOOD / "scale-filedoc.json"
 
 
-def _docstring_lines(tree: ast.AST) -> set[int]:
+def _docstring_lines(tree: ast.AST, src_lines: list[str]) -> set[int]:
     """Return the line numbers of every module/class/function docstring that can be removed safely.
 
     A docstring is only reported when its owner has at least one further statement, so stripping it never leaves an
-    empty (syntactically invalid) suite.
+    empty (syntactically invalid) suite. A module docstring containing legal boilerplate (per the file-doc pass's
+    `looks_legal` veto) is only stripped below the paragraph holding its last legal line: the license must survive
+    the wall, both so the annotated output keeps it and so the run exercises the file-doc preservation path rather
+    than starting bare.
     """
     lines: set[int] = set()
     for node in ast.walk(tree):
@@ -63,13 +71,28 @@ def _docstring_lines(tree: ast.AST) -> set[int]:
             first = body[0]
             if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
                     and isinstance(first.value.value, str)):
-                lines.update(range(first.lineno, first.end_lineno + 1))
+                start, end = first.lineno, first.end_lineno
+                if isinstance(node, ast.Module):
+                    legal = [i for i in range(start, end + 1) if looks_legal(src_lines[i - 1])]
+                    if legal:
+                        # Keep the boilerplate through the end of the paragraph holding the last legal line
+                        # (license continuation lines carry no marker themselves), plus the closing quotes;
+                        # strip only the description below.
+                        keep = legal[-1]
+                        while keep + 1 < end and src_lines[keep].strip():
+                            keep += 1
+                        start = keep + 1
+                        end = end - 1
+                        if start > end:
+                            continue
+                lines.update(range(start, end + 1))
     return lines
 
 
 def wall(src: str, strip_all_blanks: bool = False) -> str:
     """
-    Strip `src` to a dogfood wall: no docstrings, no full-line comments, no blank lines inside routine bodies.
+    Strip `src` to a dogfood wall: no docstrings, no full-line comments, no blank lines inside routine bodies. The
+    one exception is legal boilerplate in the module docstring, which is kept (see `_docstring_lines`).
 
     Blank lines *between* routines (and at class/module level) are kept so the file keeps its overall shape; pass
     `strip_all_blanks=True` to drop those too, which reduces a file to its code lines only (used for the
@@ -79,7 +102,7 @@ def wall(src: str, strip_all_blanks: bool = False) -> str:
 
     lines = src.split("\n")
     tree = ast.parse(src)
-    doc_lines = _docstring_lines(tree)
+    doc_lines = _docstring_lines(tree, lines)
 
     # Every line inside a function/method (including nested defs) - blanks here are stripped.
     in_routine: set[int] = set()
