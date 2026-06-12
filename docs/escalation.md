@@ -45,19 +45,37 @@ comments/docstrings. **Python and C** targets escalate (JS runs locally only).
 ## Completeness is a counter, not trust
 
 `--check-manifest m.json` (model-free, no targets) prints every unfilled answer slot and exits nonzero while any
-remains — the driver loops until it reports 0. `null`/whitespace is unfilled; the explicit string `"NONE"` is a
-deliberate decline (a NONE block chunk paragraphs with a blank but invents no comment; an unanswered request leaves
-its routine untouched).
+remains — the driver loops until it reports 0 (it also notes how many requests are checked out to outstanding
+fragments). `null`/whitespace is unfilled; the explicit string `"NONE"` is a deliberate decline (a NONE block chunk
+paragraphs with a blank but invents no comment; an unanswered request leaves its routine untouched).
+
+## Fragments: SCALE owns the slot bookkeeping, so filling agents run in parallel
+
+`--next-fragment m.json [--fragment-size N]` (model-free, no targets) checks out the next ≤N unfilled requests as a
+**fragment** — a small, self-contained, valid mini-manifest written next to the master (`m.frag-001.json`, its path
+printed; a monotonic `fragments_issued` counter never reuses a name). The selected requests are marked in the
+master, so repeated calls hand out **disjoint** batches and any number of agents can fill their fragments
+concurrently — no shared file, no agent ever reads the master or slices its own batch out of it. A `snippet_ref`
+whose target lands in another fragment is inlined, so a fragment never sends its reader elsewhere; `doc_style`
+travels in every fragment; the ordinary checker works on a fragment for agent self-checks. When nothing is left to
+hand out the call exits nonzero (saying whether the manifest is complete or the remainder is checked out).
+
+`--apply-manifest` is the merge gate: it first folds every sibling `*.frag-*.json` back into the master — matching
+by `(id, file)` and chunk `bidx`, **first write wins** (a stale fragment can never clobber a filled slot) — writes
+the merged master, deletes the spent fragment files, and then refuses to apply while any slot is unfilled: the
+leftovers are listed, their checkout markers cleared (back into the pile for the next `--next-fragment`), and the
+exit is nonzero. Only a complete master proceeds to the real apply, so the counter invariant is unchanged.
 
 ## The `/scale` skill is the intended driver
 
-(`.claude/skills/scale/`): emit run → Claude fills the function manifest in **batches of ~10 requests, each batch in
-a fresh subagent context** (requests are self-contained: `doc_style` + the batch; the driver never reads code, it
-only counts via the checker and loops) → model-free apply → a second local invocation (`--file-doc --emit-reword`:
-pass-2 descriptions + header splice + reword manifest, see [file-doc.md](file-doc.md)) → Claude fills the reword
-manifest in a single context (prose-only, small) → model-free `--apply-reword`. Two bounded Claude touchpoints, each
-with a machine-checked completion condition; without escalation, ONE local invocation does everything and no Claude
-tokens are spent.
+(`.claude/skills/scale/`): emit run → Claude checks out fragments with `--next-fragment` and fills them with **one
+fresh subagent per fragment, all in parallel** (fragments are self-contained: `doc_style` + ~8 requests; the driver
+never reads code, it only hands out fragments and gates on the merge) → model-free apply (merges fragments, errors
+incomplete rounds back to step one) → a second local invocation (`--file-doc --emit-reword`: pass-2 descriptions +
+header splice + reword manifest, see [file-doc.md](file-doc.md)) → Claude fills the reword manifest in a single
+context (prose-only, small) → model-free `--apply-reword`. Two bounded Claude touchpoints, each with a
+machine-checked completion condition; without escalation, ONE local invocation does everything and no Claude tokens
+are spent.
 
 The manifest carries a top-level **`doc_style`** (guidelines + the def-pass templates of the run's
 escalation-capable languages) so the stronger model writes deferred docstrings to house style. The def-pass

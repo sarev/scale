@@ -1838,6 +1838,13 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--check-manifest", default="", metavar="PATH",
                    help="Completeness check (model-free): print the manifest's unfilled-answer count and exit "
                         "nonzero if any answer is missing. Needs no source targets.")
+    p.add_argument("--next-fragment", default="", metavar="MANIFEST",
+                   help="Check out the next batch of unfilled requests from this master manifest as a small "
+                        "self-contained fragment file (a valid manifest; written next to the master, its path "
+                        "printed). Repeated calls hand out disjoint batches, so fragments can be filled by "
+                        "parallel agents. Exits nonzero when there is nothing to hand out. Needs no source targets.")
+    p.add_argument("--fragment-size", type=int, default=8, metavar="N",
+                   help="Maximum requests per fragment for --next-fragment (default 8).")
     p.add_argument("--escalate-cognitive", type=int, default=10, metavar="N",
                    help="Escalate any routine whose cognitive complexity exceeds N to the manifest (default 10).")
     p.add_argument("--codestats-json", default="", metavar="PATH",
@@ -1938,7 +1945,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for slot in missing:
             print(f"unfilled: {slot}")
         print(f"{len(missing)} unfilled answer(s) in {args.check_manifest} ({total} request(s))")
+        out = sum(1 for r in manifest.get("requests", []) if r.get(scale_escalate.FRAGMENT_KEY))
+        if out:
+            print(f"{out} request(s) checked out to outstanding fragments")
         return 1 if missing else 0
+
+    # ---- Fragment phase: check out the next batch of unfilled requests for a (parallel) filling agent. ----
+    if args.next_fragment:
+        master_path = Path(args.next_fragment)
+        manifest = scale_escalate.read_manifest(master_path)
+        if not scale_escalate.unfilled_answers(manifest):
+            print(f"manifest complete: no unfilled answers in {master_path}")
+            return 1
+        name = scale_escalate.next_fragment_name(manifest, master_path.name)
+        fragment = scale_escalate.build_fragment(manifest, args.fragment_size, name)
+        if fragment is None:
+            outstanding = sorted({str(r.get(scale_escalate.FRAGMENT_KEY))
+                                  for r in manifest.get("requests", []) if r.get(scale_escalate.FRAGMENT_KEY)})
+            print("no fragment available: every unfilled request is checked out "
+                  f"({', '.join(outstanding)}); --apply-manifest merges and releases them")
+            return 1
+        frag_path = master_path.with_name(name)
+        scale_escalate.write_manifest(frag_path, fragment)
+        scale_escalate.write_manifest(master_path, manifest)  # persist the checkout markers + issue counter
+        print(str(frag_path))
+        return 0
 
     # Expand the target patterns (files / directories / globs) into a concrete, deduplicated, ordered file list.
     targets = scale_project.gather_files(args.source)
@@ -1952,6 +1983,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             error("-o/--output cannot be used with multiple targets; multiple targets are patched in place.")
             return 1
         manifest = scale_escalate.read_manifest(Path(args.apply_manifest))
+
+        # The parallel-fill protocol: fold sibling fragment answers back into the master first. Fragments imply
+        # strict completeness - an unfilled slot is an error and is returned to the pile for --next-fragment.
+        master_path = Path(args.apply_manifest)
+        stem, dot, suffix = master_path.name.rpartition(".")
+        if not dot:
+            stem, suffix = master_path.name, "json"
+        frag_paths = sorted(master_path.parent.glob(f"{stem}.frag-*.{suffix}"))
+        fragmented = bool(frag_paths) or any(r.get(scale_escalate.FRAGMENT_KEY)
+                                             for r in manifest.get("requests", []))
+        if fragmented:
+            for fp in frag_paths:
+                merged = scale_escalate.merge_fragment(manifest, scale_escalate.read_manifest(fp))
+                echo(f"Merged {merged} answer(s) from {fp.name}")
+            missing = scale_escalate.unfilled_answers(manifest)
+            released = scale_escalate.release_unfilled(manifest)
+            scale_escalate.write_manifest(master_path, manifest)
+            for fp in frag_paths:
+                fp.unlink()  # spent: their answers now live in the master, written above
+            if missing:
+                for slot in missing:
+                    print(f"unfilled: {slot}")
+                error(f"{len(missing)} answer(s) still unfilled after merging {len(frag_paths)} fragment(s); "
+                      f"{released} request(s) returned to the pile - hand them out again with --next-fragment.")
+                return 1
+
         file_entries = {str(Path(f.get("path", "")).resolve()): f for f in manifest.get("files", [])}
         by_file: Dict[str, list] = {}
         for r in manifest.get("requests", []):

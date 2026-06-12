@@ -54,24 +54,32 @@ Do **not** pass `--file-doc` here — the published file descriptions belong to 
 
 If the manifest has **zero** requests, skip to Step 4.
 
-## Step 2 — Fill the function manifest (batched, fresh contexts, counter loop)
+## Step 2 — Fill the function manifest (fragments, PARALLEL fresh contexts, counter loop)
 
-You are the driver. **Never read the target source files yourself** — every request is self-contained. Loop:
+You are the driver. **Never read the target source files yourself** — every fragment is self-contained, and SCALE
+does the slot bookkeeping (no agent ever touches the master or another agent's file). Loop:
 
-1. Run the completeness checker:
-   `env/Scripts/python.exe scale.py --check-manifest "<MANIFEST>"`
-   It prints each unfilled slot and exits 0 only when everything is answered.
-2. While there are unfilled slots: take ~10 unfilled request ids and spawn a **fresh subagent** (Agent tool,
-   `general-purpose`) for just that batch — batches run sequentially (they edit the same JSON), and each gets a clean
-   context so quality never degrades as the run grows. Tell the subagent:
-   - the manifest path, the batch's request `id`s, and that it must edit ONLY those requests' `answer` fields;
-   - to follow the manifest's top-level `doc_style` for every def answer;
-   - the request shape (below).
-3. Re-run the checker; loop until it reports 0. Never mark the step done on trust — only on the counter.
+1. Check out the work as fragments — call repeatedly until it exits nonzero ("no fragment available" /
+   "manifest complete"), collecting each printed fragment path:
+   `env/Scripts/python.exe scale.py --next-fragment "<MANIFEST>" --fragment-size 8`
+   Each call writes a small valid mini-manifest next to the master (e.g. `scale-manifest.frag-001.json`) holding
+   the next ~8 unfilled requests, and marks them checked out in the master, so every fragment is disjoint.
+2. Spawn one **fresh subagent** (Agent tool, `general-purpose`) per fragment, **all in parallel** (one message,
+   multiple Agent calls) — fragments share nothing, and each clean context keeps quality flat as the run grows.
+   Tell each subagent:
+   - its fragment path; it should Read the file directly (fragments are small) and fill EVERY `answer` field in it;
+   - to follow the fragment's top-level `doc_style` for every def answer;
+   - the request shape (below);
+   - to self-check before finishing: `--check-manifest <FRAGMENT>` must exit 0.
+3. When all agents have returned, run the apply (Step 3). It merges every sibling fragment into the master
+   (first write wins), deletes the spent fragment files, and — if any slot is still unfilled — errors, lists the
+   slots, and returns them to the pile: go back to 1 and hand them out again. Never mark the step done on trust —
+   only on the apply/checker exit code.
 
 **Request shape (manifest version 2).** Each request is one routine: `qualname`, `kind`, `sig_hash`, `cognitive`,
-`file`, and `snippet` — the routine's verbatim source (if `snippet` is null, follow `snippet_ref` to the request that
-carries the identical text; never duplicate it back). It has either or both of:
+`file`, and `snippet` — the routine's verbatim source (if `snippet` is null, follow `snippet_ref` to the request in
+the same fragment that carries the identical text — a ref whose target is in another fragment arrives already
+inlined; never duplicate the text back). It has either or both of:
 - `"def": {"answer": null}` — write the **doc body only** (no `"""`/`/* */` delimiters, no fences) describing
   purpose, parameters, return value, per `doc_style`. For `kind: "declaration"` (a C header prototype) write the
   **caller-facing contract** — the snippet is the implementation body, but the doc sits above the prototype.
@@ -80,13 +88,15 @@ carries the identical text; never duplicate it back). It has either or both of:
   paragraph's point, reason, or gotcha — never a restatement), or the string `"NONE"` for a chunk that is genuinely
   self-evident. Leave `bidx`, `lines`, `sig_hash` etc. untouched.
 
-## Step 3 — Apply the function manifest (model-free)
+## Step 3 — Apply the function manifest (model-free; also the fragment merge gate)
 
 ```
 env/Scripts/python.exe scale.py -l <LANG> --apply-manifest "<MANIFEST>" <TARGETS...> -v
 ```
 
-No model loads. SCALE re-binds each answer by `(qualname, sig_hash)` and patches it through the same guards.
+No model loads. Sibling `*.frag-*.json` answers are merged into the master first (then the spent fragment files
+are deleted); an incomplete master errors with the unfilled slots returned to the pile (loop back to Step 2.1).
+Once complete, SCALE re-binds each answer by `(qualname, sig_hash)` and patches it through the same guards.
 
 ## Step 4 — Published descriptions + reword manifest (second local invocation)
 

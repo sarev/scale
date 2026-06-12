@@ -370,6 +370,177 @@ def unfilled_answers(manifest: dict) -> List[str]:
     return out
 
 
+# ---------------------------- fragments (parallel fill protocol) ----------------------------
+
+
+FRAGMENT_KEY = "fragment"
+
+
+def _request_unfilled(req: dict) -> bool:
+    """
+    Report whether a request still has any unfilled answer slot.
+
+    Parameters:
+    - `req`: One manifest request dictionary.
+
+    Returns:
+    - True when the def answer or any block-chunk answer is null/whitespace ("NONE" counts as filled).
+    """
+
+    d = req.get("def")
+    if d is not None and not str(d.get("answer") or "").strip():
+        return True
+    b = req.get("blocks")
+    if b is not None:
+        for chunk in b.get("chunks", []):
+            if not str(chunk.get("answer") or "").strip():
+                return True
+    return False
+
+
+def next_fragment_name(manifest: dict, master_name: str) -> str:
+    """
+    Choose the next fragment file name for a master manifest (e.g. "scale-manifest.frag-003.json").
+
+    A monotonic `fragments_issued` counter on the master (bumped here, persisted by the caller) guarantees a name is
+    never reused within one master, even after earlier fragments have been merged and their files deleted.
+
+    Parameters:
+    - `manifest`: The parsed master manifest (mutated: the issue counter is incremented).
+    - `master_name`: The master manifest's file name (stem + suffix only; no directory).
+
+    Returns:
+    - The fragment file name (no directory).
+    """
+
+    stem, dot, suffix = master_name.rpartition(".")
+    if not dot:
+        stem, suffix = master_name, "json"
+    issued = int(manifest.get("fragments_issued", 0)) + 1
+    manifest["fragments_issued"] = issued
+    return f"{stem}.frag-{issued:03d}.{suffix}"
+
+
+def build_fragment(manifest: dict, size: int, fragment_name: str) -> Optional[dict]:
+    """
+    Check out the next batch of unfilled requests as a self-contained fragment manifest.
+
+    The fragment is a valid version-2 manifest in its own right (same request shape, one `doc_style` copy), so a
+    filling agent can read it directly and self-check it with the ordinary completeness counter. Each selected
+    request is marked in the MASTER (mutated in place) with the fragment's name, so concurrent calls hand out
+    disjoint work; the caller persists the master afterwards. A request whose `snippet` is a `snippet_ref` to a
+    request outside this fragment gets the referenced text inlined, keeping every fragment self-contained.
+
+    Parameters:
+    - `manifest`: The parsed master manifest (mutated: selected requests gain a `fragment` marker).
+    - `size`: The maximum number of requests to include.
+    - `fragment_name`: The name to record on each selected request (the fragment's file name).
+
+    Returns:
+    - The fragment manifest dictionary, or None when every unfilled request is already checked out (or none remain).
+    """
+
+    pool = [r for r in manifest.get("requests", []) if _request_unfilled(r) and not r.get(FRAGMENT_KEY)]
+    if not pool or size < 1:
+        return None
+    picked = pool[:size]
+    for r in picked:
+        r[FRAGMENT_KEY] = fragment_name
+
+    # Resolve snippet_refs that point outside the fragment: the code must cross the wire once per READER, so a
+    # fragment may never force its agent back to the master file.
+    picked_ids = {r.get("id") for r in picked}
+    snippets_by_id: Dict[str, str] = {}
+    for r in manifest.get("requests", []):
+        if r.get("snippet") and r.get("id") not in snippets_by_id:
+            snippets_by_id[r["id"]] = r["snippet"]
+    out_requests: List[dict] = []
+    for r in picked:
+        req = json.loads(json.dumps(r))  # deep copy; the fragment must not alias the master
+        ref = req.get("snippet_ref")
+        if not req.get("snippet") and ref and ref not in picked_ids:
+            req["snippet"] = snippets_by_id.get(ref)
+        req.pop(FRAGMENT_KEY, None)
+        out_requests.append(req)
+
+    used_files = {r.get("file") for r in out_requests}
+    return {
+        "version": MANIFEST_VERSION,
+        "tool": manifest.get("tool", "scale"),
+        "fragment_of": fragment_name,
+        "files": [f for f in manifest.get("files", []) if f.get("path") in used_files],
+        "escalate_cognitive": manifest.get("escalate_cognitive"),
+        "doc_style": manifest.get("doc_style", ""),
+        "requests": out_requests,
+    }
+
+
+def merge_fragment(manifest: dict, fragment: dict) -> int:
+    """
+    Fold a filled fragment's answers back into the master manifest and release its checked-out requests.
+
+    Requests are matched by `(id, file)` (two files may legitimately carry the same id when their routines are
+    byte-identical) and chunks by `bidx`. First write wins: a master slot that is already filled is never
+    overwritten, so a stale or duplicated fragment cannot clobber good answers. Every master request the fragment
+    covers has its checkout marker cleared - a slot the fragment left unfilled simply returns to the pile.
+
+    Parameters:
+    - `manifest`: The parsed master manifest (mutated in place).
+    - `fragment`: The parsed fragment manifest carrying answers.
+
+    Returns:
+    - The number of answer slots newly filled in the master.
+    """
+
+    index: Dict[Tuple[str, str], dict] = {}
+    for r in manifest.get("requests", []):
+        index.setdefault((str(r.get("id")), str(r.get("file"))), r)
+
+    filled = 0
+    for fr in fragment.get("requests", []):
+        mr = index.get((str(fr.get("id")), str(fr.get("file"))))
+        if mr is None:
+            continue
+        md, fd = mr.get("def"), fr.get("def")
+        if md is not None and fd is not None:
+            if not str(md.get("answer") or "").strip() and str(fd.get("answer") or "").strip():
+                md["answer"] = fd["answer"]
+                filled += 1
+        mb, fb = mr.get("blocks"), fr.get("blocks")
+        if mb is not None and fb is not None:
+            by_bidx = {c.get("bidx"): c for c in fb.get("chunks", [])}
+            for chunk in mb.get("chunks", []):
+                fc = by_bidx.get(chunk.get("bidx"))
+                if fc is not None and not str(chunk.get("answer") or "").strip() \
+                        and str(fc.get("answer") or "").strip():
+                    chunk["answer"] = fc["answer"]
+                    filled += 1
+        mr.pop(FRAGMENT_KEY, None)
+    return filled
+
+
+def release_unfilled(manifest: dict) -> int:
+    """
+    Return every still-unfilled request to the pile by clearing its checkout marker.
+
+    Called when a fill round ends incomplete (an agent died or skipped slots): the next `build_fragment` can then
+    hand the remaining work out again.
+
+    Parameters:
+    - `manifest`: The parsed master manifest (mutated in place).
+
+    Returns:
+    - The number of requests released.
+    """
+
+    released = 0
+    for r in manifest.get("requests", []):
+        if r.get(FRAGMENT_KEY) and _request_unfilled(r):
+            r.pop(FRAGMENT_KEY, None)
+            released += 1
+    return released
+
+
 # ---------------------------- manifest I/O ----------------------------
 
 

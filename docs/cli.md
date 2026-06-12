@@ -41,7 +41,13 @@ python scale.py -c --block-comments medium -l c "src/*.c" "include/*.h" --doc-si
 python scale.py -c --block-comments medium -l python -m /path/model.gguf --escalate-cognitive 10 \
   --emit-manifest m.json "src/*.py"                     # emit: local model + manifest (multi-target = in place)
 python scale.py --check-manifest m.json                  # model-free completeness counter (exit 1 while unfilled)
-python scale.py -l python --apply-manifest m.json "src/*.py"   # apply: no model loaded
+python scale.py --next-fragment m.json --fragment-size 8 # check out the next <=8 unfilled requests as a small
+                                                         # self-contained fragment (m.frag-001.json; path printed).
+                                                         # Repeated calls hand out disjoint batches, so filling
+                                                         # agents run in PARALLEL; exit 1 when nothing remains.
+python scale.py -l python --apply-manifest m.json "src/*.py"   # apply: no model loaded. Sibling m.frag-*.json are
+                                                         # merged in first (first write wins; spent files deleted);
+                                                         # unfilled slots error out and return to the pile.
 
 # Verification (the local quality floor) is ON by default for the def/block passes: the deterministic
 # backtick-grounding gate plus clean-context challenge turns (grounding / obviousness / story). --no-verify disables.

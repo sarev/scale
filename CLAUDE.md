@@ -53,7 +53,7 @@ Up to three passes run in sequence per file, each re-priming and re-parsing the 
 | `scale_python.py` / `scale_c.py` / `scale_javascript.py` | Per-language workers: def-pass, block provider, native cognitive scorer (+ C: the `--doc-site` planner) |
 | `scale_blocks.py` | Language-agnostic block pass: structural segmenter, two-turn comment+score, insertion-only patcher + guard |
 | `scale_verify.py` | Grounding gate + challenge turns (the local quality floor) |
-| `scale_escalate.py` | Escalation policy + run-level manifest (emit/check/apply) |
+| `scale_escalate.py` | Escalation policy + run-level manifest (emit/check/apply) + parallel-fill fragments |
 | `scale_reword.py` | Header-reword manifest (prose-only) |
 | `scale_project.py` | Run-file store, project blurb, call graph, contract store |
 | `scale_filedoc.py` | File-doc pass engine: classify → license veto → guarded splice |
