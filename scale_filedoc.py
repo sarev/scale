@@ -29,7 +29,9 @@ inserted. The engine here orchestrates the two model turns (classify, then gener
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Callable, List, Optional, Tuple
+import json
 import re
 import textwrap
 
@@ -240,6 +242,95 @@ def file_doc_preserved(old_lines: Chunk, new_lines: Chunk, start: int, removed: 
     return True
 
 
+def splice_description(
+    source_lines: Chunk,
+    target: FileDocTarget,
+    desc_range: Optional[Tuple[int, int]],
+    description: str,
+) -> Optional[Chunk]:
+    """
+    Splice a file description into the leading zone - the model-free half of the file-doc pass.
+
+    Three splice shapes: replace the `desc_range` lines in place (re-wrapped in the first line's decoration prefix);
+    insert a fresh comment block at the top (`desc_range` None and `insert_fresh`); or append into the existing block
+    (`desc_range` None, a zone with no description). The deterministic safety nets both run here: the license veto
+    refuses to overwrite any legal-looking line in the range, and the preservation guard (the target's own parse-based
+    guard for Python, the comment-line `file_doc_preserved` otherwise) turns any edit that would touch code into a
+    refusal. Both the offline pass and the online `--apply-filedoc` round go through this one function, so the guards
+    hold regardless of which model wrote the prose.
+
+    Parameters:
+    - `source_lines`: The source split into lines (not mutated).
+    - `target`: The `FileDocTarget` from the language adapter (scanned from these same lines).
+    - `desc_range`: The 1-based inclusive range over `target.eligible` to replace, or None to insert/append.
+    - `description`: The description prose (sanitised here; comment delimiters/fences are stripped).
+
+    Returns:
+    - The new lines, or None on refusal (no style, empty prose, legal veto, or guard failure).
+    """
+
+    style = target.style
+    if style is None:
+        return None
+    description = _sanitise_description(description)
+    if not description:
+        return None
+
+    # Safety veto: refuse to overwrite any legal-looking line, regardless of how the range was classified.
+    if desc_range is not None:
+        lo, hi = desc_range
+        if any(looks_legal(target.eligible[i - 1][2]) for i in range(lo, hi + 1)):
+            echo("file-doc: the description range looks like license/legal text; leaving it untouched.")
+            return None
+
+    # ---- Build the single splice. ----
+    if desc_range is not None:
+        # Replace the existing description lines in place, reusing the first line's decoration prefix.
+        lo, hi = desc_range
+        start_lineno = target.eligible[lo - 1][0]
+        end_lineno = target.eligible[hi - 1][0]
+        prefix = target.eligible[lo - 1][1]
+        start = start_lineno - 1                 # 0-based
+        removed = end_lineno - start_lineno + 1
+        new_block = [f"{prefix}{ln}".rstrip() for ln in _wrap(description, prefix)]
+    elif target.insert_fresh:
+        # No header (or no usable description and no block to extend): insert a fresh comment block at the top. We
+        # render the block form directly rather than via render_comment_lines, which would collapse a one-line
+        # description to a single line comment - a file header wants the block delimiters even when the prose is short.
+        start = target.insert_index
+        removed = 0
+        if style.block_open is not None:
+            cont = style.block_cont or style.line_prefix
+            body = _wrap(description, target.indent + cont)
+            new_block = (
+                [f"{target.indent}{style.block_open}"]
+                + [f"{target.indent}{cont}{ln}".rstrip() for ln in body]
+                + [f"{target.indent}{style.block_close}", ""]
+            )
+        else:
+            body = _wrap(description, target.indent + style.line_prefix)
+            new_block = [f"{target.indent}{style.line_prefix}{ln}".rstrip() for ln in body] + [""]
+    else:
+        # A zone exists but has no description: append one into the existing block, after a blank separator line.
+        start = target.insert_index
+        removed = 0
+        prefix = target.insert_prefix
+        new_block = [prefix.rstrip()] + [f"{prefix}{ln}".rstrip() for ln in _wrap(description, prefix)]
+
+    out_lines = source_lines[:start] + new_block + source_lines[start + removed:]
+
+    # The guard is pluggable: brace languages use the line-comment `file_doc_preserved`; Python supplies a parse-based
+    # guard (its docstring content lines are not line-recognisable as comments).
+    if target.preserved is not None:
+        ok = target.preserved(source_lines, out_lines, start, removed, len(new_block))
+    else:
+        ok = file_doc_preserved(source_lines, out_lines, start, removed, len(new_block), style)
+    if not ok:
+        echo("file-doc: the edit would have altered code or preserved text; abandoning it.")
+        return None
+    return out_lines
+
+
 def annotate_file_doc(
     llm,
     cfg,
@@ -315,50 +406,9 @@ def annotate_file_doc(
         echo("file-doc: no usable description was produced; leaving the file unchanged.")
         return source_lines
 
-    # ---- Build the single splice. ----
-    if desc_range is not None:
-        # Replace the existing description lines in place, reusing the first line's decoration prefix.
-        lo, hi = desc_range
-        start_lineno = target.eligible[lo - 1][0]
-        end_lineno = target.eligible[hi - 1][0]
-        prefix = target.eligible[lo - 1][1]
-        start = start_lineno - 1                 # 0-based
-        removed = end_lineno - start_lineno + 1
-        new_block = [f"{prefix}{ln}".rstrip() for ln in _wrap(description, prefix)]
-    elif target.insert_fresh:
-        # No header (or no usable description and no block to extend): insert a fresh comment block at the top. We
-        # render the block form directly rather than via render_comment_lines, which would collapse a one-line
-        # description to a single line comment - a file header wants the block delimiters even when the prose is short.
-        start = target.insert_index
-        removed = 0
-        if style.block_open is not None:
-            cont = style.block_cont or style.line_prefix
-            body = _wrap(description, target.indent + cont)
-            new_block = (
-                [f"{target.indent}{style.block_open}"]
-                + [f"{target.indent}{cont}{ln}".rstrip() for ln in body]
-                + [f"{target.indent}{style.block_close}", ""]
-            )
-        else:
-            body = _wrap(description, target.indent + style.line_prefix)
-            new_block = [f"{target.indent}{style.line_prefix}{ln}".rstrip() for ln in body] + [""]
-    else:
-        # A zone exists but has no description: append one into the existing block, after a blank separator line.
-        start = target.insert_index
-        removed = 0
-        prefix = target.insert_prefix
-        new_block = [prefix.rstrip()] + [f"{prefix}{ln}".rstrip() for ln in _wrap(description, prefix)]
-
-    out_lines = source_lines[:start] + new_block + source_lines[start + removed:]
-
-    # The guard is pluggable: brace languages use the line-comment `file_doc_preserved`; Python supplies a parse-based
-    # guard (its docstring content lines are not line-recognisable as comments).
-    if target.preserved is not None:
-        ok = target.preserved(source_lines, out_lines, start, removed, len(new_block))
-    else:
-        ok = file_doc_preserved(source_lines, out_lines, start, removed, len(new_block), style)
-    if not ok:
-        echo("file-doc: the edit would have altered code or preserved text; abandoning it.")
+    # ---- The model-free splice (three shapes + veto + guard live in splice_description). ----
+    out_lines = splice_description(source_lines, target, desc_range, description)
+    if out_lines is None:
         return source_lines
 
     echo("file-doc: " + ("updated the existing file description."
@@ -399,6 +449,135 @@ def _sanitise_description(text: str) -> str:
         s = re.sub(r"^(\*|//|#)\s?", "", s)
         cleaned.append(s)
     return "\n".join(cleaned).strip()
+
+
+# ---- The online file-description round (the scale-filedoc manifest) ----
+#
+# Online, the local model never runs, so there is no local draft to reword: the file description itself is deferred
+# to the stronger model as a second, run-level manifest round after --apply-manifest. The answer is a coupled pair -
+# WHICH header lines are the existing description (the classify decision) plus the replacement prose - so this is a
+# manifest type of its own rather than a reword (whose apply locates a known local draft by exact match). Emit gives
+# the stronger model each file's CURRENT skeleton (rich with the freshly applied docs) and the header zone's eligible
+# lines; apply re-derives the zone, checks it is unchanged, and splices through the same veto + preservation guard as
+# the offline pass.
+
+FILEDOC_VERSION = 1
+FILEDOC_TOOL = "scale-filedoc"
+
+# Cap (characters) on the raw project-overview text carried in the manifest - context, not a payload.
+FILEDOC_PROJECT_DOC_CAP = 12000
+
+
+def filedoc_manifest(description_spec: str, project_doc: str, entries: List[dict]) -> dict:
+    """
+    Build the run's file-description manifest from the spec, the project overview, and the per-file entries.
+
+    Parameters:
+    - `description_spec`: The file-description instruction (scale-cfg/summary.txt or the built-in default) the
+      stronger model writes each description to.
+    - `project_doc`: The raw resolved project-overview text (capped by the caller), so descriptions share the big
+      picture.
+    - `entries`: One dict per target file:
+      `{"path", "language", "role", "skeleton", "entries": [...], "answer": {"range": None, "description": None}}`,
+      where `skeleton` is the file's current structural skeleton (or its whole text when it has no symbols) and
+      `entries` are the header zone's eligible inner texts, numbered from 1 for the `range` answer.
+
+    Returns:
+    - The manifest dictionary ready to be written as JSON.
+    """
+
+    return {
+        "version": FILEDOC_VERSION,
+        "tool": FILEDOC_TOOL,
+        "description_spec": description_spec,
+        "project_doc": project_doc,
+        "files": entries,
+    }
+
+
+def write_filedoc_manifest(path: Path, manifest: dict) -> None:
+    """Write a file-description manifest to disk as indented JSON (UTF-8)."""
+
+    Path(path).write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def read_filedoc_manifest(path: Path) -> dict:
+    """
+    Read and lightly validate a file-description manifest.
+
+    Parameters:
+    - `path`: The manifest file path.
+
+    Returns:
+    - The parsed manifest dictionary.
+
+    Raises:
+    - `ValueError`: If the file is not a filedoc manifest of a supported version.
+    """
+
+    manifest = json.loads(Path(path).read_text(encoding="utf-8"))
+    if (not isinstance(manifest, dict) or manifest.get("tool") != FILEDOC_TOOL
+            or manifest.get("version") != FILEDOC_VERSION):
+        raise ValueError(f"{path}: not a SCALE filedoc manifest of version {FILEDOC_VERSION}")
+    manifest.setdefault("files", [])
+    return manifest
+
+
+def unfilled_descriptions(manifest: dict) -> List[str]:
+    """
+    Return the path of every file entry whose answer pair has not been filled in (the completeness counter).
+
+    An answer needs BOTH halves: `range` ("START-END", a single number, or "NONE" for no existing description) and
+    `description` (the prose, or the explicit "NONE" to decline the file - a deliberate decline counts as filled).
+    A missing/blank half leaves the entry unfilled.
+
+    Parameters:
+    - `manifest`: The parsed filedoc manifest.
+
+    Returns:
+    - The unfilled entries' paths.
+    """
+
+    out: List[str] = []
+    for f in manifest.get("files", []):
+        answer = f.get("answer") or {}
+        if not str(answer.get("range") or "").strip() or not str(answer.get("description") or "").strip():
+            out.append(f.get("path", "?"))
+    return out
+
+
+def apply_filedoc_entry(source_lines: Chunk, target: FileDocTarget, entry: dict) -> Optional[Chunk]:
+    """
+    Apply one filedoc manifest entry to a file (the model-free apply phase of the online file-description round).
+
+    The header zone is re-derived by the caller from the CURRENT text and compared against the entry's recorded
+    `entries`: any mismatch means the file's header changed since emit, so the recorded `range` can no longer be
+    trusted and the apply is a safe no-op. The answer's `range` is parsed with the same `_parse_classify_range` the
+    offline classify turn uses, then `splice_description` runs the splice - the license veto and the preservation
+    guard fire locally exactly as offline, so the stronger model's classification is never blindly trusted.
+
+    Parameters:
+    - `source_lines`: The file's current lines.
+    - `target`: The file's `FileDocTarget`, freshly scanned from these same lines.
+    - `entry`: The manifest file entry carrying `entries` and the filled `answer` pair.
+
+    Returns:
+    - The new lines, or None when nothing was (safely) applicable: a zone mismatch, a "NONE"/empty description, or a
+      veto/guard refusal.
+    """
+
+    current = [inner for (_lineno, _prefix, inner) in target.eligible]
+    recorded = [str(e) for e in (entry.get("entries") or [])]
+    if current != recorded:
+        echo("filedoc: the header zone changed since emit; leaving the file unchanged.")
+        return None
+
+    answer = entry.get("answer") or {}
+    description = str(answer.get("description") or "").strip()
+    if not description or description.upper() == "NONE":
+        return None
+    desc_range = _parse_classify_range(str(answer.get("range") or ""), len(target.eligible))
+    return splice_description(source_lines, target, desc_range, description)
 
 
 def scan_brace_leading_zone(source_lines: Chunk, style: CommentStyle) -> Optional[FileDocTarget]:

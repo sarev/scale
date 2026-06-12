@@ -29,6 +29,7 @@ from scale_log import echo, error, set_verbosity
 from scale_text import (summarise, fit_snippet, LENGTH_LINE, LENGTH_PARAGRAPH, LENGTH_PARAGRAPHS, PRIMING_ACK,
                         MARKER_PYTHON, MARKER_C, MARKER_JS)
 import scale_escalate
+import scale_filedoc
 import scale_project
 import scale_reword
 import scale_verify
@@ -1841,6 +1842,15 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--fragment-size", type=int, default=8, metavar="N",
                    help="Maximum requests per fragment for --next-fragment (default 8).")
 
+    # The online file-description round (a second, model-free manifest after --apply-manifest).
+    p.add_argument("--emit-filedoc", default="", metavar="PATH",
+                   help="Model-free: write the run-level file-description manifest - each target's current skeleton, "
+                        "role, and header-zone lines - for a stronger model to fill (the online --file-doc round; "
+                        "run it on the --apply-manifest outputs).")
+    p.add_argument("--apply-filedoc", default="", metavar="PATH",
+                   help="Model-free: splice each target's header description from this filedoc manifest (the answers' "
+                        "classify range + prose), through the same license veto and preservation guard as --file-doc.")
+
     # The header-reword manifest (prose-only escalation of the file descriptions; requires --file-doc to emit).
     p.add_argument("--emit-reword", default="", metavar="PATH",
                    help="With --file-doc: also write a run-level header-reword manifest carrying the project blurb "
@@ -1928,6 +1938,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if isinstance(raw, dict) and raw.get("tool") == scale_reword.REWORD_TOOL:
             manifest = scale_reword.read_reword_manifest(Path(args.check_manifest))
             missing = scale_reword.unfilled_rewords(manifest)
+            total = len(manifest.get("files", []))
+        elif isinstance(raw, dict) and raw.get("tool") == scale_filedoc.FILEDOC_TOOL:
+            manifest = scale_filedoc.read_filedoc_manifest(Path(args.check_manifest))
+            missing = scale_filedoc.unfilled_descriptions(manifest)
             total = len(manifest.get("files", []))
         else:
             manifest = scale_escalate.read_manifest(Path(args.check_manifest))
@@ -2060,6 +2074,100 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 echo(f"{'Reworded' if changed else 'Unchanged'}: written to {out}")
             else:
                 print("\n".join(new_lines))
+        return rc
+
+    # ---- Filedoc emit phase: model-free. Write the run-level file-description manifest (the online --file-doc
+    # round): each target's CURRENT skeleton (run this after --apply-manifest, so the fresh docs are in it), its
+    # role, and its header zone's eligible lines, for a stronger model to classify-and-describe. ----
+    if args.emit_filedoc:
+        spec = _read_optional(scale_path / "summary.txt") or SUMMARY_INSTRUCTION
+        project_doc_text = ""
+        project_doc = scale_project.resolve_project_doc(args.project_doc, targets[0])
+        if project_doc is not None:
+            try:
+                project_doc_text = project_doc.read_text(encoding="utf-8", errors="replace")
+                project_doc_text = project_doc_text[:scale_filedoc.FILEDOC_PROJECT_DOC_CAP]
+            except OSError:
+                project_doc_text = ""
+
+        entries: List[dict] = []
+        rc = 0
+        for target in targets:
+            language = args.language.lower() if args.language else None
+            source_blob, source_lines, line_ending, language = load_source(target, language)
+            if language not in SUPPORTED_LANGUAGES:
+                error(f"Skipping {target}: unsupported language '{language}' (SCALE supports: "
+                      f"{', '.join(SUPPORTED_LANGUAGES)}).")
+                rc = 1
+                continue
+            try:
+                provider = _file_doc_target_for(language)
+            except NotImplementedError as exc:
+                error(str(exc))
+                rc = 1
+                continue
+            zone = provider(source_blob, source_lines)
+            if zone is None:
+                echo(f"filedoc: {target} has nothing to describe; skipping.")
+                continue
+
+            # The skeleton of the CURRENT text (the applied docs are in it); a no-symbol file rides whole.
+            skeleton = None
+            sym_provider = _symbol_provider_for(language)
+            if sym_provider is not None:
+                try:
+                    skeleton = scale_project.render_skeleton(
+                        source_lines, language, sym_provider(source_blob, source_lines))
+                except Exception:
+                    skeleton = None      # an unparseable file simply falls back to the whole-text path
+            entries.append({
+                "path": str(target),
+                "language": language,
+                "role": _file_role(target, language),
+                "skeleton": skeleton if skeleton else source_blob,
+                "entries": [inner for (_lineno, _prefix, inner) in zone.eligible],
+                "answer": {"range": None, "description": None},
+            })
+
+        manifest = scale_filedoc.filedoc_manifest(spec, project_doc_text, entries)
+        scale_filedoc.write_filedoc_manifest(Path(args.emit_filedoc), manifest)
+        echo(f"Wrote {len(entries)} file-description request(s) to {args.emit_filedoc}")
+        return rc
+
+    # ---- Filedoc apply phase: model-free. Splice each target's header description from the filled manifest. ----
+    if args.apply_filedoc:
+        if dst_path is not None and len(targets) > 1:
+            error("-o/--output cannot be used with multiple targets; multiple targets are patched in place.")
+            return 1
+        manifest = scale_filedoc.read_filedoc_manifest(Path(args.apply_filedoc))
+        file_entries = {str(Path(f.get("path", "")).resolve()): f for f in manifest.get("files", [])}
+        rc = 0
+        for target in targets:
+            entry = file_entries.get(str(target.resolve()))
+            if entry is None:
+                echo(f"No file-description answer for {target}; leaving it unchanged.")
+                continue
+            language = args.language.lower() if args.language else entry.get("language")
+            source_blob, source_lines, line_ending, language = load_source(target, language)
+            try:
+                provider = _file_doc_target_for(language)
+            except NotImplementedError as exc:
+                error(str(exc))
+                rc = 1
+                continue
+            zone = provider(source_blob, source_lines)
+            if zone is None:
+                echo(f"filedoc: {target} has no header zone; leaving it unchanged.")
+                continue
+            new_lines = scale_filedoc.apply_filedoc_entry(source_lines, zone, entry)
+            changed = new_lines is not None
+            final = new_lines if changed else source_lines
+            out = dst_path if len(targets) == 1 else target
+            if out:
+                out.write_bytes(line_ending.join(final).encode("utf-8", errors="surrogateescape"))
+                echo(f"{'Described' if changed else 'Unchanged'}: written to {out}")
+            else:
+                print("\n".join(final))
         return rc
 
     # The block pass runs when spacing is requested or comments are requested (comments imply the pass). The comment

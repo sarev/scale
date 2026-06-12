@@ -45,6 +45,7 @@ DOGFOOD = ROOT / "temp" / "dogfood"
 WALLED = DOGFOOD / "walled"
 ANNOTATED = DOGFOOD / "annotated"
 MANIFEST = DOGFOOD / "scale-manifest.json"
+FILEDOC = DOGFOOD / "scale-filedoc.json"
 
 
 def _docstring_lines(tree: ast.AST) -> set[int]:
@@ -234,11 +235,13 @@ def main() -> int:
     ok = verify(sources)
     run_scale(["--check-manifest", str(MANIFEST.relative_to(ROOT))])  # informational: how much was deferred
 
-    m, t = MANIFEST.relative_to(ROOT), " ".join(targets + out_flag)
+    m, fd, t = MANIFEST.relative_to(ROOT), FILEDOC.relative_to(ROOT), " ".join(targets + out_flag)
     print(f"\nEmit phase complete. Finish the loop with a stronger model filling the manifest answers, then:\n"
           f"  python scale.py --check-manifest {m}\n"
           f"  python scale.py -l python --apply-manifest {m} {t}\n"
-          f"then run the file-description round (--emit-filedoc / --apply-filedoc) over the applied outputs.\n"
+          f"  python scale.py -l python --emit-filedoc {fd} {t}\n"
+          f"  ...fill each file's range + description answer...\n"
+          f"  python scale.py -l python --apply-filedoc {fd} {t}\n"
           f"In Claude Code, the /scale skill drives this whole loop.")
     return 0 if ok else 1
 
