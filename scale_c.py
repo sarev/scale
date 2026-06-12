@@ -1787,7 +1787,7 @@ def _clean_c_comment_answer(text: str) -> str:
     return body.strip()
 
 
-def apply_manifest_c(source_blob: str, source_lines: Chunk, manifest: dict) -> Chunk:
+def apply_manifest_c(source_lines: Chunk, manifest: dict) -> Chunk:
     """
     Patch a stronger model's answers from an escalation manifest into already-locally-annotated C source.
 
@@ -1798,8 +1798,7 @@ def apply_manifest_c(source_blob: str, source_lines: Chunk, manifest: dict) -> C
     does. Everything goes through the same insertion-only patchers and code-preservation guard as the local passes.
 
     Parameters:
-    - `source_blob`: The emit-phase output source as a single string.
-    - `source_lines`: The same source split into individual lines.
+    - `source_lines`: The emit-phase output source split into individual lines.
     - `manifest`: The parsed manifest dictionary, with this file's requests' `answer` slots filled in.
 
     Returns:

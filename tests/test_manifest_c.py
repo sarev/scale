@@ -106,7 +106,7 @@ def main():
 
     # The header request targets the prototype, which lives in this same file in the fixture; apply both sets here.
     sub = dict(manifest)
-    final = scale_c.apply_manifest_c("\n".join(emit), emit, sub)
+    final = scale_c.apply_manifest_c(emit, sub)
 
     proto_idx = final.index("int helper(int x);")
     assert "Adds up the working values." in "\n".join(final[:proto_idx]), \

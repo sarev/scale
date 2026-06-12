@@ -133,13 +133,20 @@ def apply_reword(source_lines: Chunk, target: FileDocTarget, draft: str, answer:
         return source_lines, False
 
     entries = target.eligible
-    want = " ".join(draft.split())
+
+    # Collapse whitespace, then heal hyphen line-breaks: the wrapper may have split "role-based" as "role-" +
+    # "based", which the plain line join turns into "role- based". Applied to BOTH sides the transform is
+    # self-consistent, so equal underlying texts always match.
+    def _collapse(s: str) -> str:
+        return " ".join(s.split()).replace("- ", "-")
+
+    want = _collapse(draft)
     found: Optional[Tuple[int, int]] = None
     for i in range(len(entries)):
         acc: List[str] = []
         for j in range(i, len(entries)):
             acc.append(entries[j][2])
-            got = " ".join(" ".join(acc).split())
+            got = _collapse(" ".join(acc))
             if got == want:
                 found = (i, j)
                 break

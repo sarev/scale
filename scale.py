@@ -1860,7 +1860,6 @@ def _apply_manifest_file(
     src_path: Path,
     dst_path: Optional[Path],
     language: str,
-    source_blob: str,
     source_lines: List[str],
     line_ending: str,
     manifest: dict,
@@ -1875,7 +1874,6 @@ def _apply_manifest_file(
     - `src_path`: The source file (the emit-phase output) being patched.
     - `dst_path`: Where to write the result, or None to print to stdout.
     - `language`: The resolved language identifier.
-    - `source_blob`: The source as a single string.
     - `source_lines`: The source split into individual lines.
     - `line_ending`: The detected line ending used to re-join the output.
     - `manifest`: The parsed manifest dictionary with answers filled in (its `requests` already filtered to this file).
@@ -1892,7 +1890,7 @@ def _apply_manifest_file(
         error(f"--apply-manifest supports Python and C only (got '{language}').")
         return 1
 
-    new_lines = apply_manifest(source_blob, source_lines, manifest)
+    new_lines = apply_manifest(source_lines, manifest)
 
     if dst_path:
         dst_path.write_bytes(line_ending.join(new_lines).encode("utf-8", errors="surrogateescape"))
@@ -1968,7 +1966,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 continue
             entry = file_entries.get(key, {})
             language = args.language.lower() if args.language else entry.get("language")
-            source_blob, source_lines, line_ending, language = load_source(target, language)
+            _blob, source_lines, line_ending, language = load_source(target, language)
             if language not in SUPPORTED_LANGUAGES:
                 error(f"Unsupported language '{language}'. SCALE supports: {', '.join(SUPPORTED_LANGUAGES)}")
                 rc = 1
@@ -1976,7 +1974,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sub_manifest = dict(manifest)
             sub_manifest["requests"] = requests
             out = dst_path if len(targets) == 1 else target
-            frc = _apply_manifest_file(target, out, language, source_blob, source_lines, line_ending, sub_manifest)
+            frc = _apply_manifest_file(target, out, language, source_lines, line_ending, sub_manifest)
             if frc != 0:
                 rc = frc
         return rc

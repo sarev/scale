@@ -32,7 +32,9 @@ comments/docstrings. **Python and C** targets escalate (JS runs locally only).
   and is left **byte-for-byte untouched** in the emitted output. The request carries the routine's identity, ONE
   `snippet` (its verbatim source span), an optional `def` answer slot, and an optional `blocks` recipe (segmentation
   still runs locally; each chunk holds its boundary index `bidx` plus `lines`, its 1-based line range INTO the
-  snippet — chunk text is never duplicated). `run_manifest` merges the per-target collectors, stamps each request
+  snippet — chunk text is never duplicated). When both passes record, the **block recording's snippet wins**: its
+  chunk ranges were computed against the block pass's view of the source, which can be longer than the def pass's
+  (nested routines gain docstrings in between). `run_manifest` merges the per-target collectors, stamps each request
   with its `file`, and **dedupes byte-identical snippets** into a `snippet_ref` (e.g. an impl body that feeds a
   header prototype's prose and is itself deferred crosses the wire once).
 - **Apply** (`--apply-manifest`, model-free, any number of targets): requests are routed to their file, re-bound by

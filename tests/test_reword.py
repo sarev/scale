@@ -86,6 +86,28 @@ def test_python_reword_through_parse_guard():
     assert not changed2 and out2 == PY_SRC
 
 
+PY_HYPHEN_SRC = [
+    '"""',
+    "Handles the run model and its role-",
+    "based formatting of top-of-",
+    "file descriptions.",
+    '"""',
+    "",
+    "VALUE = 1",
+]
+
+
+def test_hyphen_wrapped_draft_still_matches():
+    # The wrapper used to split hyphenated words across lines ("role-" / "based"); the plain whitespace-collapsed
+    # join then reads "role- based" and the draft ("role-based") never matched. Both sides now heal "- " to "-".
+    zone = file_doc_target_py("\n".join(PY_HYPHEN_SRC), PY_HYPHEN_SRC)
+    draft = "Handles the run model and its role-based formatting of top-of-file descriptions."
+    out, changed = apply_reword(PY_HYPHEN_SRC, zone, draft, "Reworded description of the run model.")
+    assert changed, "a draft wrapped across a hyphen must still be located"
+    assert any("Reworded description" in ln for ln in out)
+    assert "VALUE = 1" in out, "code untouched"
+
+
 def test_manifest_io_and_completeness():
     entries = [
         {"path": "a.c", "language": "c", "role": "implementation", "draft": "d1", "context": None, "answer": None},
@@ -115,6 +137,7 @@ def main():
     test_miss_and_none_are_noops()
     test_legal_veto()
     test_python_reword_through_parse_guard()
+    test_hyphen_wrapped_draft_still_matches()
     test_manifest_io_and_completeness()
     print("PASS: the header reword applies by exact draft match through the guards; misses and NONE are no-ops")
     return 0

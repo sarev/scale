@@ -200,7 +200,9 @@ def _wrap(text: str, prefix: str) -> List[str]:
             out.append("")                       # blank line between paragraphs
         collapsed = " ".join(para.split())
         if collapsed:
-            out.extend(textwrap.wrap(collapsed, width=width))
+            # Never split hyphenated words: the reword matcher relocates this text by whitespace-collapsed
+            # comparison, and a "role-" / "based" break re-joins as "role- based", which no longer matches.
+            out.extend(textwrap.wrap(collapsed, width=width, break_on_hyphens=False, break_long_words=False))
     return out or [""]
 
 

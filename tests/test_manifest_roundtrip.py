@@ -120,7 +120,7 @@ def main():
         for ci, chunk in enumerate(req["blocks"]["chunks"]):
             chunk["answer"] = "NONE" if ci == 0 else f"heavy step {ci}"   # exercise NONE on the first chunk
 
-    final = scale_python.apply_manifest("\n".join(emit), emit, manifest)
+    final = scale_python.apply_manifest(emit, manifest)
 
     assert any("# heavy step" in ln for ln in final), "the stronger model's block comments must be inserted"
     assert code_preserved(emit, final, PYTHON_STYLE), "apply must not alter any code"
@@ -150,7 +150,7 @@ def main():
     for req in manifest_d["requests"]:
         req["def"]["answer"] = "Heavy routine docstring written by the stronger model."
 
-    final_d = scale_python.apply_manifest("\n".join(patched), patched, manifest_d)
+    final_d = scale_python.apply_manifest(patched, manifest_d)
     assert any("Heavy routine docstring" in ln for ln in final_d), "heavy's deferred docstring must be applied"
     # The def pass inserts docstrings (which are statements), so it changes the code signature by design; the
     # guarantee is that no original code line is dropped or mutated - every one must still be present.
@@ -163,9 +163,11 @@ def main():
     # recipe together), and the apply phase delivers docstring + spacing + comments from it in one go.
     esc_m = Escalation(threshold=10)
     doc_map_m = scale_python.generate_docstrings(stub, cfg, msgs, defs, SRC, lines, escalation=esc_m)
-    emit_m = scale_blocks.annotate_blocks(stub, cfg, msgs,
-                                          scale_python.patch_docstrings_textually(lines, defs, doc_map_m),
-                                          targets, PYTHON_STYLE, escalation=esc_m)
+    # As in the real pipeline, the block pass re-derives its targets from the def pass's output: 'simple' gained a
+    # docstring above 'heavy', and the block recipe's span/ranges must be computed against the shifted text.
+    patched_m = scale_python.patch_docstrings_textually(lines, defs, doc_map_m)
+    targets_m = scale_python.iter_block_targets("\n".join(patched_m), patched_m)
+    emit_m = scale_blocks.annotate_blocks(stub, cfg, msgs, patched_m, targets_m, PYTHON_STYLE, escalation=esc_m)
     merged = [r for r in esc_m.requests if r["qualname"] == "heavy"]
     assert len(merged) == 1, "both passes must record into ONE per-routine request"
     assert merged[0].get("def") is not None and merged[0].get("blocks") is not None
@@ -178,7 +180,7 @@ def main():
         if req.get("blocks") is not None:
             for chunk in req["blocks"]["chunks"]:
                 chunk["answer"] = "merged note"
-    final_m = scale_python.apply_manifest("\n".join(emit_m), emit_m, manifest_m)
+    final_m = scale_python.apply_manifest(emit_m, manifest_m)
     assert any("Merged docstring." in ln for ln in final_m) and any("# merged note" in ln for ln in final_m), \
         "one merged request must deliver both the docstring and the block comments"
 

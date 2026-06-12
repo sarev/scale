@@ -188,7 +188,8 @@ class Escalation:
         Parameters:
         - `qualname`/`kind`/`sig_hash`: The routine's identity.
         - `cognitive`: The routing score (the highest seen is kept).
-        - `snippet`: The routine's verbatim source span (kept from the first recording that supplies one).
+        - `snippet`: The routine's verbatim source span (kept from the first recording that supplies one;
+          `record_block` then overrides it, because its chunk line ranges index into its own snapshot).
 
         Returns:
         - The (possibly fresh) request dict, already registered in `requests`.
@@ -246,7 +247,9 @@ class Escalation:
         is deferred. Each chunk is identified by its boundary index - the position of its start line within the
         routine's sorted legal boundaries, stable across the line shifts between emit and apply because the escalated
         routine is left untouched - and carries `lines`, the chunk's 1-based line range INTO the routine's `snippet`
-        (so the chunk text is never duplicated alongside the snippet).
+        (so the chunk text is never duplicated alongside the snippet). The snippet supplied here replaces any one a
+        def-pass recording stored earlier: the chunk ranges were computed against the block pass's view of the source,
+        which differs from the def pass's view wherever nested routines gained docstrings in between.
 
         Parameters:
         - `qualname`: The routine's fully qualified name.
@@ -260,7 +263,14 @@ class Escalation:
         - `snippet`: The routine's verbatim source span (header through last body line).
         """
 
-        self._routine(qualname, kind, sig_hash, cognitive, snippet)["blocks"] = {
+        req = self._routine(qualname, kind, sig_hash, cognitive, snippet)
+        # The chunk `lines` index into THIS snapshot of the routine, so a block recording's snippet must win over an
+        # earlier def-pass one. The def pass records from the pre-patch source (docstrings land after its LLM loop),
+        # so by block-pass time nested routines have gained docstrings and the two spans differ - ranges into the
+        # stale span would overrun by the inserted lines. The def answer is indifferent to which snapshot it reads.
+        if snippet:
+            req["snippet"] = snippet
+        req["blocks"] = {
             "doc_summary": doc_summary,
             "length_note": length_note,
             "chunks": [{"bidx": c["bidx"], "lines": list(c.get("lines") or []), "answer": None} for c in chunks],

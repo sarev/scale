@@ -290,7 +290,14 @@ def _header_span(n: ast.AST) -> Tuple[int, int]:
             start = min(deco_starts + [start])
 
     if getattr(n, "body", None):
-        end = n.body[0].lineno - 1
+        first = n.body[0]
+        first_line = first.lineno
+        # A decorated first statement starts at its decorators, not its `def` line; the header must end above them
+        # or a docstring inserted at header_end would split decorator from definition (invalid syntax).
+        deco_starts = [d.lineno for d in getattr(first, "decorator_list", None) or [] if hasattr(d, "lineno")]
+        if deco_starts:
+            first_line = min(deco_starts + [first_line])
+        end = first_line - 1
     else:
         end = getattr(n, "end_lineno", n.lineno)
     return start, end
@@ -436,7 +443,7 @@ def iter_defs_with_info(tree: ast.AST) -> List[DefInfo]:
     return sorted(completed, key=lambda d: d.start)
 
 
-def _collect_calls_py(node: ast.AST) -> List[Tuple[str, str]]:
+def _collect_calls_py(node: ast.AST) -> List[Tuple[str, str, int]]:
     """
     Collect a routine's own call sites, classified for the call-graph resolver, without descending into nested defs.
 
@@ -1816,7 +1823,7 @@ def _clean_docstring_answer(text: str) -> str:
     return textwrap.dedent(body).strip()
 
 
-def apply_manifest(source_blob: str, source_lines: Chunk, manifest: dict) -> Chunk:
+def apply_manifest(source_lines: Chunk, manifest: dict) -> Chunk:
     """
     Patch a stronger model's answers from an escalation manifest into already-locally-annotated Python source.
 
@@ -1829,8 +1836,7 @@ def apply_manifest(source_blob: str, source_lines: Chunk, manifest: dict) -> Chu
     the byte-for-byte code guarantee holds for the stronger model's output too.
 
     Parameters:
-    - `source_blob`: The emit-phase output source as a single string.
-    - `source_lines`: The same source split into individual lines.
+    - `source_lines`: The emit-phase output source split into individual lines.
     - `manifest`: The parsed manifest dictionary, with each request's `answer` slots filled in.
 
     Returns:

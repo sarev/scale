@@ -812,7 +812,7 @@ def iter_defs_with_info_js(tree, source_bytes: bytes) -> List[DefInfoJS]:
     return sorted(completed, key=lambda d: d.start)
 
 
-def _collect_calls_js(node, source_bytes: bytes, def_node_ids: set) -> List[Tuple[str, str]]:
+def _collect_calls_js(node, source_bytes: bytes, def_node_ids: set) -> List[Tuple[str, str, int]]:
     """
     Collect a JS routine's own call sites for the call-graph resolver, without descending into nested routines.
 
@@ -1602,8 +1602,8 @@ def assemble_snippet_for_js(
     This function generates a snippet by splicing together the header and body of the source code.
     The header is obtained from the `source_lines` chunk, spanning from `header_start` to `header_end`.
     The body is constructed by replacing direct children with their corresponding JSDoc comments and headers,
-    and preserving other lines. The replacement is done in a deepest-first order to ensure that parents see
-    child stubs.
+    and preserving other lines. A forward cursor walks the body in source order, copying the gap before each
+    child verbatim and emitting the child's stub (its already-generated doc plus header) in its place.
 
     Parameters:
     - `info_by_id`: A dictionary mapping node IDs to `DefInfoJS` objects.
@@ -1621,18 +1621,20 @@ def assemble_snippet_for_js(
     body_chunks: List[str] = []
 
     direct_children = [info_by_id[cid] for cid in info.children_ids]
-    direct_children.sort(key=lambda d: d.start, reverse=True)  # replace from bottom to top
+    direct_children.sort(key=lambda d: d.start)  # body order: the forward cursor splices gap, stub, gap, stub...
 
     cursor = info.header_end + 1
     for child in direct_children:
         if cursor <= child.start - 1:
             body_chunks.append(_get_text_for_lines(source_lines, cursor, child.start - 1))
-        # child stub
-        header_last_line = source_lines[child.header_end - 1] if 1 <= child.header_end <= len(source_lines) else ""
+        # child stub. In the common brace-on-signature-line style the body block starts on the header line, making
+        # `header_end` come out as `header_start - 1`; clamp so the stub still carries the signature line.
+        hdr_end = max(child.header_end, child.header_start)
+        header_last_line = source_lines[hdr_end - 1] if 1 <= hdr_end <= len(source_lines) else ""
         indent = " " * _leading_spaces_count(header_last_line)
         child_doc = docs_by_id.get(id(child.node), "")
         jsdoc_block = "\n".join(_render_jsdoc_block(child_doc, indent))
-        child_header = _get_text_for_lines(source_lines, child.header_start, child.header_end)
+        child_header = _get_text_for_lines(source_lines, child.header_start, hdr_end)
         body_chunks.append(jsdoc_block + ("\n" if jsdoc_block and child_header else "") + child_header)
         cursor = child.end + 1
 
