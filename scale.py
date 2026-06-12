@@ -1865,7 +1865,6 @@ def _apply_manifest_file(
     Patch a stronger model's manifest answers into the source and write the result (the apply phase entry point).
 
     No model is loaded: the answers are inserted through the same insertion-only patchers as the local passes.
-    Python and C have manifest appliers (the escalation-capable languages).
 
     Parameters:
     - `src_path`: The source file (the emit-phase output) being patched.
@@ -1883,8 +1882,10 @@ def _apply_manifest_file(
         from scale_python import apply_manifest
     elif language == "c":
         from scale_c import apply_manifest_c as apply_manifest
+    elif language == "js":
+        from scale_javascript import apply_manifest_js as apply_manifest
     else:
-        error(f"--apply-manifest supports Python and C only (got '{language}').")
+        error(f"--apply-manifest supports Python, C, and JS only (got '{language}').")
         return 1
 
     new_lines = apply_manifest(source_lines, manifest)
@@ -2129,16 +2130,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                       f"{', '.join(SUPPORTED_LANGUAGES)}).")
                 rc = 1
                 continue
-            if language == "js":
-                error(f"Skipping {target}: --online does not support 'js' yet; annotate it offline.")
-                rc = 1
-                continue
-
             escalation = scale_escalate.Escalation(doc_style=emit_doc_style)
             if args.comment:
                 if language == "python":
                     from scale_python import collect_def_requests
                     n = collect_def_requests(source_blob, source_lines, escalation)
+                elif language == "js":
+                    from scale_javascript import collect_def_requests_js
+                    n = collect_def_requests_js(source_blob, source_lines, escalation)
                 else:
                     from scale_c import collect_def_requests_c
                     doc_plan = c_plan.for_file(str(target.resolve())) if c_plan is not None else None

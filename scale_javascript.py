@@ -40,6 +40,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from scale_blocks import BlockTarget, SegStatement, structural_breaks, SEG_MIN_LEADING_DECLS, SLASH_BLOCK_STYLE
+from scale_escalate import routine_text_hash
 from scale_filedoc import FileDocTarget, scan_brace_leading_zone
 from scale_llm import LocalChatModel, GenerationConfig, Messages, Chunk
 from scale_log import echo, error
@@ -48,6 +49,7 @@ from scale_text import fit_snippet, MARKER_JS, PRIMING_ACK
 from tree_sitter import Parser, Language
 from tree_sitter_javascript import language as js_language
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+import re
 import textwrap
 
 
@@ -1265,6 +1267,10 @@ def iter_block_targets_js(source_blob: str, source_lines: Chunk) -> List[BlockTa
                 indent_of=indent_of,
                 depth=info.depth,
                 doc=_doc_above_header_js(source_lines, info.header_start),
+                # The manifest re-binding identity, over the SAME `header_start..info.end` convention as the
+                # def-side recording (`collect_def_requests_js`) - a mismatch would silently split one routine
+                # into two manifest requests. Comment/blank-invariant: see `_js_span_hash`.
+                sig=_js_span_hash(source_lines, info.header_start, info.end),
                 segments=segments,
             )
         )
@@ -1794,3 +1800,176 @@ def generate_language_comments(
 
     echo("Applying JS patches...\n")
     return patch_comments_textually_js(source_lines, defs, doc_map, style=style)
+
+
+# ---- Manifest emit (model-free) ----------------------------------------------
+
+
+def _js_span_hash(source_lines: Chunk, header_start: int, end: int) -> str:
+    """
+    Hash a JS routine's `header_start..end` span over its CODE lines only - the manifest re-binding identity.
+
+    Unlike C (which hashes the verbatim span), JS has nested definitions: applying a nested function's JSDoc inserts
+    comment lines INSIDE the parent's span, so a verbatim hash taken at emit would no longer match at apply time.
+    Stripping blank and pure-comment lines first (the same normalisation as the code-preservation guard) makes the
+    identity invariant to every edit SCALE can make - doc blocks, block comments, paragraphing blanks - while any
+    genuine code change still changes it. All four hash sites (the def recording, the block provider's `sig`, and
+    both apply re-derivations) share this one function; a mismatch would silently split a routine into two requests.
+
+    Parameters:
+    - `source_lines`: The source split into lines.
+    - `header_start`/`end`: The routine's 1-based inclusive span.
+
+    Returns:
+    - A short hex digest.
+    """
+
+    from scale_blocks import _code_signature
+    span = source_lines[header_start - 1:end]
+    return routine_text_hash("\n".join(_code_signature(span, SLASH_BLOCK_STYLE)))
+
+
+def collect_def_requests_js(source_blob: str, source_lines: Chunk, escalation) -> int:
+    """
+    Record every JS definition as a deferred doc-comment request (the online emit phase) - model-free.
+
+    Every definition-like construct `iter_defs_with_info_js` finds - functions, classes, methods, and function/arrow
+    bindings - is recorded with its verbatim `header_start..end` span as the snippet and the span's code-line hash
+    (`_js_span_hash`) as the re-binding identity. That convention is shared with `iter_block_targets_js`'s `sig` and
+    both apply re-derivations.
+
+    Parameters:
+    - `source_blob`: The complete source text (parsed with Tree-sitter JavaScript).
+    - `source_lines`: The same source split into individual lines.
+    - `escalation`: The `scale_escalate.Escalation` collector for this target file.
+
+    Returns:
+    - The number of definitions recorded.
+    """
+
+    tree, source_bytes = _parse_js(source_blob)
+    defs = iter_defs_with_info_js(tree, source_bytes)
+    for info in defs:
+        span = _get_text_for_lines(source_lines, info.header_start, info.end)
+        escalation.record_def(qualname=info.qualname, kind=info.kind,
+                              sig_hash=_js_span_hash(source_lines, info.header_start, info.end), snippet=span)
+    return len(defs)
+
+
+# ---- Manifest apply (model-free) ----------------------------------------------
+
+
+def _clean_js_comment_answer(text: str) -> str:
+    """
+    Strip any code fence or comment delimiters a stronger model wrapped a JS answer in, leaving bare prose.
+
+    The patcher renders the comment in the file's own doc style, so the answer must be the comment body alone.
+
+    Parameters:
+    - `text`: The raw answer from the manifest.
+
+    Returns:
+    - The cleaned comment body (may be empty).
+    """
+
+    body = (text or "").strip()
+    fence = re.match(r"^```[^\n]*\n(.*)\n```$", body, flags=re.DOTALL)
+    if fence:
+        body = fence.group(1).strip()
+    if body.startswith("/*") or body.startswith("//"):
+        if body.startswith("//"):
+            # A `//` run: strip the leading slashes from each line.
+            body = "\n".join(ln.strip()[2:].strip() if ln.strip().startswith("//") else ln.strip()
+                             for ln in body.split("\n")).strip()
+        else:
+            body = _extract_first_comment_block(body)
+    return body.strip()
+
+
+def apply_manifest_js(source_lines: Chunk, manifest: dict) -> Chunk:
+    """
+    Patch a stronger model's answers from a manifest into JavaScript source (the model-free apply phase for JS).
+
+    Each request is re-bound to its routine by `(qualname, span hash)` - the comment/blank-invariant code-line hash
+    of the routine's `header_start..end` span (`_js_span_hash`), which survives both the line shifts between emit and
+    apply and the JSDoc blocks this very phase inserts inside a parent's span for its nested definitions. Definition
+    docs are patched first (rendered in the file's prevailing doc style); then the text is re-parsed and the block
+    answers placed by boundary index, exactly as the Python/C applies do. Everything goes through the same
+    insertion-only patchers and code-preservation guard as the local passes.
+
+    Parameters:
+    - `source_lines`: The emit-phase source split into individual lines.
+    - `manifest`: The parsed manifest dictionary, with this file's requests' `answer` slots filled in.
+
+    Returns:
+    - The fully annotated source split into individual lines.
+    """
+
+    from scale_blocks import SLASH_LINE_STYLE, _apply_edits, code_preserved, _parse_comment_reply
+
+    requests = manifest.get("requests", [])
+    def_reqs = [r for r in requests if r.get("def") is not None]
+    block_reqs = [r for r in requests if r.get("blocks") is not None]
+
+    out_lines = source_lines
+
+    # ---- 1. Definition answers (a doc block above each header, in the file's own style) ----
+    if def_reqs:
+        tree, sb = _parse_js("\n".join(out_lines))
+        records = iter_defs_with_info_js(tree, sb)
+        style = _detect_doc_style_js(tree, sb)
+        wanted = {(r["qualname"], r["sig_hash"]): r for r in def_reqs}
+        doc_map: Dict[int, str] = {}
+        used: set = set()
+        matched: List[DefInfoJS] = []
+        for info in records:
+            key = (info.qualname, _js_span_hash(out_lines, info.header_start, info.end))
+            req = wanted.get(key)
+            if req is None or key in used:
+                continue
+            answer = req["def"].get("answer")
+            if not answer or not str(answer).strip():
+                echo(f"[apply] Def request '{req['id']}' has no answer; leaving the definition untouched")
+                continue
+            doc = _clean_js_comment_answer(str(answer))
+            if doc and doc.upper() != "NONE":
+                doc_map[id(info.node)] = doc
+                used.add(key)
+                matched.append(info)
+        out_lines = patch_comments_textually_js(out_lines, matched, doc_map, style=style)
+
+    # ---- 2. Block answers (re-parse so spans/boundaries reflect the inserted doc blocks) ----
+    if block_reqs:
+        targets = iter_block_targets_js("\n".join(out_lines), out_lines)
+        by_key = {(t.qualname, t.sig): t for t in targets}
+
+        all_edits: List[Tuple[int, Optional[str], str]] = []
+        for req in block_reqs:
+            target = by_key.get((req["qualname"], req["sig_hash"]))
+            chunks = req["blocks"].get("chunks", [])
+            if target is None:
+                echo(f"[apply] No match for block request '{req['id']}'; skipping")
+                continue
+            if all(c.get("answer") is None for c in chunks):
+                echo(f"[apply] Block request '{req['id']}' has no answers; leaving routine untouched")
+                continue
+
+            edits: List[Tuple[int, Optional[str], str]] = []
+            for chunk in chunks:
+                bidx = chunk["bidx"]
+                if not (0 <= bidx < len(target.boundary_lines)):
+                    continue
+                boundary = target.boundary_lines[bidx]
+                comment = _parse_comment_reply(chunk.get("answer") or "", SLASH_LINE_STYLE)
+                edits.append((boundary, comment, target.indent_of.get(boundary, "")))
+
+            # Per-routine guard: keep this routine's edits only if simulating them preserves its code.
+            trial = _apply_edits(out_lines, edits, SLASH_LINE_STYLE)
+            if code_preserved(out_lines, trial, SLASH_LINE_STYLE):
+                all_edits.extend(edits)
+            else:
+                echo(f"[apply] Skipped '{req['qualname']}': block edit would alter code; keeping original")
+
+        out_lines = _apply_edits(out_lines, all_edits, SLASH_LINE_STYLE)
+
+    return out_lines
