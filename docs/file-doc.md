@@ -20,6 +20,23 @@ slots, for a stronger model to reword the run's descriptions with cross-file con
 re-splices the answers model-free by exact draft match through the same preservation guard (a miss — the file
 changed — is a safe no-op; prose only, no licence/boilerplate ever enters the manifest).
 
+## The online round (`--emit-filedoc` / `--apply-filedoc`, the `scale-filedoc` manifest)
+
+In the [online mode](escalation.md) the local model never runs, so there is no local draft to reword — the
+description itself is deferred, as a second run-level manifest after `--apply-manifest`. It is a manifest type of
+its own (tool `scale-filedoc`, version 1) rather than a reword, because the answer is a **coupled pair**: WHICH
+header lines are the existing description (the classify decision, normally the local model's job) *plus* the
+replacement prose. **Emit** (model-free) records the description spec (`scale-cfg/summary.txt`), the raw project doc
+(capped), and per file its role, its **current skeleton** (run after `--apply-manifest`, so the freshly applied docs
+are in it; a no-symbol file rides whole), and the header zone's eligible lines numbered for the `range` answer.
+**Fill**: the stronger model answers `range` (`START-END`/`N`/`NONE`) + `description` (prose, or the explicit
+`"NONE"` to decline — a deliberate decline counts as filled; `--check-manifest` needs both halves). **Apply**
+(model-free, `apply_filedoc_entry`) re-derives the zone, treats any mismatch with the recorded entries as a safe
+no-op (the file changed since emit), parses the range with the same `_parse_classify_range` as the offline classify
+turn, and splices via `splice_description` — the **license veto and preservation guard run locally exactly as
+offline**, so the stronger model's classification is never blindly trusted. The offline reword flow above is
+byte-for-byte unchanged.
+
 The safety model is the same split that protects the other passes — **the guarantee lives in the patcher, not the
 model** — but applied to legal text: the local model is used *only* to **classify** which existing header lines are
 the editable description (and the summary generation itself writes the prose). It never re-emits any preserved text;
@@ -44,9 +61,10 @@ range (`START-END`/`N`/`NONE`), mapped back to source lines and clamped to the z
 **Fetch the prose**: the engine calls a `summary_provider` callback with the existing description text as a **seed**
 — that runs `_get_file_summary`, so the unified summary is generated (or cache-loaded) *incorporating the author's
 wording* (ingest-and-update), and `_sanitise_description` strips any stray delimiters. There is **no separate
-generate turn**. **Patch**: replace the existing description in place (re-wrapped in the host block's own
-` * `/`// ` decoration), or — when the zone has no usable description — append one into the last block, or — when
-there's no header at all — insert a fresh `/* … */` block at the top.
+generate turn**. **Patch**: the model-free `splice_description` (shared with the online round's apply) replaces the existing
+description in place (re-wrapped in the host block's own ` * `/`// ` decoration), or — when the zone has no usable
+description — appends one into the last block, or — when there's no header at all — inserts a fresh `/* … */` block
+at the top; the veto and guard live inside it.
 
 Only the classify wording is externalised, to `scale-cfg/filedoc.classify.txt` (built-in default as fallback, filled
 brace-safely via `_fill`); the description wording lives in `summary.txt`. Because the provider is the shared

@@ -12,7 +12,7 @@ Every change should serve (and never trade away) these three principles:
 
 1. **Trustworthy and complete.** Pre-existing code is preserved byte-for-byte, and every file/routine the tool is pointed at gets processed — both guaranteed by deterministic machinery (patchers, guards, manifest counters), never by trusting a model's behaviour or diligence.
 2. **Value-adding only.** A comment earns its place by giving insight or speeding a new reader's comprehension; restatements are filtered out. Output claims are checked against the code rather than assumed correct. Known limit: institutional knowledge (design rationale, cross-system contracts) cannot be regenerated — where it already exists, the ingest-and-update seeds preserve it.
-3. **Local-first.** The local model does the volume; a stronger model (Claude, via the manifest) is consulted selectively — by complexity, detected failure, or contract criticality — through bounded, self-contained, machine-checkable work units. It is never handed an open-ended job, and the manifest scaffolding stays lean because in the worst case (a fully uncommented codebase) every routine's code crosses the wire once; nothing should make it cross twice.
+3. **Two modes, both bounded.** `--offline` (the default): everything is written by the local model, no network, no manifest. `--online`: everything is deferred to a stronger model (Claude) via the run manifest — a model-free, instant emit — but only ever through bounded, self-contained, machine-checkable work units, never an open-ended job. The manifest scaffolding stays lean: every routine's code crosses the wire once; nothing may make it cross twice.
 
 A corollary that shapes solutions here: **generic over convention-specific.** Never assume a project's coding conventions (identifier casing, error-code returns, comment density) — mechanisms must work across languages and house styles, unless a language-specific path is generally valuable for that whole language. And prefer **structural fixes over prompt growth**: long rule-laden prompts make small models drift; a second small, single-aspect turn in a clean context (challenge/score patterns) beats adding rules to the first turn.
 
@@ -43,20 +43,20 @@ Two gotchas:
 
 `scale.py` is the CLI/orchestrator; each language worker (`scale_python` / `scale_c` / `scale_javascript`) exposes the identical entry point `generate_language_comments(llm, cfg, messages, source_blob, source_lines)`. Adding a language = implement that + a dispatcher branch.
 
-Up to three passes run in sequence per file, each re-priming and re-parsing the current text: the **definition pass** (`-c`, one docstring/header comment per routine), the **block pass** (`--block-spacing`/`--block-comments`, comments on statement groups inside bodies), and the **file-doc pass** (`--file-doc`, the top-of-file description — runs **LAST**, so it draws on the docs just written). Around them sit: a **project-context layer** (run model, call graph, callee contracts, C header/impl doc-site), a **verification floor** (grounding gate + clean-context challenge turns, default-on), and **selective escalation** to a stronger model via run-level JSON manifests (Python and C).
+Up to three passes run in sequence per file, each re-priming and re-parsing the current text: the **definition pass** (`-c`, one docstring/header comment per routine), the **block pass** (`--block-spacing`/`--block-comments`, comments on statement groups inside bodies), and the **file-doc pass** (`--file-doc`, the top-of-file description — runs **LAST**, so it draws on the docs just written). Around them sit: a **project-context layer** (run model, call graph, callee contracts, C header/impl doc-site) and a **verification floor** (grounding gate + clean-context challenge turns, default-on). That is the offline mode; the **online mode** (`--online --emit-manifest`) instead defers every routine to a stronger model through run-level JSON manifests (all three languages; model-free emit/apply, plus a second `--emit-filedoc`/`--apply-filedoc` round for the file descriptions).
 
 | Module | One-liner |
 | --- | --- |
 | `scale.py` | CLI, language guessing, priming, summary cache, dispatch, file I/O |
 | `scale_llm.py` | `LocalChatModel` over `llama_cpp`, chat formatters, token budgets |
 | `scale_text.py` | `summarise` + crude snippet cropping (`fit_snippet`) |
-| `scale_python.py` / `scale_c.py` / `scale_javascript.py` | Per-language workers: def-pass, block provider, native cognitive scorer (+ C: the `--doc-site` planner) |
+| `scale_python.py` / `scale_c.py` / `scale_javascript.py` | Per-language workers: def-pass, block provider, manifest emit collector + apply (+ C: the `--doc-site` planner) |
 | `scale_blocks.py` | Language-agnostic block pass: structural segmenter, two-turn comment+score, insertion-only patcher + guard |
 | `scale_verify.py` | Grounding gate + challenge turns (the local quality floor) |
-| `scale_escalate.py` | Escalation policy + run-level manifest (emit/check/apply) + parallel-fill fragments |
-| `scale_reword.py` | Header-reword manifest (prose-only) |
+| `scale_escalate.py` | The online run-level manifest (collector/check/apply plumbing) + parallel-fill fragments |
+| `scale_reword.py` | Header-reword manifest (prose-only; offline `--file-doc`) |
 | `scale_project.py` | Run-file store, project blurb, call graph, contract store |
-| `scale_filedoc.py` | File-doc pass engine: classify → license veto → guarded splice |
+| `scale_filedoc.py` | File-doc pass engine: classify → license veto → guarded splice; + the online `scale-filedoc` manifest |
 | `scale_log.py` | `echo`/`error`/verbosity |
 
 ## Invariants — do not break these
@@ -69,13 +69,13 @@ Up to three passes run in sequence per file, each re-priming and re-parsing the 
 
 ## Detailed documentation (read on demand)
 
-- [docs/cli.md](docs/cli.md) — every flag with worked example commands (block pass, file-doc, references, doc-site, manifests, reword).
+- [docs/cli.md](docs/cli.md) — every flag with worked example commands (block pass, file-doc, references, doc-site, the online mode's manifests, reword).
 - [docs/architecture.md](docs/architecture.md) — the per-file pipeline (load/prime/summary), the full module table, the shared worker pattern, structural elision, doc-style matching, summary cache, LLM layer, dependencies.
 - [docs/block-pass.md](docs/block-pass.md) — the within-function block pass: providers, the deterministic structural segmenter and its rules, the two-turn summarise-then-score comment pass, the patcher, prompt files, and the 7B reality check.
-- [docs/verification.md](docs/verification.md) — the backtick-grounding gate, the three clean-context challenge turns, and the shared failure routing (regenerate once → promote or drop/warn).
+- [docs/verification.md](docs/verification.md) — the backtick-grounding gate, the three clean-context challenge turns, and the failure routing (regenerate once → drop/warn).
 - [docs/project-context.md](docs/project-context.md) — the multi-file run model and retained run-file store, project blurb, call graph (leaf-first order + callee contracts + lazy one-liners), ingest-and-update seeds, block-pass read-side call annotations, and the C header/impl doc-site.
-- [docs/file-doc.md](docs/file-doc.md) — the top-of-file description pass: two-pass descriptions, classify + license veto + preservation guard, the Python module-docstring target, and the header-reword manifest.
-- [docs/escalation.md](docs/escalation.md) — selective escalation: the three routing signals (native cognitive scorers per language), the run-level manifest schema and emit/apply phases, the completeness counter, and the `/scale` skill loop.
+- [docs/file-doc.md](docs/file-doc.md) — the top-of-file description pass: two-pass descriptions, classify + license veto + preservation guard, the Python module-docstring target, the header-reword manifest, and the online `scale-filedoc` round.
+- [docs/escalation.md](docs/escalation.md) — the online mode: the two modes, the model-free instant emit, the run-level manifest schema and emit/apply phases, the completeness counter, fragments, and the `/scale` skill loop.
 - [docs/prompt-tuning.md](docs/prompt-tuning.md) — every `scale-cfg/` prompt file and which constant it overrides; the primary lever for output quality.
 - [docs/tests.md](docs/tests.md) — the full test catalogue (which past bug each test guards) and the model-dependent `tests/block_eval/` harnesses.
 

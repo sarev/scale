@@ -25,7 +25,7 @@ Existing documentation is an input, not an obstacle: SCALE reads what's already 
 
 A small local model writes plausible prose; left unchecked, some of it would be wrong or worthless. SCALE doesn't trust it:
 
-- **Claims are verified against the code.** Every generated comment is challenged in a fresh model context — do the things it names actually appear in the source? Is it telling the reader something the code doesn't already say? Failures are regenerated once, then dropped, flagged in the run output, or set aside for a stronger model.
+- **Claims are verified against the code.** Every generated comment is challenged in a fresh model context — do the things it names actually appear in the source? Is it telling the reader something the code doesn't already say? Failures are regenerated once, then dropped or flagged in the run output.
 - **Restatements are filtered.** A comment that just narrates the line below it ("increment the counter") is rejected. The density knob (`low`/`medium`/`high`) sets how strict this is.
 - **Completion is counted, not assumed.** Multi-file runs track every routine; nothing is silently skipped.
 
@@ -40,23 +40,26 @@ Annotating a file in isolation produces isolated-sounding docs. SCALE can do bet
 - **Read-only references.** `--reference include/` parses extra files (e.g. your headers) for context without ever editing them.
 - **Project blurb.** `--project-doc` feeds every pass a short description of the wider project (auto-detected from a nearby `README`/`CLAUDE.md`), so file descriptions know their place in the system.
 
-## Claude Code integration — and why
+## Two modes: offline and online
 
-A local 7B model is fast, free, and private, and for most routines it writes perfectly serviceable documentation. But some routines are genuinely hard — dense logic, subtle contracts — and that's exactly where a weak model's prose stops being trustworthy. Sending the *whole* codebase to a frontier model would fix quality but costs money and privacy on the 95% that didn't need it.
+**Offline is the default.** Every pass, including verification, runs entirely on your own hardware via the local GGUF model — no network, nothing leaves your system.
 
-SCALE splits the difference. The local model does the volume, and the hard cases are collected into a **manifest**: a single JSON file of self-contained work units (the routine's code plus context, and an empty slot for the answer). A stronger model fills in the slots; SCALE applies the answers back through the same code-preserving patcher, and a completeness check counts what's still unfilled. Routines are escalated for concrete reasons — cognitive complexity above a threshold (`--escalate-cognitive 10`), comments that twice failed verification, or C header prototypes whose docs define a public API contract.
+**Online** (`--online`) trades that privacy for quality: every routine's comments are written by a stronger model (in practice, Claude via Claude Code) instead of the local one. SCALE collects the work into a **manifest** — a single JSON file of self-contained units (each routine's code plus context, and empty slots for the answers). The emit is model-free and finishes in seconds (the GGUF is never loaded); the stronger model fills in the slots; SCALE applies the answers back through the same code-preserving patcher, and a completeness check counts what's still unfilled. The structure stays SCALE's: segmentation, placement, and the byte-for-byte guarantee are deterministic machinery, and the stronger model is only ever handed bounded, machine-checkable units — never an open-ended "comment this codebase".
 
 ```bash
-python scale.py -c --block-comments medium -l c --escalate-cognitive 10 \
-    --emit-manifest scale-manifest.json "src/*.c"      # local model does the bulk
+python scale.py -c --block-comments medium -l c --online \
+    --emit-manifest scale-manifest.json "src/*.c"      # model-free, instant
 # ...a stronger model fills in the manifest answers...
 python scale.py --check-manifest scale-manifest.json   # exits non-zero until complete
 python scale.py -l c --apply-manifest scale-manifest.json "src/*.c"   # no model loaded
+# ...then the file descriptions, as a second small manifest round...
+python scale.py -l c --emit-filedoc scale-filedoc.json "src/*.c"
+python scale.py -l c --apply-filedoc scale-filedoc.json "src/*.c"
 ```
 
-The repository ships a Claude Code skill (`.claude/skills/scale/`) that drives this loop end-to-end: ask Claude Code to "scale" some files and it runs the local pass, fills the manifest itself, applies the answers, and verifies the counts. Claude only ever sees the deferred routines, and its answers go through the same machinery as everything else.
+The repository ships a Claude Code skill (`.claude/skills/scale/`) that drives this loop end-to-end: ask Claude Code to "scale" some files and it emits the manifest, fills it (fanning out parallel subagents over self-contained fragments), applies the answers, runs the file-description round, and verifies the counts. Claude's answers go through the same machinery as everything else.
 
-**None of this is required.** Skip the manifest flags and SCALE is a fully offline tool — every pass, including verification, runs entirely on your own hardware.
+**None of this is required.** Without `--online`, SCALE is a fully offline tool.
 
 ## Using SCALE
 
@@ -102,7 +105,7 @@ python tests/run_all.py    # everything, with a pass/fail summary; non-zero exit
 ## Scope and limits
 
 - Python, C, and JavaScript only, for now.
-- Output quality tracks the model you give it. A code-tuned 7B writes good summaries and serviceable walkthroughs; genuinely insightful commentary on the hardest routines is what the escalation path is for.
+- Offline output quality tracks the model you give it. A code-tuned 7B writes good summaries and serviceable walkthroughs; consistently trustworthy, insightful commentary is what the online mode is for.
 - SCALE cannot invent institutional knowledge — design rationale and cross-system context that only live in someone's head. Where that knowledge is already written down, it is preserved and updated; where it isn't, you still need a human.
 
 ## Picking an LLM

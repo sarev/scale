@@ -1694,7 +1694,7 @@ def _clean_c_comment_answer(text: str) -> str:
 
 def apply_manifest_c(source_lines: Chunk, manifest: dict) -> Chunk:
     """
-    Patch a stronger model's answers from an escalation manifest into already-locally-annotated C source.
+    Patch a stronger model's answers from a run manifest into C source (the online apply phase).
 
     The model-free apply phase for C. Each request is re-bound to its record by `(qualname, span hash)` - the hash of
     the routine's verbatim text (`routine_text_hash`), which survives the line shifts between emit and apply because a

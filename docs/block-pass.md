@@ -48,7 +48,7 @@ closes (a dedent).
   in-body docstring) and `allow_after_def` (off for C — no nested functions). The `depth` field is any
   order-preserving nesting proxy (Python passes the source column; C/JS pass parent-chain depth).
 - **Size, not cognitive complexity, gates triviality** (cc is nesting-dominated and wrongly demotes long-but-flat
-  blocks). This is free, reproducible, and — being model-free — also makes the escalation manifest's chunk recipe
+  blocks). This is free, reproducible, and — being model-free — also makes the online manifest's chunk recipe
   deterministic across emit/apply. The Python segmenter was developed/validated against a corpus with
   `tests/block_eval/segment_eval.py` (model-free harness: wall a file, re-segment, diff vs the human paragraphing).
 - **LLM fallback** (`request_segments`): now only a safety net for a target with no structural segmenter; it renders
@@ -135,6 +135,6 @@ parses the def-pass output so each routine's **header doc** is in the comment co
 so a later paragraph is never reasoning about state an earlier (uncommented) one silently changed — the specific gap
 that produced the worst hallucinations. The 1–3 **value score** + `--block-comments` density then filters bland
 restatements out of the code (keeping them only as context). Residual limits remain — the 7B still mislabels
-genuinely ambiguous near-duplicate branches — so materially better *prose* still wants a stronger model for the
-comment turns (segment/comment/score turns are separate; a stronger model could drive comments alone, or via the
-escalation manifest for the complex routines).
+genuinely ambiguous near-duplicate branches — which is exactly what the [online mode](escalation.md) exists for: the
+segmentation is structural either way, and online the comment text comes from the stronger model via the manifest's
+chunk recipes.

@@ -30,9 +30,8 @@ prompts make small models drift; a second small, single-aspect turn in a clean c
   **obviousness challenge** (block comments: does this tell the reader anything not evident from the code?), and the
   **story challenge** (a routine's block comments as a set: do they tell the routine's story or just restate it?).
 
-The shared failure routing lives with the call sites: a challenge failure regenerates once with the verdict as
-feedback; a second failure promotes the routine to the escalation manifest when one is active (discarding the local
-attempt), else drops a block comment (wrongness is worse than absence) or writes a def doc under a prominent warning
+The failure routing lives with the call sites: a challenge failure regenerates once with the verdict as feedback; a
+second failure drops a block comment (wrongness is worse than absence) or writes a def doc under a prominent warning
 (so the doubt is visible rather than silent). The `Verifier` here only detects and phrases; it never patches - the
 byte-for-byte code guarantee is untouched.
 """

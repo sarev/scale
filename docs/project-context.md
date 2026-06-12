@@ -138,7 +138,7 @@ index** in `build_project_graph`, so a decl/def pair never makes a name ambiguou
 
 ## Scope/limits (the whole layer)
 
-Escalation is honoured (a deferred routine doesn't call `on_doc`, so its contract stays the seed; its manifest chunk
-text is unannotated); resolution is confident-only and the file order is coarse (a forward/cyclic cross-file
+This layer belongs to the offline mode (the online emit is model-free and sends verbatim spans, so it needs no
+priming context); resolution is confident-only and the file order is coarse (a forward/cyclic cross-file
 reference falls back to the seed/empty contract — or a lazily-generated one-liner). The patchers and the
 byte-for-byte guarantee are untouched — this layer only enriches the priming context and the visiting order.

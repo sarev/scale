@@ -874,7 +874,7 @@ def _looks_like_ack(text: str) -> bool:
 
 
 def _is_unusable_docstring(reply: str, docstring: str) -> bool:
-    """Report whether a docstring reply must be retried/escalated: empty, or just an acknowledgement."""
+    """Report whether a docstring reply must be retried: empty, or just an acknowledgement."""
     return (not docstring) or _looks_like_ack(docstring) or _looks_like_ack(reply)
 
 
@@ -1705,7 +1705,7 @@ def _clean_docstring_answer(text: str) -> str:
 
 def apply_manifest(source_lines: Chunk, manifest: dict) -> Chunk:
     """
-    Patch a stronger model's answers from an escalation manifest into already-locally-annotated Python source.
+    Patch a stronger model's answers from a run manifest into Python source (the online apply phase).
 
     This is the model-free apply phase. Each request is re-bound to its routine by `(qualname, node_sig)` - a structural
     signature that survives the line shifts, inserted comments, and docstring changes between the emit and apply phases.

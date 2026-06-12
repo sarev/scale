@@ -1,53 +1,51 @@
-# Selective escalation to a stronger model (`scale_escalate.py`, `--emit-manifest`/`--apply-manifest`)
+# The online mode (`--online`, `scale_escalate.py`, `--emit-manifest`/`--apply-manifest`)
 
-The local 7B is "good enough" for the bulk, but the comments worth a stronger model are exactly those for the most
-involved routines — where the 7B's prose gets unreliable. This feature routes that split **without weakening the
-code guarantee**, because the guarantee lives in the patcher, not the model: a stronger model's reply flows through
-the *same* extractor + insertion-only patcher + `code_preserved` guard as the local one, so it can only ever change
-comments/docstrings. **Python and C** targets escalate (JS runs locally only).
+SCALE runs in one of **two modes**. **Offline** (the default): the local model writes everything; no manifest is
+involved. **Online** (`--online --emit-manifest m.json`): *every* routine's comments and docstrings are deferred to
+a stronger model (e.g. Claude Code) via one run-level JSON manifest. Dogfood review drove the split: escalated
+output met the hand-curated quality bar while local-7B output carried a ~1-in-5 false-claim rate — and a tool whose
+whole output must be proof-read isn't a serious tool, so the old *selective* escalation (cognitive-complexity
+routing) was replaced by the whole-run deferral and the complexity machinery deleted.
 
-## Three routing signals
-
-1. **Cognitive complexity**: every language has a **native scorer** — `scale_python.cognitive_complexity(node)` on
-   SCALE's own `ast`, plus its tree-sitter mirrors `scale_c.cognitive_complexity_c(node)` and
-   `scale_javascript.cognitive_complexity_js(node)` — all computing the same SonarSource-style score (`+1`/`+nesting`
-   per `if`/`for`/`while`/`do`/`switch`/`try`/ternary; `+1` per `elif`/`else`/`except`/`catch`/`finally`
-   continuation, with C/JS `else if` chains folded so they read as cheap continuations rather than nested ifs; `+1`
-   per boolean-operator *sequence*, runs of the same operator collapsed; nested defs opaque; a bodyless C prototype
-   scores 0), so one `--escalate-cognitive` cutoff is meaningful across languages. A routine escalates when its
-   score **exceeds** `--escalate-cognitive` (default 10). `--codestats-json <report>` overrides the native score
-   per-qualname. The scorers also stamp `BlockTarget.cognitive` in every block provider, so block-pass escalation
-   routes natively too (JS carries the score but does not escalate).
-2. **Verification failures** (see [verification.md](verification.md)): a doc/note that fails its gate or challenge
-   twice is promoted, discarding the local attempt.
-3. **C doc-site redirected prototypes**: with a manifest active they are *always* deferred — a public contract is
-   the highest value per stronger-model token.
+Neither mode weakens the code guarantee, because the guarantee lives in the patcher, not the model: a stronger
+model's reply flows through the *same* extractor + insertion-only patcher + `code_preserved` guard as a local one,
+so it can only ever change comments/docstrings. **Python, C, and JS** targets are all supported online.
 
 ## Two phases around ONE run-level JSON manifest
 
 (`scale_escalate` schema, version 2; v1 is read-upgraded.)
 
-- **Emit** (`--emit-manifest`, any number of targets): the passes run with the local model as usual, but a deferred
-  routine gets a **per-routine request** — both passes record into the *same* request keyed `(qualname, sig_hash)` —
-  and is left **byte-for-byte untouched** in the emitted output. The request carries the routine's identity, ONE
-  `snippet` (its verbatim source span), an optional `def` answer slot, and an optional `blocks` recipe (segmentation
-  still runs locally; each chunk holds its boundary index `bidx` plus `lines`, its 1-based line range INTO the
-  snippet — chunk text is never duplicated). When both passes record, the **block recording's snippet wins**: its
-  chunk ranges were computed against the block pass's view of the source, which can be longer than the def pass's
-  (nested routines gain docstrings in between). `run_manifest` merges the per-target collectors, stamps each request
-  with its `file`, and **dedupes byte-identical snippets** into a `snippet_ref` (e.g. an impl body that feeds a
-  header prototype's prose and is itself deferred crosses the wire once).
+- **Emit** (`--online --emit-manifest`, any number of targets): **model-free and instant — the GGUF is never
+  loaded.** Each target is parsed and every routine recorded as a **per-routine request** — the def collector and
+  the block collector record into the *same* request keyed `(qualname, sig_hash)` — while the target itself is left
+  **byte-for-byte untouched**. The request carries the routine's identity, ONE `snippet` (its verbatim source span),
+  an optional `def` answer slot, and an optional `blocks` recipe (segmentation is structural and runs at emit; each
+  chunk holds its boundary index `bidx` plus `lines`, its 1-based line range INTO the snippet — chunk text is never
+  duplicated). The collectors are `scale_python.collect_def_requests`, `scale_c.collect_def_requests_c` (doc-site
+  aware: a redirected definition is skipped and its header prototype requested instead, with the impl body as the
+  prose source), `scale_javascript.collect_def_requests_js`, and the language-agnostic
+  `scale_blocks.defer_block_targets`. `run_manifest` merges the per-target collectors, stamps each request with its
+  `file`, and **dedupes byte-identical snippets** into a `snippet_ref` (e.g. an impl body that feeds a header
+  prototype's prose and is itself deferred crosses the wire once). The local passes (`--file-doc`, bare
+  `--block-spacing`, `--emit-reword`) have no online form and error out with a pointer.
 - **Apply** (`--apply-manifest`, model-free, any number of targets): requests are routed to their file, re-bound by
-  `(qualname, sig_hash)` (Python: `node_sig`, AST-structural; C: `routine_text_hash`, the span-text hash — both
-  shift-proof because the routine was untouched), then docstrings are patched and the text re-parsed before block
-  answers are placed by boundary index (`scale_python.apply_manifest` / `scale_c.apply_manifest_c`).
+  `(qualname, sig_hash)` (Python: `node_sig`, AST-structural; C: `routine_text_hash`, the verbatim span-text hash;
+  JS: `_js_span_hash`, a comment/blank-stripped code-line hash, because applying a nested function's JSDoc inserts
+  comment lines *inside* the parent's span — all shift-proof), then docstrings are patched and the text re-parsed
+  before block answers are placed by boundary index (`scale_python.apply_manifest` / `scale_c.apply_manifest_c` /
+  `scale_javascript.apply_manifest_js`).
+
+The manifest carries a top-level **`doc_style`** (guidelines + the def-pass templates of the run's target languages)
+so the stronger model writes deferred docs to house style.
 
 ## Completeness is a counter, not trust
 
 `--check-manifest m.json` (model-free, no targets) prints every unfilled answer slot and exits nonzero while any
 remains — the driver loops until it reports 0 (it also notes how many requests are checked out to outstanding
 fragments). `null`/whitespace is unfilled; the explicit string `"NONE"` is a deliberate decline (a NONE block chunk
-paragraphs with a blank but invents no comment; an unanswered request leaves its routine untouched).
+paragraphs with a blank but invents no comment; an unanswered request leaves its routine untouched). The same
+checker dispatches the [file-description manifest](file-doc.md) (`scale-filedoc`) and the offline reword manifest by
+their `tool` field.
 
 ## Fragments: SCALE owns the slot bookkeeping, so filling agents run in parallel
 
@@ -66,17 +64,19 @@ the merged master, deletes the spent fragment files, and then refuses to apply w
 leftovers are listed, their checkout markers cleared (back into the pile for the next `--next-fragment`), and the
 exit is nonzero. Only a complete master proceeds to the real apply, so the counter invariant is unchanged.
 
+## The file-description round (a second manifest)
+
+Online there is no local draft to reword, so after `--apply-manifest` the top-of-file descriptions get their own
+round: model-free `--emit-filedoc fd.json` (each target's current skeleton + role + header-zone lines) → the
+stronger model fills each file's `range` + `description` answer pair → model-free `--apply-filedoc fd.json`, which
+runs the license veto and preservation guard locally. See [file-doc.md](file-doc.md).
+
 ## The `/scale` skill is the intended driver
 
-(`.claude/skills/scale/`): emit run → Claude checks out fragments with `--next-fragment` and fills them with **one
-fresh subagent per fragment, all in parallel** (fragments are self-contained: `doc_style` + ~8 requests; the driver
-never reads code, it only hands out fragments and gates on the merge) → model-free apply (merges fragments, errors
-incomplete rounds back to step one) → a second local invocation (`--file-doc --emit-reword`: pass-2 descriptions +
-header splice + reword manifest, see [file-doc.md](file-doc.md)) → Claude fills the reword manifest in a single
-context (prose-only, small) → model-free `--apply-reword`. Two bounded Claude touchpoints, each with a
-machine-checked completion condition; without escalation, ONE local invocation does everything and no Claude tokens
-are spent.
-
-The manifest carries a top-level **`doc_style`** (guidelines + the def-pass templates of the run's
-escalation-capable languages) so the stronger model writes deferred docstrings to house style. The def-pass
-"unusable reply" nudge (`DOCSTRING_NUDGE`) still runs first; promotion only happens after it fails too.
+(`.claude/skills/scale/`): model-free emit (instant; no model path needed) → Claude checks out fragments with
+`--next-fragment` and fills them with **one fresh subagent per fragment, all in parallel** (fragments are
+self-contained: `doc_style` + ~8 requests; the driver never reads code, it only hands out fragments and gates on the
+merge) → model-free apply (merges fragments, errors incomplete rounds back to the fragment loop) → model-free
+`--emit-filedoc` → Claude fills the file descriptions in a single context (prose-only, small) → model-free
+`--apply-filedoc`. Every Claude touchpoint is bounded and machine-checked; offline, ONE local invocation does
+everything and no Claude tokens are spent.

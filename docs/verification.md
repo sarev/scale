@@ -18,13 +18,12 @@ not longer generation prompts:
   from the code?" — kills restatement and purpose-clause score-gaming), and the **story challenge** (per routine,
   after its chunks: do the notes as a set tell the routine's story or restate it? — length-guarded by
   `SHORT_FUNCTION_CHUNKS` and skipped when nothing would be written).
-- **Shared failure routing**: a failure regenerates ONCE with the verdict as feedback (in the worker's own context),
-  then a second failure routes — **promote to the manifest** when escalation is active (the local attempt is
-  discarded; a block/story promotion records the chunk recipe and leaves the routine byte-for-byte untouched,
-  preserving the sig-hash invariant, so apply delivers spacing + comments together); without a manifest, a
-  twice-failed block note is **dropped** (kept as `{priors}` context under `CHALLENGE_FLAG`, never written —
-  wrongness is worse than absence) and a twice-failed def doc is **written under a prominent stderr warning** (a
-  visible contract beats a silent gap).
+- **Failure routing**: a failure regenerates ONCE with the verdict as feedback (in the worker's own context); on a
+  second failure, a block note is **dropped** (kept as `{priors}` context under `CHALLENGE_FLAG`, never written —
+  wrongness is worse than absence; a twice-failed story drops the routine's whole note set while keeping the
+  paragraphing blanks) and a def doc is **written under a prominent stderr warning** (a visible contract beats a
+  silent gap). When the local floor isn't good enough, the answer is the [online mode](escalation.md), not
+  per-routine promotion.
 
 Wording lives in `scale-cfg/verify.*.txt` (gate nudge, the three challenge prompts, and their feedback texts),
 overriding constants in `scale_verify.py` — see [prompt-tuning.md](prompt-tuning.md).

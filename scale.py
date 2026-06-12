@@ -1851,7 +1851,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Model-free: splice each target's header description from this filedoc manifest (the answers' "
                         "classify range + prose), through the same license veto and preservation guard as --file-doc.")
 
-    # The header-reword manifest (prose-only escalation of the file descriptions; requires --file-doc to emit).
+    # The header-reword manifest (prose-only stronger-model reword of the offline --file-doc descriptions).
     p.add_argument("--emit-reword", default="", metavar="PATH",
                    help="With --file-doc: also write a run-level header-reword manifest carrying the project blurb "
                         "and each file's role + freshly spliced draft description, for a stronger model to reword "

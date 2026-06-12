@@ -35,11 +35,12 @@ python scale.py -c --block-comments medium -l c "src/**/*.c" --reference include
 # .c's docstring; 'impl' keeps the legacy impl docstring (target prototypes are still documented, from the prototype).
 python scale.py -c --block-comments medium -l c "src/*.c" "include/*.h" --doc-site auto -m /path/model.gguf -v
 
-# Selective escalation (Python and C): emit ONE run-level manifest of deferred routines (cognitive > N, twice-failed
-# verification, and C doc-site prototypes) covering all targets, then apply the stronger model's answers (model-free).
-# The /scale skill drives the whole loop with Claude as the stronger model.
-python scale.py -c --block-comments medium -l python -m /path/model.gguf --escalate-cognitive 10 \
-  --emit-manifest m.json "src/*.py"                     # emit: local model + manifest (multi-target = in place)
+# The ONLINE mode (Python, C, JS): defer EVERY routine's comments to a stronger model via ONE run-level manifest.
+# The emit is model-free and instant - the GGUF is never loaded - and the targets are left byte-for-byte untouched.
+# The /scale skill drives the whole loop with Claude as the stronger model. (--offline is the default mode; the two
+# flags are mutually exclusive, and --online requires --emit-manifest.)
+python scale.py -c --block-comments medium -l python --online \
+  --emit-manifest m.json "src/*.py"                      # emit: model-free; every def + block recipe requested
 python scale.py --check-manifest m.json                  # model-free completeness counter (exit 1 while unfilled)
 python scale.py --next-fragment m.json --fragment-size 8 # check out the next <=8 unfilled requests as a small
                                                          # self-contained fragment (m.frag-001.json; path printed).
@@ -49,13 +50,19 @@ python scale.py -l python --apply-manifest m.json "src/*.py"   # apply: no model
                                                          # merged in first (first write wins; spent files deleted);
                                                          # unfilled slots error out and return to the pile.
 
-# Verification (the local quality floor) is ON by default for the def/block passes: the deterministic
+# The online file-description round (runs AFTER --apply-manifest, both phases model-free): --emit-filedoc records
+# each target's current skeleton + role + header-zone lines; the stronger model fills each file's range+description
+# answer pair; --apply-filedoc splices through the same license veto and preservation guard as --file-doc.
+python scale.py -l python --emit-filedoc fd.json "src/*.py"
+python scale.py -l python --apply-filedoc fd.json "src/*.py"
+
+# Verification (the local quality floor) is ON by default for the offline def/block passes: the deterministic
 # backtick-grounding gate plus clean-context challenge turns (grounding / obviousness / story). --no-verify disables.
 
-# The header-reword manifest (--emit-reword, requires --file-doc) records every freshly spliced file description for
-# a stronger model to reword with cross-file consistency; --apply-reword re-splices the answers model-free (each
-# draft located by exact match through the preservation guard; a miss is a safe no-op). --check-manifest counts both
-# manifest kinds.
+# The header-reword manifest (--emit-reword, requires the offline --file-doc) records every freshly spliced file
+# description for a stronger model to reword with cross-file consistency; --apply-reword re-splices the answers
+# model-free (each draft located by exact match through the preservation guard; a miss is a safe no-op).
+# --check-manifest counts all three manifest kinds (scale / scale-filedoc / scale-reword).
 python scale.py --file-doc -l c -m /path/model.gguf --emit-reword r.json "src/*.c"
 python scale.py -l c --apply-reword r.json "src/*.c"
 
