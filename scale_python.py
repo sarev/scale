@@ -127,110 +127,6 @@ def _node_kind(n: ast.AST) -> str:
     return "def"
 
 
-def cognitive_complexity(node: ast.AST) -> int:
-    """
-    Compute the SonarSource-style Cognitive Complexity of a single routine's own body.
-
-    This is SCALE's escalation routing signal: a routine scoring above the configured cutoff has its
-    comment/docstring generation handed to a stronger model, while simpler routines stay on the local model. The
-    metric mirrors the one in the companion `codestats` tool (the SonarSource 2017 rules), computed here directly on
-    CPython's `ast` so the score lines up exactly with SCALE's own definition nodes and qualnames:
-
-      - +1 (and +1 per enclosing nesting level) for each `if` / `for` / `while` / `try` and ternary expression;
-      - +1 (with no nesting penalty) for each `elif` / `else` / `except` / `finally` continuation;
-      - +1 for each boolean-operator sequence (`and` / `or`).
-
-    `with` blocks add nothing and do not deepen nesting (matching codestats). Nested functions, async functions and
-    classes are opaque - the walk does not descend into them - so each routine is scored on its own control flow and
-    nested routines are scored separately when they are processed as their own targets.
-
-    Parameters:
-    - `node`: A function/async-function/class definition node whose body is scored.
-
-    Returns:
-    - The cognitive complexity as a non-negative integer.
-    """
-
-    score = 0
-
-    def visit(n: ast.AST, nesting: int) -> None:
-        """Walk `n`, adding to `score`; `nesting` is the count of enclosing nesting constructs."""
-        nonlocal score
-
-        # Nested definitions are opaque: they are scored separately as their own routines.
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            return
-
-        if isinstance(n, ast.If):
-            # Fold the elif chain iteratively so `elif` reads as a continuation (+1, no nesting penalty) rather than
-            # an ever-deeper nested `if`.
-            score += 1 + nesting
-            visit(n.test, nesting)
-            for c in n.body:
-                visit(c, nesting + 1)
-            orelse = n.orelse
-            while orelse:
-                if len(orelse) == 1 and isinstance(orelse[0], ast.If):
-                    elif_node = orelse[0]
-                    score += 1
-                    visit(elif_node.test, nesting)
-                    for c in elif_node.body:
-                        visit(c, nesting + 1)
-                    orelse = elif_node.orelse
-                else:
-                    score += 1
-                    for c in orelse:
-                        visit(c, nesting + 1)
-                    orelse = []
-            return
-
-        if isinstance(n, (ast.For, ast.AsyncFor, ast.While)):
-            score += 1 + nesting
-            visit(n.test if isinstance(n, ast.While) else n.iter, nesting)
-            for c in n.body:
-                visit(c, nesting + 1)
-            for c in n.orelse:  # `else` clause of a loop
-                visit(c, nesting + 1)
-            return
-
-        if isinstance(n, ast.Try):
-            score += 1 + nesting
-            for c in n.body:
-                visit(c, nesting + 1)
-            for handler in n.handlers:  # each `except` is a +1 continuation
-                score += 1
-                for c in handler.body:
-                    visit(c, nesting + 1)
-            for c in n.orelse:
-                visit(c, nesting + 1)
-            if n.finalbody:  # `finally` is a +1 continuation
-                score += 1
-                for c in n.finalbody:
-                    visit(c, nesting + 1)
-            return
-
-        if isinstance(n, ast.IfExp):  # ternary `a if cond else b`
-            score += 1 + nesting
-            visit(n.test, nesting)
-            visit(n.body, nesting + 1)
-            visit(n.orelse, nesting + 1)
-            return
-
-        if isinstance(n, ast.BoolOp):  # one `and`/`or` sequence scores once
-            score += 1
-            for c in n.values:
-                visit(c, nesting)
-            return
-
-        # `with` and everything else are transparent: recurse without changing nesting.
-        for c in ast.iter_child_nodes(n):
-            visit(c, nesting)
-
-    for stmt in getattr(node, "body", []):
-        visit(stmt, 0)
-    return score
-
-
 class _DocstringStripper(ast.NodeTransformer):
     """AST transformer that removes the leading docstring from every function/class/module body in a tree."""
 
@@ -252,7 +148,7 @@ def node_sig(node: ast.AST) -> str:
     """
     Return a short, stable structural fingerprint of a routine, ignoring docstrings and comments.
 
-    Selective escalation uses this to re-bind a manifest request to its routine across the emit and apply phases. It is
+    The online manifest flow uses this to re-bind a request to its routine across the emit and apply phases. It is
     a hash of the node's `ast.dump` *without* source-position attributes and with every nested docstring stripped, so it
     is invariant to: the line shifts caused by annotating other routines (no positions), block comments inserted into
     the body (comments are absent from the AST), and the docstring the apply phase itself adds or replaces (stripped).
@@ -447,8 +343,8 @@ def _collect_calls_py(node: ast.AST) -> List[Tuple[str, str, int]]:
     """
     Collect a routine's own call sites, classified for the call-graph resolver, without descending into nested defs.
 
-    Mirrors the opacity of `cognitive_complexity`: only the routine's own body is walked (nested functions/classes/
-    lambdas are scored/resolved as their own routines, so they are not descended into). Each `ast.Call` is classified
+    Only the routine's own body is walked (nested functions/classes/lambdas are resolved as their own routines, so
+    they are not descended into). Each `ast.Call` is classified
     by its callee expression:
       - a bare name `f(...)` -> `("f", "free", line)`;
       - `self.m(...)` -> `("m", "self", line)` (the enclosing class's own method);
@@ -989,7 +885,6 @@ def generate_docstrings(
     defs: List[DefInfo],
     source_blob: str,
     source_lines: Chunk,
-    escalation=None,
     doc_order: Optional[List[str]] = None,
     callee_context: Optional[Callable[[str], str]] = None,
     on_doc: Optional[Callable[[str, str], None]] = None,
@@ -1009,21 +904,16 @@ def generate_docstrings(
     - `defs`: A list of `DefInfo` objects representing definitions in the AST.
     - `source_blob`: The entire source code as a string.
     - `source_lines`: A chunk of source lines for context.
-    - `escalation`: Optional `scale_escalate.Escalation`. When supplied, a definition whose complexity exceeds the
-      cutoff has its docstring deferred to a stronger model: a manifest request carrying the assembled snippet is
-      recorded and no docstring is produced locally (the routine is left untouched for the apply phase).
     - `doc_order`: Optional call-graph documentation order (qualnames); when given, routines are processed in this
       order (callees/children first) instead of the internal deepest-first sort, falling back to that sort for any
       routine not listed.
     - `callee_context`: Optional callback `qualname -> notes`; the resolved-callee contract block it returns is
-      appended to that routine's generation turn (so the docstring can draw on what it calls). Not added to escalated
-      routines (their snippet goes verbatim to the stronger model).
+      appended to that routine's generation turn (so the docstring can draw on what it calls).
     - `on_doc`: Optional callback `(qualname, docstring)` invoked after each locally-generated docstring, so the shared
-      `ContractStore` can update the routine's contract for later callers. Escalated/deferred routines do not call it.
+      `ContractStore` can update the routine's contract for later callers.
     - `verifier`: Optional `scale_verify.Verifier`. When supplied, each generated docstring faces the deterministic
       backtick-grounding gate and the clean-context grounding challenge (one corrective regeneration each); a
-      docstring that fails twice is promoted to the manifest when escalation is active (the local attempt is
-      discarded), else written under a prominent warning so the doubt is visible rather than silent.
+      docstring that fails twice is written under a prominent warning so the doubt is visible rather than silent.
 
     Returns:
     - A dictionary mapping qualified names to generated or updated docstrings.
@@ -1222,32 +1112,13 @@ def generate_docstrings(
     else:
         defs_deepest_first = sorted(defs, key=lambda d: (d.depth, d.start, -d.end), reverse=True)
 
-    def record_escalation(info: DefInfo, score: int) -> None:
-        """Record a deferred docstring request for `info` on the active manifest."""
-        # The manifest carries the routine's VERBATIM source span (not the child-stubbed local snippet): the stronger
-        # model wants full fidelity, and one span per routine is what lets the block recipe reference into it.
-        span = "\n".join(source_lines[info.header_start - 1:info.end])
-        escalation.record_def(
-            qualname=info.qualname, kind=info.kind, sig_hash=node_sig(info.node),
-            cognitive=escalation.score_for(info.qualname, score), snippet=span,
-        )
-
     for info in defs_deepest_first:
         node_id = id(info.node)
         full_snippet = assemble_snippet_for(node_id)
-        score = cognitive_complexity(info.node) if escalation is not None else 0
-
-        # Complexity-driven escalation: defer a complex routine's docstring to the stronger model. Record the assembled
-        # snippet and leave the routine out of the doc map, so the patcher leaves it untouched here.
-        if escalation is not None and escalation.should_escalate(info.qualname, score):
-            record_escalation(info, score)
-            echo(f"[Python] Escalated docstring for '{info.qualname}' (cognitive {score}); deferred")
-            continue
 
         # Elide the body if this routine is too large for the context window (the patch is unaffected). The structural
         # eliding summarises the deepest blocks into one-liners (keeping the routine's shape), falling back to a crude
-        # head/tail crop only if that cannot get it under budget. Only the local model's view is reduced; an escalation
-        # would carry the full snippet.
+        # head/tail crop only if that cannot get it under budget. Only the local model's view is reduced.
         header_lines = max(1, info.header_end - info.header_start + 1)
         local_snippet, omitted = elide_structurally(llm, cfg, messages, full_snippet, header_lines, MARKER_PYTHON)
         if omitted:
@@ -1294,13 +1165,8 @@ def generate_docstrings(
         for _ in range(appended):
             messages.pop()
 
-        # Failure-driven escalation: if the local model still could not produce a docstring, promote the routine to the
-        # stronger model (when a manifest is active) rather than writing a useless placeholder.
+        # If the local model still could not produce a docstring, fall back to a visible placeholder.
         if _is_unusable_docstring(reply, docstring):
-            if escalation is not None:
-                record_escalation(info, score)
-                echo(f"[Python] Promoted '{info.qualname}' to the stronger model (local docstring was unusable)")
-                continue
             docstring = f"{info.kind} `{info.qualname}` - comment generation failed."
         elif verifier is not None:
             # Verification (the quality floor): the grounding gate + grounding challenge, each allowing one
@@ -1323,12 +1189,7 @@ def generate_docstrings(
 
             docstring, ok = verifier.verify_def(local_snippet, docstring, regenerate, label=info.qualname)
             if not ok:
-                # Shared failure routing: promote to the manifest (discarding the local attempt) when one is
-                # active; else write the doc under a prominent warning - a visible contract beats a silent gap.
-                if escalation is not None:
-                    record_escalation(info, score)
-                    echo(f"[Python] Promoted '{info.qualname}' to the stronger model (failed verification)")
-                    continue
+                # Failure routing: write the doc under a prominent warning - a visible contract beats a silent gap.
                 error(f"[verify] '{info.qualname}': docstring failed verification twice; writing it anyway - "
                       f"review this docstring")
 
@@ -1725,7 +1586,6 @@ def iter_block_targets(source_blob: str, source_lines: Chunk) -> List[BlockTarge
                 indent_of=indent_of,
                 depth=info.depth,
                 doc=ast.get_docstring(info.node) or "",
-                cognitive=cognitive_complexity(info.node),
                 sig=node_sig(info.node),
                 segments=structural_segments(info.node, source_lines, boundary_lines, info.end),
             )
@@ -1734,13 +1594,35 @@ def iter_block_targets(source_blob: str, source_lines: Chunk) -> List[BlockTarge
     return targets
 
 
+def collect_def_requests(source_blob: str, source_lines: Chunk, escalation) -> int:
+    """
+    Record every Python definition as a deferred docstring request (the online emit phase) - model-free.
+
+    The manifest carries each routine's VERBATIM source span (not the child-stubbed local snippet): the stronger
+    model wants full fidelity, and one span per routine is what lets the block recipe reference into it.
+
+    Parameters:
+    - `source_blob`: The complete source text (parsed with the standard library `ast`).
+    - `source_lines`: The same source split into individual lines.
+    - `escalation`: The `scale_escalate.Escalation` collector for this target file.
+
+    Returns:
+    - The number of definitions recorded.
+    """
+
+    defs = iter_defs_with_info(ast.parse(source_blob))
+    for info in defs:
+        span = "\n".join(source_lines[info.header_start - 1:info.end])
+        escalation.record_def(qualname=info.qualname, kind=info.kind, sig_hash=node_sig(info.node), snippet=span)
+    return len(defs)
+
+
 def generate_language_comments(
     llm: LocalChatModel,
     cfg: GenerationConfig,
     messages: Messages,
     source_blob: str,
     source_lines: Chunk,
-    escalation=None,
     doc_order: Optional[List[str]] = None,
     callee_context: Optional[Callable[[str], str]] = None,
     on_doc: Optional[Callable[[str, str], None]] = None,
@@ -1758,8 +1640,6 @@ def generate_language_comments(
     - messages: The conversational message history to extend with new prompts and replies.
     - source_blob: The complete text of the source file as a single string (with original line endings).
     - source_lines: The source file split into individual lines.
-    - escalation: Optional `scale_escalate.Escalation`; when supplied, complex definitions are deferred to the manifest
-      rather than commented locally (see `generate_docstrings`).
     - doc_order/callee_context/on_doc: Optional call-graph hooks (see `generate_docstrings`); absent, behaviour is
       unchanged.
     - verifier: Optional `scale_verify.Verifier` (the grounding gate + challenge turns; see `generate_docstrings`).
@@ -1787,7 +1667,7 @@ def generate_language_comments(
     echo(f"Found {len(defs)} definitions")
 
     echo("Generating docstrings...\n")
-    doc_map = generate_docstrings(llm, cfg, messages, defs, source_blob, source_lines, escalation=escalation,
+    doc_map = generate_docstrings(llm, cfg, messages, defs, source_blob, source_lines,
                                   doc_order=doc_order, callee_context=callee_context, on_doc=on_doc,
                                   verifier=verifier)
 

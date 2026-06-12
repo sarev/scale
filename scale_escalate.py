@@ -11,28 +11,21 @@ Unless required by applicable law or agreed to in writing, software distributed 
 "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
 language governing permissions and limitations under the License.
 
-Selective escalation to a stronger model.
+The online mode's manifest machinery: every routine's comments deferred to a stronger model.
 
-SCALE's local model is good enough for the bulk of the work - the whole-file summary, the structural segmentation of a
-body into blocks, and the comments for simple routines. The comments that are *worth* a stronger model are those for the
-genuinely involved routines, which is exactly where a small local model's prose gets unreliable. This module routes that
-split: routines are deferred to a manifest, a stronger model (e.g. Claude Code) fills in the comment text, and SCALE
-patches the answers back in through the same insertion-only path as everything else - so the byte-for-byte code
-guarantee is unchanged regardless of which model produced the words. Three things route a routine in: its **cognitive
-complexity** exceeding the `--escalate-cognitive` cutoff (computed natively per language - see
-`scale_python.cognitive_complexity` / `scale_c.cognitive_complexity_c` / `scale_javascript.cognitive_complexity_js` -
-or overridden per-qualname by a `--codestats-json` report); a
-**verification failure** (the grounding gate / challenge turns of `scale_verify` failing twice - the local attempt is
-discarded); and a C **doc-site redirected prototype** (a public contract is the highest value per stronger-model token,
-so when a manifest is active those docs are always deferred).
+SCALE runs in one of two modes. **Offline** (the default) the local model writes everything and no manifest exists.
+**Online** (`--online --emit-manifest`) every routine's comment/docstring generation is deferred to a stronger model
+(e.g. Claude Code): the routines are recorded as manifest *requests*, the stronger model fills in the answer text, and
+SCALE patches the answers back in through the same insertion-only path as everything else - so the byte-for-byte code
+guarantee is unchanged regardless of which model produced the words.
 
-Two phases, coordinated by a single JSON manifest **per run** (covering every target file's deferred routines):
+Two phases, coordinated by a single JSON manifest **per run** (covering every target file's routines):
 
-- **emit**: SCALE runs the passes with the local model as usual, but each deferred routine gets a *request* - its
-  identity, the code, and what the stronger model needs - and is left byte-for-byte untouched in the output. One
+- **emit**: a model-free pass (the GGUF is never loaded) parses each target and records one *request* per routine -
+  its identity, the code, and what the stronger model needs - leaving the target byte-for-byte untouched. One
   `Escalation` object per target collects requests; `run_manifest` merges them.
 - **apply**: a separate, model-free pass reads the manifest (now carrying the stronger model's `answer`s), re-parses
-  each emit output, matches each request back to its routine by `(qualname, sig_hash)`, and patches the answers in.
+  each target, matches each request back to its routine by `(qualname, sig_hash)`, and patches the answers in.
 
 The manifest is kept **lean** - in the worst case (a fully uncommented codebase) every routine's code crosses the wire
 once, and nothing may make it cross twice: a routine deferred by both passes carries ONE `snippet` (its verbatim source
@@ -53,34 +46,7 @@ import json
 MANIFEST_VERSION = 2
 
 
-# ---------------------------- complexity sources ----------------------------
-
-
-def load_codestats_json(path: Path) -> Dict[str, int]:
-    """
-    Load a `codestats` JSON report and return a map of qualified name to cognitive complexity.
-
-    `codestats` emits `{"functions": [{"function": "Foo.bar", "cognitive": N, ...}, ...]}`. Only the function name and
-    its cognitive score are taken; everything else is ignored. When the same qualified name appears more than once
-    (overloads, or two files scanned together), the highest score wins, so a routine is escalated if any namesake is
-    complex.
-
-    Parameters:
-    - `path`: Path to the codestats JSON file.
-
-    Returns:
-    - A dictionary mapping each qualified name to its cognitive complexity.
-    """
-
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    out: Dict[str, int] = {}
-    for rec in data.get("functions", []):
-        name = rec.get("function")
-        if name is None:
-            continue
-        score = int(rec.get("cognitive", 0))
-        out[name] = max(out.get(name, 0), score)
-    return out
+# ---------------------------- request identity ----------------------------
 
 
 def request_id(qualname: str, sig_hash: str) -> str:
@@ -118,76 +84,35 @@ def routine_text_hash(span_text: str) -> str:
     return hashlib.sha256(span_text.encode("utf-8", errors="surrogateescape")).hexdigest()[:16]
 
 
-# ---------------------------- emit-phase collector + policy ----------------------------
+# ---------------------------- emit-phase collector ----------------------------
 
 
 @dataclass
 class Escalation:
     """
-    The emit-phase policy and request collector for selective escalation (one instance per target file).
+    The emit-phase request collector for the online mode (one instance per target file).
 
-    An instance decides whether a routine is complex enough to defer to the stronger model (`should_escalate`) and
-    records what that model needs to answer (`record_def` / `record_block`). Both passes record into the SAME
-    per-routine request - keyed by `(qualname, sig_hash)` - which carries the routine's code once (`snippet`, its
-    verbatim source span) plus a `def` slot and/or a `blocks` recipe. After every target has run, `run_manifest`
-    merges the collectors into the run's manifest. Only the local model runs during emit; this object never calls a
-    model itself.
+    An instance records what the stronger model needs to answer (`record_def` / `record_block`). Both passes record
+    into the SAME per-routine request - keyed by `(qualname, sig_hash)` - which carries the routine's code once
+    (`snippet`, its verbatim source span) plus a `def` slot and/or a `blocks` recipe. After every target has been
+    collected, `run_manifest` merges the collectors into the run's manifest. This object never calls a model.
 
     Attributes:
-    - `threshold`: The cognitive-complexity cutoff; a routine is escalated when its score is strictly greater.
-    - `override`: Optional qualname to cognitive-complexity map (from `--codestats-json`) that overrides the native
-      score for any routine it names; `None` means always use the native score supplied by the caller.
     - `doc_style`: The house-style docstring template (e.g. `comment.<lang>.txt` + `guidelines.md`), carried into the
       manifest so the stronger model is told the required style when it writes deferred docstrings.
     - `requests`: The collected per-routine requests, in the order their routines were first recorded.
     """
 
-    threshold: int
-    override: Optional[Dict[str, int]] = None
     doc_style: str = ""
     requests: List[dict] = field(default_factory=list)
     _index: Dict[Tuple[str, str], dict] = field(default_factory=dict, init=False, repr=False)
 
-    def score_for(self, qualname: str, native_score: int) -> int:
-        """
-        Return the cognitive score used for routing this routine.
-
-        The native score (computed by the caller from SCALE's own AST) is used unless an override map was supplied and
-        names this routine, in which case the override wins.
-
-        Parameters:
-        - `qualname`: The routine's fully qualified name.
-        - `native_score`: The score SCALE computed natively for this routine.
-
-        Returns:
-        - The score to compare against the threshold.
-        """
-
-        if self.override is not None and qualname in self.override:
-            return self.override[qualname]
-        return native_score
-
-    def should_escalate(self, qualname: str, native_score: int) -> bool:
-        """
-        Report whether a routine should be deferred to the stronger model.
-
-        Parameters:
-        - `qualname`: The routine's fully qualified name.
-        - `native_score`: The score SCALE computed natively for this routine.
-
-        Returns:
-        - True when the routing score exceeds the threshold.
-        """
-
-        return self.score_for(qualname, native_score) > self.threshold
-
-    def _routine(self, qualname: str, kind: str, sig_hash: str, cognitive: int, snippet: str) -> dict:
+    def _routine(self, qualname: str, kind: str, sig_hash: str, snippet: str) -> dict:
         """
         Find or create the per-routine request - the slimming pivot: one request, one snippet, both passes record into it.
 
         Parameters:
         - `qualname`/`kind`/`sig_hash`: The routine's identity.
-        - `cognitive`: The routing score (the highest seen is kept).
         - `snippet`: The routine's verbatim source span (kept from the first recording that supplies one;
           `record_block` then overrides it, because its chunk line ranges index into its own snapshot).
 
@@ -203,18 +128,15 @@ class Escalation:
                 "qualname": qualname,
                 "kind": kind,
                 "sig_hash": sig_hash,
-                "cognitive": cognitive,
                 "snippet": snippet,
             }
             self._index[key] = req
             self.requests.append(req)
-        else:
-            req["cognitive"] = max(req.get("cognitive", 0), cognitive)
-            if not req.get("snippet") and snippet:
-                req["snippet"] = snippet
+        elif not req.get("snippet") and snippet:
+            req["snippet"] = snippet
         return req
 
-    def record_def(self, qualname: str, kind: str, sig_hash: str, cognitive: int, snippet: str) -> None:
+    def record_def(self, qualname: str, kind: str, sig_hash: str, snippet: str) -> None:
         """
         Record a deferred definition (docstring/header-comment) request on the routine's manifest entry.
 
@@ -222,19 +144,17 @@ class Escalation:
         - `qualname`: The routine's fully qualified name.
         - `kind`: The routine kind ("def", "async def", "class", "function", or "declaration").
         - `sig_hash`: The routine's signature hash.
-        - `cognitive`: The routing score that triggered escalation (for the manifest and logging).
         - `snippet`: The routine's verbatim source span (or, for a doc-site prototype, the implementation body the
           prose is to be written from).
         """
 
-        self._routine(qualname, kind, sig_hash, cognitive, snippet)["def"] = {"answer": None}
+        self._routine(qualname, kind, sig_hash, snippet)["def"] = {"answer": None}
 
     def record_block(
         self,
         qualname: str,
         kind: str,
         sig_hash: str,
-        cognitive: int,
         doc_summary: str,
         length_note: str,
         chunks: List[dict],
@@ -245,17 +165,16 @@ class Escalation:
 
         Segmentation has already run locally (it is structural and deterministic); only the per-chunk comment *text*
         is deferred. Each chunk is identified by its boundary index - the position of its start line within the
-        routine's sorted legal boundaries, stable across the line shifts between emit and apply because the escalated
+        routine's sorted legal boundaries, stable across the line shifts between emit and apply because the deferred
         routine is left untouched - and carries `lines`, the chunk's 1-based line range INTO the routine's `snippet`
         (so the chunk text is never duplicated alongside the snippet). The snippet supplied here replaces any one a
         def-pass recording stored earlier: the chunk ranges were computed against the block pass's view of the source,
-        which differs from the def pass's view wherever nested routines gained docstrings in between.
+        which could differ from the def pass's view if the text changed in between.
 
         Parameters:
         - `qualname`: The routine's fully qualified name.
         - `kind`: The routine kind.
         - `sig_hash`: The routine's signature hash.
-        - `cognitive`: The routing score that triggered escalation.
         - `doc_summary`: The routine's one-line docstring summary, as context for the comment.
         - `length_note`: The short/long length note SCALE would have used, so the model keeps the same bias.
         - `chunks`: One dict per chunk, each `{"bidx": int, "lines": [start, end]}` (snippet-relative, 1-based,
@@ -263,11 +182,9 @@ class Escalation:
         - `snippet`: The routine's verbatim source span (header through last body line).
         """
 
-        req = self._routine(qualname, kind, sig_hash, cognitive, snippet)
+        req = self._routine(qualname, kind, sig_hash, snippet)
         # The chunk `lines` index into THIS snapshot of the routine, so a block recording's snippet must win over an
-        # earlier def-pass one. The def pass records from the pre-patch source (docstrings land after its LLM loop),
-        # so by block-pass time nested routines have gained docstrings and the two spans differ - ranges into the
-        # stale span would overrun by the inserted lines. The def answer is indifferent to which snapshot it reads.
+        # earlier def-pass one. The def answer is indifferent to which snapshot it reads.
         if snippet:
             req["snippet"] = snippet
         req["blocks"] = {
@@ -289,10 +206,10 @@ class Escalation:
         - The manifest dictionary ready to be written as JSON.
         """
 
-        return run_manifest([(source, language, line_ending, self)], self.threshold, self.doc_style)
+        return run_manifest([(source, language, line_ending, self)], self.doc_style)
 
 
-def run_manifest(parts: List[Tuple[str, str, str, "Escalation"]], threshold: int, doc_style: str) -> dict:
+def run_manifest(parts: List[Tuple[str, str, str, "Escalation"]], doc_style: str) -> dict:
     """
     Merge per-target escalation collectors into the run's single manifest.
 
@@ -303,7 +220,6 @@ def run_manifest(parts: List[Tuple[str, str, str, "Escalation"]], threshold: int
 
     Parameters:
     - `parts`: One `(source_path, language, line_ending, escalation)` tuple per target that collected requests.
-    - `threshold`: The run's cognitive cutoff (provenance).
     - `doc_style`: The house-style template (one copy per manifest).
 
     Returns:
@@ -333,7 +249,6 @@ def run_manifest(parts: List[Tuple[str, str, str, "Escalation"]], threshold: int
         "version": MANIFEST_VERSION,
         "tool": "scale",
         "files": files,
-        "escalate_cognitive": threshold,
         "doc_style": doc_style,
         "requests": requests,
     }
@@ -469,7 +384,6 @@ def build_fragment(manifest: dict, size: int, fragment_name: str) -> Optional[di
         "tool": manifest.get("tool", "scale"),
         "fragment_of": fragment_name,
         "files": [f for f in manifest.get("files", []) if f.get("path") in used_files],
-        "escalate_cognitive": manifest.get("escalate_cognitive"),
         "doc_style": manifest.get("doc_style", ""),
         "requests": out_requests,
     }
@@ -579,7 +493,6 @@ def _upgrade_v1(manifest: dict) -> dict:
             "qualname": r.get("qualname"),
             "kind": r.get("kind"),
             "sig_hash": r.get("sig_hash"),
-            "cognitive": r.get("cognitive", 0),
             "snippet": r.get("snippet"),
             "file": source,
         }
@@ -599,7 +512,6 @@ def _upgrade_v1(manifest: dict) -> dict:
         "tool": manifest.get("tool", "scale"),
         "files": [{"path": source, "language": manifest.get("language"),
                    "line_ending": manifest.get("line_ending", "lf")}],
-        "escalate_cognitive": manifest.get("escalate_cognitive"),
         "doc_style": manifest.get("doc_style", ""),
         "requests": requests,
     }

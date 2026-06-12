@@ -1087,7 +1087,6 @@ def _def_pass(
     source_blob: str,
     source_lines: List[str],
     language: str,
-    escalation=None,
     doc_order: Optional[List[str]] = None,
     callee_context: Optional[Callable[[str], str]] = None,
     on_doc: Optional[Callable[[str, str], None]] = None,
@@ -1104,7 +1103,6 @@ def _def_pass(
     - `source_blob`: The complete source text to annotate (with original line endings).
     - `source_lines`: The same source text split into individual lines.
     - `language`: The programming language identifier (already validated).
-    - `escalation`: Optional `scale_escalate.Escalation` (Python only).
     - `doc_order`/`callee_context`/`on_doc`: Optional call-graph hooks threaded to the worker (all three languages);
       absent, the worker's behaviour is unchanged.
     - `doc_plan`: Optional per-file `--doc-site` plan (C only); redirects docs to header prototypes and skips the
@@ -1117,9 +1115,6 @@ def _def_pass(
 
     if language == "python":
         from scale_python import generate_language_comments
-        return generate_language_comments(llm, cfg, messages, source_blob, source_lines, escalation=escalation,
-                                          doc_order=doc_order, callee_context=callee_context, on_doc=on_doc,
-                                          verifier=verifier)
     elif language == "js":
         from scale_javascript import generate_language_comments
     elif language == "c":
@@ -1127,7 +1122,7 @@ def _def_pass(
         # Only the C worker has a header/implementation doc-site plan.
         return generate_language_comments(llm, cfg, messages, source_blob, source_lines,
                                           doc_order=doc_order, callee_context=callee_context, on_doc=on_doc,
-                                          doc_plan=doc_plan, verifier=verifier, escalation=escalation)
+                                          doc_plan=doc_plan, verifier=verifier)
     else:
         raise ValueError(f"Unsupported language '{language}'")
     return generate_language_comments(llm, cfg, messages, source_blob, source_lines,
@@ -1453,7 +1448,6 @@ def _block_pass(
     language: str,
     comment_style: str = "line",
     comment_value: Optional[int] = None,
-    escalation=None,
     doc_override: Optional[Callable[[str], Optional[str]]] = None,
     callee_annotations: Optional[Dict[str, Dict[int, str]]] = None,
     verifier=None,
@@ -1499,7 +1493,6 @@ def _block_pass(
         note_long=_read_optional(scale_path / "blocks.note.long.txt"),
         score_prompt=_read_optional(scale_path / "blocks.score.txt"),
         value_threshold=comment_value,
-        escalation=escalation,
         callee_annotations=callee_annotations,
         verifier=verifier,
     )
@@ -1650,7 +1643,6 @@ def generate_comments(
     do_file_doc: bool = False,
     block_comment_style: str = "line",
     comment_value: Optional[int] = None,
-    escalation=None,
     project_context: str = "",
     doc_order: Optional[List[str]] = None,
     callee_context: Optional[Callable[[str], str]] = None,
@@ -1685,8 +1677,6 @@ def generate_comments(
     - `no_cache`: Generate new summary - don't use the cached version.
     - `do_comment`: Run the definition (docstring/header-comment) pass.
     - `do_blocks`: Run the within-function block pass.
-    - `escalation`: Optional `scale_escalate.Escalation`; when supplied, complex routines are deferred to its manifest
-      instead of being commented by the local model (the caller serialises the manifest afterwards).
     - `doc_order`/`callee_context`/`on_doc`: Optional call-graph hooks for the definition pass (see `_def_pass`),
       bound by the caller over the shared `ContractStore` and this file. Absent, the def pass behaves as before.
     - `doc_plan`: Optional per-file `--doc-site` plan (C only) threaded to the def pass; `doc_override` is the matching
@@ -1720,7 +1710,7 @@ def generate_comments(
             project_context=project_context, skeleton=skeleton,
         )
         current_blob = line_ending.join(new_lines)
-        new_lines = _def_pass(llm, cfg, messages, current_blob, new_lines, language, escalation=escalation,
+        new_lines = _def_pass(llm, cfg, messages, current_blob, new_lines, language,
                               doc_order=doc_order, callee_context=callee_context, on_doc=on_doc, doc_plan=doc_plan,
                               verifier=verifier)
 
@@ -1739,7 +1729,7 @@ def generate_comments(
         # on the calling line the block pass actually reads.
         annotations = block_callee_notes(current_blob, new_lines) if block_callee_notes is not None else None
         new_lines = _block_pass(llm, cfg, scale_path, messages, current_blob, new_lines, language,
-                                comment_style=block_comment_style, comment_value=comment_value, escalation=escalation,
+                                comment_style=block_comment_style, comment_value=comment_value,
                                 doc_override=doc_override, callee_annotations=annotations, verifier=verifier)
 
     # The file-doc pass runs LAST: the published description is generated from the CURRENT text's skeleton, so it
@@ -1827,14 +1817,19 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--n-batch", type=int, default=256, help="Number of batches to process")
     p.add_argument("--n-gpu-layers", "-g", type=int, default=-1, help="Number of GPU layers to use")
 
-    # Selective escalation to a stronger model (Python and C).
+    # The two modes: offline (default; everything local) vs online (everything deferred to a stronger model).
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--offline", action="store_true",
+                      help="Annotate everything with the local model (the default; no manifest is involved).")
+    mode.add_argument("--online", action="store_true",
+                      help="Defer EVERY routine's comments/docstrings to a stronger model via the run manifest "
+                           "(requires --emit-manifest). Model-free and instant: the GGUF is never loaded.")
     p.add_argument("--emit-manifest", default="", metavar="PATH",
-                   help="Emit phase: write deferred comment requests (complex routines, verification failures, and "
-                        "C doc-site prototypes) for ALL targets to this one run-level manifest (the local model "
-                        "still annotates the rest of each file).")
+                   help="Online emit phase: write every routine's comment request for ALL targets to this one "
+                        "run-level manifest (model-free; the targets are left untouched). Requires --online.")
     p.add_argument("--apply-manifest", default="", metavar="PATH",
                    help="Apply phase: patch a stronger model's answers from this manifest into the targets. No model "
-                        "is loaded; the targets should be the emit-phase outputs.")
+                        "is loaded.")
     p.add_argument("--check-manifest", default="", metavar="PATH",
                    help="Completeness check (model-free): print the manifest's unfilled-answer count and exit "
                         "nonzero if any answer is missing. Needs no source targets.")
@@ -1845,11 +1840,6 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "parallel agents. Exits nonzero when there is nothing to hand out. Needs no source targets.")
     p.add_argument("--fragment-size", type=int, default=8, metavar="N",
                    help="Maximum requests per fragment for --next-fragment (default 8).")
-    p.add_argument("--escalate-cognitive", type=int, default=10, metavar="N",
-                   help="Escalate any routine whose cognitive complexity exceeds N to the manifest (default 10).")
-    p.add_argument("--codestats-json", default="", metavar="PATH",
-                   help="Optional precomputed codestats JSON report; its cognitive scores override the native ones "
-                        "when deciding what to escalate.")
 
     # The header-reword manifest (prose-only escalation of the file descriptions; requires --file-doc to emit).
     p.add_argument("--emit-reword", default="", metavar="PATH",
@@ -2076,6 +2066,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     do_blocks = args.block_spacing or args.block_comments is not None
     block_threshold = BLOCK_COMMENT_LEVELS.get(args.block_comments, 4)
 
+    # The two-mode contract: online and the manifest go together (the deferred requests must land somewhere, and a
+    # manifest only exists to carry the online mode's requests), and the local-only passes have no online form.
+    if args.online:
+        if not args.emit_manifest:
+            error("--online requires --emit-manifest PATH (the deferred comment requests must be written somewhere).")
+            return 1
+        if args.file_doc:
+            error("--file-doc is a local pass; online, run the file-description round with --emit-filedoc / "
+                  "--apply-filedoc after the manifest has been applied.")
+            return 1
+        if args.emit_reword:
+            error("--emit-reword belongs to the offline --file-doc pass; online, use --emit-filedoc instead.")
+            return 1
+        if args.block_spacing and args.block_comments is None:
+            error("--block-spacing alone is deterministic local work with nothing to defer; run it offline "
+                  "(or add --block-comments to defer the comments).")
+            return 1
+    elif args.emit_manifest:
+        error("--emit-manifest requires --online (offline runs are manifest-free; the manifest defers ALL routines).")
+        return 1
+
     if not (args.comment or do_blocks or args.file_doc):
         # Nothing to do without --comment, --block-spacing/--block-comments, or --file-doc.
         return 0
@@ -2091,6 +2102,69 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     references = scale_project.gather_files(args.reference) if args.reference else []
     target_keys = {p.resolve() for p in targets}
     references = [r for r in references if r.resolve() not in target_keys]
+
+    # ---- Online emit phase: model-free and instant (the GGUF is never loaded). Every routine in every target is
+    # recorded as a manifest request - the def pass's docstring slot and/or the block pass's chunk recipe - and the
+    # targets themselves are left byte-for-byte untouched (the apply phase patches the answers in later). ----
+    if args.online:
+        language_arg = args.language.lower() if args.language else None
+        run_files = _scan_run_files(targets, references, language_arg)
+        c_plan = _build_c_doc_plan(run_files, args.doc_site) if args.comment else None
+
+        # One doc_style copy for the run: the house guidelines plus each target language's style template, so the
+        # stronger model writes deferred docs to the same spec the local model is primed with.
+        langs = sorted({rf.language for rf in run_files.values()
+                        if rf.is_target and rf.language in SUPPORTED_LANGUAGES})
+        pieces = [t for t in (_read_optional(scale_path / "guidelines.md"),) if t]
+        pieces += [t for lang in langs for t in (_read_optional(scale_path / f"comment.{lang}.txt"),) if t]
+        emit_doc_style = "\n\n".join(pieces)
+
+        emit_parts: List[Tuple[str, str, str, "scale_escalate.Escalation"]] = []
+        rc = 0
+        for target in targets:
+            language = language_arg
+            source_blob, source_lines, line_ending, language = load_source(target, language)
+            if language not in SUPPORTED_LANGUAGES:
+                error(f"Skipping {target}: unsupported language '{language}' (SCALE supports: "
+                      f"{', '.join(SUPPORTED_LANGUAGES)}).")
+                rc = 1
+                continue
+            if language == "js":
+                error(f"Skipping {target}: --online does not support 'js' yet; annotate it offline.")
+                rc = 1
+                continue
+
+            escalation = scale_escalate.Escalation(doc_style=emit_doc_style)
+            if args.comment:
+                if language == "python":
+                    from scale_python import collect_def_requests
+                    n = collect_def_requests(source_blob, source_lines, escalation)
+                else:
+                    from scale_c import collect_def_requests_c
+                    doc_plan = c_plan.for_file(str(target.resolve())) if c_plan is not None else None
+                    n = collect_def_requests_c(source_blob, source_lines, escalation, doc_plan=doc_plan)
+                echo(f"[emit] {target}: {n} definition request(s)")
+            if do_blocks:
+                from scale_blocks import defer_block_targets
+                provider = _block_provider_for(language)
+                n = defer_block_targets(
+                    escalation, source_lines, provider(source_blob, source_lines),
+                    note_short=_read_optional(scale_path / "blocks.note.short.txt"),
+                    note_long=_read_optional(scale_path / "blocks.note.long.txt"),
+                )
+                echo(f"[emit] {target}: {n} block recipe(s)")
+            emit_parts.append((str(target), language, line_ending, escalation))
+
+            # The emit output is byte-identical to the input: in place there is nothing to write; with -o (single
+            # target) the original bytes are copied so the apply phase can be pointed at the copy.
+            if dst_path is not None:
+                dst_path.write_bytes(source_blob.encode("utf-8", errors="surrogateescape"))
+                echo(f"Emit copy written to {dst_path}")
+
+        manifest = scale_escalate.run_manifest(emit_parts, emit_doc_style)
+        scale_escalate.write_manifest(Path(args.emit_manifest), manifest)
+        echo(f"Wrote {len(manifest['requests'])} request(s) to {args.emit_manifest}")
+        return rc
 
     # Prepare model and config (loaded once for the whole run).
     echo("Loading the LLM...")
@@ -2165,17 +2239,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             targets = _order_header_before_impl(targets, c_plan.pairs)
 
     # Annotate each target in turn (single target -> -o or stdout; multiple targets -> in place).
-    # The run-level emit machinery: one codestats override and one doc_style for the run (the style block covers
-    # every escalation-capable language among the targets), a per-target collector, and one manifest at the end.
-    emit_override = emit_doc_style = None
-    emit_parts: List[Tuple[str, str, str, "scale_escalate.Escalation"]] = []
     reword_entries: List[dict] = []
-    if args.emit_manifest:
-        emit_override = scale_escalate.load_codestats_json(Path(args.codestats_json)) if args.codestats_json else None
-        langs = sorted({rf.language for rf in run_files.values() if rf.is_target and rf.language in ("python", "c")})
-        pieces = [t for t in (_read_optional(scale_path / "guidelines.md"),) if t]
-        pieces += [t for lang in langs for t in (_read_optional(scale_path / f"comment.{lang}.txt"),) if t]
-        emit_doc_style = "\n\n".join(pieces)
 
     rc = 0
     for target in targets:
@@ -2185,15 +2249,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             error(f"Skipping {target}: unsupported language '{language}' (SCALE supports: "
                   f"{', '.join(SUPPORTED_LANGUAGES)}).")
             continue
-
-        # ---- Emit phase: a per-target escalation collector, merged into one run-level manifest after the loop. ----
-        escalation = None
-        if args.emit_manifest:
-            if language in ("python", "c"):
-                escalation = scale_escalate.Escalation(
-                    threshold=args.escalate_cognitive, override=emit_override, doc_style=emit_doc_style or "")
-            else:
-                error(f"--emit-manifest does not support '{language}' yet; {target} is annotated locally only.")
 
         # Bind the call-graph hooks for this file over the shared store (closing the file key into each closure). The
         # store accumulates across files, so a callee documented in an earlier-ordered target informs a later caller;
@@ -2245,7 +2300,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             do_file_doc=args.file_doc,
             block_comment_style=args.block_comment_style,
             comment_value=block_threshold,
-            escalation=escalation,
             project_context=project_context,
             doc_order=doc_order,
             callee_context=callee_context,
@@ -2267,16 +2321,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ik = c_plan.impl_file.get(nm)
                 if ik:
                     store.update(ik, nm, doc)
-
-        # Collect this target's deferred requests for the run-level manifest (written once, after every target).
-        if frc == 0 and escalation is not None:
-            emit_parts.append((str(target), language, line_ending, escalation))
-
-    # Serialise the run's deferred requests so a stronger model can answer them (then re-run with --apply-manifest).
-    if args.emit_manifest:
-        manifest = scale_escalate.run_manifest(emit_parts, args.escalate_cognitive, emit_doc_style or "")
-        scale_escalate.write_manifest(Path(args.emit_manifest), manifest)
-        echo(f"Wrote {len(manifest['requests'])} escalation request(s) to {args.emit_manifest}")
 
     # Serialise the header-reword manifest (the freshly spliced descriptions, for a cross-file consistency reword).
     if args.emit_reword:

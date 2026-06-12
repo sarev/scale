@@ -39,7 +39,6 @@ from typing import List, Set, Tuple
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from scale_python import cognitive_complexity  # noqa: E402  (SCALE's real metric; ~0.2s import, no model loaded)
 
 # Rule toggles - flip to ablate a rule and watch precision/recall move. `merge_singleline` is a post-pass that drops
 # the interior breaks of any run of two or more consecutive single-statement paragraphs (a wall of one-line paragraphs
@@ -48,11 +47,11 @@ RULES = {"first_in_scope": True, "after_def": True, "before_return": True, "befo
          "merge_singleline": False}
 
 # Triviality gate for the before_compound / dedent rules: a block only earns a paragraph break when its significance
-# reaches `k`. `measure` is one of "none" (no gate), "stmts" (recursive statement count), "lines" (span), or "cc"
-# (cognitive complexity). Tune via the ablation sweep - "lines" (raw size) discriminates best: a trivial guard /
-# one-line block is not a paragraph, a substantial block is, and size beats cognitive complexity (which is nesting-
-# dominated and wrongly demotes long-but-flat blocks). first_in_scope is not size-gated: it fires iff the body has a
-# docstring (the blank separates docstring from code), which matches the convention and needs no size hack.
+# reaches `k`. `measure` is one of "none" (no gate), "stmts" (recursive statement count), or "lines" (span). Tune via
+# the ablation sweep - "lines" (raw size) discriminates best: a trivial guard / one-line block is not a paragraph, a
+# substantial block is, and size beats cognitive complexity (which is nesting-dominated and wrongly demotes
+# long-but-flat blocks; the sweep is why SCALE dropped that metric). first_in_scope is not size-gated: it fires iff
+# the body has a docstring (the blank separates docstring from code), which matches the convention.
 GATE = {"measure": "lines", "k": 3}
 
 _DEF = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
@@ -176,14 +175,12 @@ def _stmt_count(node: ast.AST) -> int:
 
 
 def _significance(node: ast.AST) -> int:
-    """Return the configured significance measure of a block: statement count, line span, or cognitive complexity."""
+    """Return the configured significance measure of a block: statement count or line span."""
     measure = GATE["measure"]
     if measure == "stmts":
         return _stmt_count(node)
     if measure == "lines":
         return getattr(node, "end_lineno", node.lineno) - _stmt_start(node) + 1
-    if measure == "cc":
-        return cognitive_complexity(node)
     return 1 << 30                                # "none": always significant
 
 

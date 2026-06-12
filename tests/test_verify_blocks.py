@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 The block-pass verification floor: the grounding gate on each note, the clean-context obviousness challenge on each
-insertable note, and the per-routine story challenge on the note set - with the shared failure routing (regenerate
-once with the verdict as feedback; a second failure promotes the routine to the manifest when one is active, leaving
-it byte-for-byte untouched, else drops the comment(s) while keeping the paragraphing blanks).
+insertable note, and the per-routine story challenge on the note set - with the failure routing (regenerate once with
+the verdict as feedback; a second failure drops the comment(s) while keeping the paragraphing blanks - wrongness is
+worse than absence).
 
 This guards (model-free, via a fake LLM):
 - an obviousness NO regenerates the note once (re-scored, re-challenged); a second NO tags it `CHALLENGE_FLAG`
@@ -11,8 +11,7 @@ This guards (model-free, via a fake LLM):
 - a note whose backticked identifier exists nowhere in the run is nudged once, then flagged,
 - the story challenge fires only on a routine longer than `SHORT_FUNCTION_CHUNKS` chunks with at least one insertable
   note (the length guard), regenerates the whole note set once on RESTATE, and on a second RESTATE drops the
-  routine's comments (no manifest) or promotes the routine whole (manifest active: chunk recipe recorded, routine
-  untouched),
+  routine's comments,
 - the persistent message list is balanced around every call.
 """
 import sys
@@ -23,7 +22,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scale_blocks import (  # noqa: E402
     BlockTarget, PYTHON_STYLE, CHALLENGE_FLAG, request_block_comment, annotate_blocks, _comment_to_insert,
 )
-from scale_escalate import Escalation  # noqa: E402
 from scale_verify import Verifier  # noqa: E402
 
 
@@ -117,9 +115,9 @@ def test_block_gate_nudges_then_flags():
 SEGMENTS = [(2, 2), (3, 3), (4, 4), (5, 5)]  # 4 chunks > SHORT_FUNCTION_CHUNKS (3) -> story-challenge eligible
 
 
-def _annotate(llm, segments=None, escalation=None):
+def _annotate(llm, segments=None):
     return annotate_blocks(llm, _Cfg(), [], SRC, [_target(segments if segments is not None else SEGMENTS)],
-                           PYTHON_STYLE, value_threshold=2, escalation=escalation, verifier=_verifier(llm))
+                           PYTHON_STYLE, value_threshold=2, verifier=_verifier(llm))
 
 
 def test_story_pass_inserts_comments():
@@ -167,29 +165,17 @@ def test_story_fail_twice_drops_comments_keeps_paragraphing():
         "the paragraphing blanks must remain"
 
 
-def test_story_fail_twice_with_manifest_promotes_routine_untouched():
-    llm = _RouterLLM(
-        notes=[f"Restating step {i}." for i in range(1, 5)] + [f"Still restating {i}." for i in range(1, 5)],
-        scores=["3"] * 8, obvious=["YES"] * 8, story=["RESTATE", "RESTATE"],
-    )
-    esc = Escalation(threshold=999)
-    out = _annotate(llm, escalation=esc)
-    assert out == SRC, "a promoted routine must be left byte-for-byte untouched"
-    assert len(esc.requests) == 1 and esc.requests[0].get("blocks") is not None
-    assert [c["bidx"] for c in esc.requests[0]["blocks"]["chunks"]] == [0, 1, 2, 3], \
-        "the chunk recipe rides the manifest"
-
-
-def test_flagged_note_with_manifest_promotes_routine():
-    # One note fails its obviousness challenge twice -> CHALLENGE_FLAG -> with a manifest the routine is promoted.
+def test_flagged_note_is_dropped_while_the_rest_are_written():
+    # One note fails its obviousness challenge twice -> CHALLENGE_FLAG -> that note is dropped from the output (it
+    # stays in the running context), while the routine's other notes are written as normal.
     llm = _RouterLLM(
         notes=["Restate a.", "Restate a again.", "Good two.", "Good three.", "Good four."],
         scores=["3"] * 5, obvious=["NO", "NO", "YES", "YES", "YES"], story=["STORY"],
     )
-    esc = Escalation(threshold=999)
-    out = _annotate(llm, escalation=esc)
-    assert out == SRC, "a promoted routine must be left byte-for-byte untouched"
-    assert len(esc.requests) == 1 and esc.requests[0].get("blocks") is not None
+    out = _annotate(llm)
+    comments = [ln.strip() for ln in out if ln.lstrip().startswith("#")]
+    assert comments == ["# Good two.", "# Good three.", "# Good four."], comments
+    assert [ln for ln in out if ln.strip() and not ln.lstrip().startswith("#")] == SRC, "code is untouched"
 
 
 def main():
@@ -202,9 +188,8 @@ def main():
     test_story_guard_skips_when_nothing_would_be_written()
     test_story_fail_then_regenerated_set_passes()
     test_story_fail_twice_drops_comments_keeps_paragraphing()
-    test_story_fail_twice_with_manifest_promotes_routine_untouched()
-    test_flagged_note_with_manifest_promotes_routine()
-    print("PASS: block notes face the gate, obviousness and story challenges, with drop/promote failure routing")
+    test_flagged_note_is_dropped_while_the_rest_are_written()
+    print("PASS: block notes face the gate, obviousness and story challenges, with drop/warn failure routing")
     return 0
 
 

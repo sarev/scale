@@ -6,9 +6,8 @@ Two guards against the "OK" docstring regression and its recovery path:
   supplied instead), the priming text carries no "say OK" instruction, and the only generation during priming is the
   whole-file summary.
 - The definition pass recovers from an unusable reply: a bare-"OK" docstring triggers one nudge, and if that still
-  fails the routine is PROMOTED to the manifest for the stronger model (when escalation is active) rather than written
-  as a placeholder. A good reply is used as-is with no nudge; with no manifest, a persistent failure falls back to the
-  placeholder.
+  fails the routine falls back to a visible placeholder rather than a silent gap. A good reply is used as-is with no
+  nudge.
 
 No GGUF model required.
 """
@@ -22,7 +21,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scale import prime_llm_for_comments, SummaryCache  # noqa: E402
 from scale_text import PRIMING_ACK  # noqa: E402
 from scale_python import generate_docstrings, iter_defs_with_info, _looks_like_ack  # noqa: E402
-from scale_escalate import Escalation  # noqa: E402
 from scale_llm import GenerationConfig  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,10 +54,9 @@ class Stub:
         return self.reply
 
 
-def _gen(stub, defs, escalation):
+def _gen(stub, defs):
     return generate_docstrings(stub, GenerationConfig(max_new_tokens=512),
-                               [{"role": "system", "content": "system"}], defs, SRC, SRC.split("\n"),
-                               escalation=escalation)
+                               [{"role": "system", "content": "system"}], defs, SRC, SRC.split("\n"))
 
 
 def main():
@@ -87,29 +84,23 @@ def main():
     assert _looks_like_ack("OK") and _looks_like_ack(PRIMING_ACK), "OK and the priming-ack echo must be unusable"
     assert not _looks_like_ack("Return x plus one."), "a real docstring must not be mistaken for an acknowledgement"
 
-    # ---- 3. Unusable local docstring is promoted to the manifest (escalation active) ----
+    # ---- 3. A persistent failure is nudged once, then falls back to the visible placeholder ----
     # Use the priming ack itself as the reply - the exact failure seen on `summarise` in the real run.
-    esc = Escalation(threshold=999)            # complexity never escalates; force the local path then failure-promote
     stub_ack = Stub(PRIMING_ACK)
-    dm = _gen(stub_ack, iter_defs_with_info(ast.parse(SRC)), esc)
-    assert dm == {}, "a parroted-ack reply must not be written as a docstring"
+    dm = _gen(stub_ack, iter_defs_with_info(ast.parse(SRC)))
     assert stub_ack.calls == 2, f"expected one attempt + one nudge, got {stub_ack.calls}"
-    assert [r["qualname"] for r in esc.requests] == ["helper"], "an uncoaxable docstring must be promoted to the manifest"
-    assert esc.requests[0].get("def") is not None
+    assert any("comment generation failed" in v for v in dm.values()), \
+        "a persistent failure must fall back to the visible placeholder"
+    dm2 = _gen(Stub("OK"), iter_defs_with_info(ast.parse(SRC)))
+    assert any("comment generation failed" in v for v in dm2.values()), "a bare OK must hit the same fallback"
 
-    # ---- 4. No manifest: a persistent failure falls back to the placeholder ----
-    dm2 = _gen(Stub("OK"), iter_defs_with_info(ast.parse(SRC)), None)
-    assert any("comment generation failed" in v for v in dm2.values()), "without a manifest, failure uses the placeholder"
-
-    # ---- 5. A good reply is used as-is, with no nudge and no escalation ----
-    esc3 = Escalation(threshold=999)
+    # ---- 4. A good reply is used as-is, with no nudge ----
     stub_good = Stub(GOOD)
-    dm3 = _gen(stub_good, iter_defs_with_info(ast.parse(SRC)), esc3)
+    dm3 = _gen(stub_good, iter_defs_with_info(ast.parse(SRC)))
     assert stub_good.calls == 1, "a usable docstring must not trigger a nudge"
     assert len(dm3) == 1 and "Return x plus one" in next(iter(dm3.values()))
-    assert esc3.requests == [], "a good local docstring must not be escalated"
 
-    print("PASS: priming never parrots OK; def pass nudges then promotes unusable docstrings, uses good ones as-is")
+    print("PASS: priming never parrots OK; def pass nudges then placeholder-falls-back, uses good replies as-is")
     return 0
 
 

@@ -15,20 +15,21 @@ Two scratch directories are produced under `temp/dogfood/` and both are left in 
 Modes:
     --mode offline      one local-model run: definition docs + block comments + file descriptions. No network, no
                         stronger model - what a fully offline user gets.
-    --mode escalation   the same def/block pass but with complex routines deferred into a run manifest
-                        (`temp/dogfood/scale-manifest.json`) for a stronger model to fill. The harness stops after the
-                        emit phase and prints the remaining loop commands; in Claude Code, the /scale skill drives
-                        that loop end-to-end.
+    --mode online       every routine's comments deferred into a run manifest (`temp/dogfood/scale-manifest.json`)
+                        for a stronger model to fill. The emit is model-free and completes in seconds; the harness
+                        stops after it and prints the remaining loop commands; in Claude Code, the /scale skill
+                        drives that loop end-to-end.
 
-After the run (offline) or the emit phase (escalation) the harness verifies, deterministically, that re-walling each
+After the run (offline) or the emit phase (online) the harness verifies, deterministically, that re-walling each
 annotated file reproduces the walled input's code lines byte-for-byte - SCALE's code-preservation guarantee checked
 from the outside - and that every output still parses.
 
 Usage:
-    python tests/dogfood.py [--mode offline|escalation] [--files NAME ...] [--wall-only] [--cutoff N] [-- EXTRA...]
+    python tests/dogfood.py [--mode offline|online] [--files NAME ...] [--wall-only] [-- EXTRA...]
 
-Anything after `--` is passed through to scale.py (e.g. `-- -m /path/model.gguf --n-ctx 12288`). This loads a real
-GGUF and is SLOW on the full source set; use `--files` to dogfood a subset (e.g. `--files scale_text.py scale_log.py`).
+Anything after `--` is passed through to scale.py (e.g. `-- -m /path/model.gguf --n-ctx 12288`). The offline mode
+loads a real GGUF and is SLOW on the full source set; use `--files` to dogfood a subset (e.g. `--files scale_text.py
+scale_log.py`). The online emit loads no model at all.
 """
 from __future__ import annotations
 
@@ -44,7 +45,6 @@ DOGFOOD = ROOT / "temp" / "dogfood"
 WALLED = DOGFOOD / "walled"
 ANNOTATED = DOGFOOD / "annotated"
 MANIFEST = DOGFOOD / "scale-manifest.json"
-REWORD = DOGFOOD / "scale-reword.json"
 
 
 def _docstring_lines(tree: ast.AST) -> set[int]:
@@ -186,12 +186,11 @@ def verify(files: list[Path]) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Dogfood SCALE against its own (walled) source.")
-    ap.add_argument("--mode", choices=("offline", "escalation"), default="offline",
-                    help="offline = full local run; escalation = defer complex routines into a manifest")
+    ap.add_argument("--mode", choices=("offline", "online"), default="offline",
+                    help="offline = full local run; online = defer every routine into a manifest (model-free)")
     ap.add_argument("--files", nargs="+", metavar="NAME", default=None,
                     help="subset of source file names to dogfood (default: every scale*.py)")
     ap.add_argument("--wall-only", action="store_true", help="prepare the walled/annotated dirs and stop")
-    ap.add_argument("--cutoff", type=int, default=10, help="escalation cognitive-complexity threshold (default 10)")
     args, extra = ap.parse_known_args()
     if extra and extra[0] == "--":
         extra = extra[1:]
@@ -226,22 +225,20 @@ def main() -> int:
               f"\n  diff:              git diff --no-index {WALLED.relative_to(ROOT)} {ANNOTATED.relative_to(ROOT)}")
         return 0 if ok else 1
 
-    # Escalation: emit phase only - the manifest needs a stronger model before the loop can finish.
-    rc = run_scale(base + ["--escalate-cognitive", str(args.cutoff),
-                           "--emit-manifest", str(MANIFEST.relative_to(ROOT))] + targets + out_flag)
+    # Online: model-free emit only - the manifest needs a stronger model before the loop can finish.
+    rc = run_scale(["-c", "--block-comments", "medium", "-l", "python", "-v", "--online",
+                    "--emit-manifest", str(MANIFEST.relative_to(ROOT))] + extra + targets + out_flag)
     if rc != 0:
         print(f"\nSCALE exited with {rc}")
         return rc
     ok = verify(sources)
     run_scale(["--check-manifest", str(MANIFEST.relative_to(ROOT))])  # informational: how much was deferred
 
-    m, r, t = MANIFEST.relative_to(ROOT), REWORD.relative_to(ROOT), " ".join(targets + out_flag)
+    m, t = MANIFEST.relative_to(ROOT), " ".join(targets + out_flag)
     print(f"\nEmit phase complete. Finish the loop with a stronger model filling the manifest answers, then:\n"
           f"  python scale.py --check-manifest {m}\n"
           f"  python scale.py -l python --apply-manifest {m} {t}\n"
-          f"  python scale.py --file-doc -l python --project-doc README.md --emit-reword {r} {t}\n"
-          f"  ...fill the reword answers...\n"
-          f"  python scale.py -l python --apply-reword {r} {t}\n"
+          f"then run the file-description round (--emit-filedoc / --apply-filedoc) over the applied outputs.\n"
           f"In Claude Code, the /scale skill drives this whole loop.")
     return 0 if ok else 1
 

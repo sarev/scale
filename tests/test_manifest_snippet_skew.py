@@ -1,30 +1,23 @@
 #!/usr/bin/env python3
 """
-Manifest snippet freshness across passes (the emit-side skew): when a routine with a NESTED def is escalated by BOTH
-passes, the def pass records its span from the pre-patch source, but by block-pass time the nested def has gained a
-locally generated docstring - so the block pass's chunk line ranges are computed against a LONGER span. A past bug
-kept the def pass's stale snippet (first write won), leaving every chunk range below the nested docstring overrunning
-the stored snippet by the inserted lines. `record_block` must make its own snippet authoritative.
+Merged-request snippet consistency (the descendant of the old emit-side skew bug): when a routine with a NESTED def
+is recorded by BOTH collectors, the manifest must carry ONE request with ONE snippet, and every block chunk's `lines`
+range must index into exactly that snippet (the block recording's snapshot wins by contract - under the online emit
+both collectors read the same pristine text, so the spans agree, but the invariant is what the apply phase relies
+on). The nested def is its own request, with its own recipe, and the parent's chunk recipe treats it as one opaque
+boundary. The model-free apply phase is exercised on top (it re-binds by bidx, so the answers land regardless).
 
-Guards: the merged request's snippet is the block pass's snapshot (it contains the nested docstring), every chunk
-range stays in bounds, and each range slices the snippet to exactly the text the block pass segmented. The model-free
-apply phase is also exercised on top (it re-binds by bidx, so it must keep working regardless). No GGUF model required.
+No GGUF model required.
 """
-import ast
-import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import scale_python  # noqa: E402
-import scale_blocks  # noqa: E402
-from scale_blocks import PYTHON_STYLE  # noqa: E402
+from scale_blocks import defer_block_targets  # noqa: E402
 from scale_escalate import Escalation  # noqa: E402
-from scale_llm import GenerationConfig  # noqa: E402
 
 
-# 'heavy' exceeds the cutoff on its OWN body (nested defs are opaque to the scorer); 'inner' is trivial, so it is
-# annotated locally in the def pass - that local docstring is what skews the parent's span between the passes.
 SRC = (
     "def heavy(x):\n"
     "    def inner(v):\n"
@@ -47,90 +40,53 @@ SRC = (
 )
 
 
-class StubLLM:
-    """A minimal stand-in for LocalChatModel: canned replies, generous budget, no real generation."""
-    n_ctx = 8192
-    ctx_margin = 256
-
-    def estimate_tokens(self, text):
-        return max(1, len(text) // 4)
-
-    def count_tokens(self, messages):
-        return sum(self.estimate_tokens(m["content"]) for m in messages)
-
-    def snippet_budget(self, messages, cfg, **kwargs):
-        return 4000
-
-    def generate(self, messages, cfg=None, stop=None):
-        content = messages[-1]["content"]
-        if "Write exactly the docstring" in content:
-            return "Stub generated docstring."
-        if "NEXT paragraph" in content:           # comment-pass prompt
-            return "stub block note"
-        nums = re.findall(r"(?m)^\s*(\d+)\|", content)
-        return ", ".join(f"{n}-{n}" for n in nums) or "NONE"
-
-
 def main():
     lines = SRC.split("\n")
-    cfg = GenerationConfig(max_new_tokens=256)
-    msgs = [{"role": "system", "content": "system"}]
-    stub = StubLLM()
 
-    heavy_node = next(n for n in ast.parse(SRC).body if getattr(n, "name", "") == "heavy")
-    assert scale_python.cognitive_complexity(heavy_node) > 10, "test fixture 'heavy' must exceed the cutoff"
+    # ---- EMIT: both collectors over the same pristine text ----
+    esc = Escalation()
+    assert scale_python.collect_def_requests(SRC, lines, esc) == 2     # heavy + heavy.inner
+    targets = scale_python.iter_block_targets(SRC, lines)
+    defer_block_targets(esc, lines, targets)
 
-    esc = Escalation(threshold=10)
+    by_name = {r["qualname"]: r for r in esc.requests}
+    assert set(by_name) == {"heavy", "heavy.inner"}, "each routine gets exactly one merged request"
+    heavy = by_name["heavy"]
+    assert heavy.get("def") is not None and heavy.get("blocks") is not None, \
+        "both collectors must record into ONE per-routine request"
 
-    # ---- DEF PASS: heavy deferred (span recorded from the PRE-patch source); inner docstringed locally ----
-    defs = scale_python.iter_defs_with_info(ast.parse(SRC))
-    doc_map = scale_python.generate_docstrings(stub, cfg, msgs, defs, SRC, lines, escalation=esc)
-    assert {info.qualname for info in defs if id(info.node) in doc_map} == {"heavy.inner"}, \
-        "'inner' must be annotated locally so the parent's span grows before the block pass"
-    patched = scale_python.patch_docstrings_textually(lines, defs, doc_map)
-    assert any("Stub generated docstring." in ln for ln in patched), "inner should get its local docstring"
-    stale_snippet = esc.requests[0]["snippet"]
-    assert "Stub generated docstring." not in stale_snippet, \
-        "fixture: the def-pass span must predate the nested docstring"
-
-    # ---- BLOCK PASS on the updated text: chunk ranges computed against the grown span ----
-    patched_blob = "\n".join(patched)
-    targets = scale_python.iter_block_targets(patched_blob, patched)
-    emit = scale_blocks.annotate_blocks(stub, cfg, msgs, patched, targets, PYTHON_STYLE, escalation=esc)
-
-    merged = [r for r in esc.requests if r["qualname"] == "heavy"]
-    assert len(merged) == 1 and merged[0].get("def") is not None and merged[0].get("blocks") is not None, \
-        "both passes must record into ONE per-routine request"
-
-    # The skew fix: the block recording's snippet wins, so the ranges index into the snapshot they were computed from.
-    snippet_lines = merged[0]["snippet"].split("\n")
-    assert "Stub generated docstring." in merged[0]["snippet"], \
-        "record_block must replace the def pass's stale snippet with the block pass's snapshot"
-    # Ranges are checked against `patched` - the block pass's INPUT. (`emit` differs inside heavy's span: the nested
-    # 'inner' is its own non-escalated target, so its local block edits land there; placement-by-bidx absorbs that.)
-    header_idx = patched.index("def heavy(x):")
-    for chunk in merged[0]["blocks"]["chunks"]:
+    # The invariant the apply phase relies on: every chunk range indexes the request's OWN snippet, slicing it to
+    # exactly the text the structural segmenter grouped.
+    snippet_lines = heavy["snippet"].split("\n")
+    header_idx = lines.index("def heavy(x):")
+    assert snippet_lines[0] == "def heavy(x):"
+    for chunk in heavy["blocks"]["chunks"]:
         a, b = chunk["lines"]
         assert 1 <= a <= b <= len(snippet_lines), f"chunk range {chunk['lines']} overruns the stored snippet"
-        assert snippet_lines[a - 1:b] == patched[header_idx + a - 1:header_idx + b], \
-            f"chunk range {chunk['lines']} must slice the snippet to the text the block pass segmented"
+        assert snippet_lines[a - 1:b] == lines[header_idx + a - 1:header_idx + b], \
+            f"chunk range {chunk['lines']} must slice the snippet to the segmented text"
+
+    # The nested def is one opaque boundary in the parent's recipe, never split across chunks.
+    inner_line_rel = lines.index("    def inner(v):") - header_idx + 1
+    covering = [c for c in heavy["blocks"]["chunks"] if c["lines"][0] <= inner_line_rel <= c["lines"][1]]
+    assert len(covering) == 1, "the nested def must fall inside exactly one parent chunk"
 
     # ---- APPLY still lands the answers (placement is by bidx, independent of the snippet) ----
     manifest = esc.to_manifest("test.py", "python", "\n")
     for req in manifest["requests"]:
         if req.get("def") is not None:
-            req["def"]["answer"] = "Heavy docstring from the stronger model."
+            req["def"]["answer"] = f"Docstring for {req['qualname']}."
         if req.get("blocks") is not None:
             for chunk in req["blocks"]["chunks"]:
                 chunk["answer"] = "stronger note"
-    final = scale_python.apply_manifest(emit, manifest)
-    assert any("Heavy docstring" in ln for ln in final) and any("# stronger note" in ln for ln in final), \
+    final = scale_python.apply_manifest(lines, manifest)
+    assert any("Docstring for heavy." in ln for ln in final) and any("# stronger note" in ln for ln in final), \
         "the merged request must deliver both the docstring and the block comments"
-    # The applied docstring is a statement, so `code_preserved` does not apply; instead every emit line must survive.
-    for ln in (l for l in emit if l.strip()):
+    # The applied docstring is a statement, so `code_preserved` does not apply; instead every line must survive.
+    for ln in (l for l in lines if l.strip()):
         assert ln in final, f"apply dropped or altered a line: {ln!r}"
 
-    print("PASS: the block pass's snippet supersedes the def pass's stale span; chunk ranges index the right snapshot")
+    print("PASS: merged requests carry one snippet; chunk ranges index it exactly; apply lands answers by bidx")
     return 0
 
 

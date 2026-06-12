@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
 The def-pass verification floor: the deterministic backtick-grounding gate and the clean-context grounding challenge,
-with the shared failure routing (one corrective regeneration each; a second failure promotes the routine to the
-manifest when one is active, else writes the doc under a prominent warning).
+with the failure routing (one corrective regeneration each; a second failure writes the doc under a prominent warning
+- a visible contract beats a silent gap).
 
 This guards (model-free, via a fake LLM):
 - `ungrounded_tokens` (the gate itself): backticked identifiers absent from the run's source are flagged; grounded
   ones, single characters, and non-identifier text are not,
 - the gate's one nudge: a corrected regeneration passes; a still-ungrounded one fails the routine,
 - the grounding challenge's parse (NONE passes, a verdict fails) and its regenerate-with-verdict retry,
-- the routing: a twice-failed docstring is promoted to the manifest (the routine left byte-for-byte untouched, its
-  snippet recorded) when escalation is active, and written anyway (visible, with a warning) when it is not,
+- the routing: a twice-failed docstring is still written (visible, with a warning) - never a silent gap,
 - the persistent message list is balanced (append-then-pop) around the whole pipeline.
 """
 import ast
@@ -19,8 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from scale_escalate import Escalation  # noqa: E402
-from scale_python import generate_docstrings, iter_defs_with_info, patch_docstrings_textually  # noqa: E402
+from scale_python import generate_docstrings, iter_defs_with_info  # noqa: E402
 from scale_verify import Verifier, ungrounded_tokens, _first_word_verdict  # noqa: E402
 
 
@@ -62,12 +60,11 @@ def _doc(text: str) -> str:
     return f'"""\n{text}\n"""'
 
 
-def _run(llm, escalation=None):
+def _run(llm):
     messages = []
     defs = iter_defs_with_info(ast.parse(SRC))
     verifier = Verifier(llm, _Cfg(), corpus=CORPUS)
-    doc_map = generate_docstrings(llm, _Cfg(), messages, defs, SRC, SRC.split("\n"),
-                                  escalation=escalation, verifier=verifier)
+    doc_map = generate_docstrings(llm, _Cfg(), messages, defs, SRC, SRC.split("\n"), verifier=verifier)
     assert messages == [], "the persistent message list must be balanced after the def pass"
     return defs, doc_map
 
@@ -106,7 +103,7 @@ def test_gate_nudge_corrects():
     assert llm.grounding_calls == 1
 
 
-def test_gate_failure_without_manifest_writes_with_warning():
+def test_gate_failure_writes_with_warning():
     # Both attempts invent an identifier: the doc is still written (a visible contract beats a silent gap).
     llm = _RouterLLM(
         main=[_doc("Uses `ERR_BOGUS`."), _doc("Still uses `ERR_BOGUS`.")],
@@ -128,21 +125,16 @@ def test_challenge_regenerates_then_passes():
     assert llm.grounding_calls == 2
 
 
-def test_twice_failed_promotes_to_manifest_and_leaves_routine_untouched():
-    # The challenge fails twice -> the routine is promoted (its snippet recorded) and gets no local docstring.
+def test_twice_failed_is_written_with_a_warning():
+    # The challenge fails twice -> the docstring is still written (warn-and-write: the doubt is visible, never silent).
     llm = _RouterLLM(
         main=[_doc("Add one, retrying on overflow."), _doc("Add one, with exponential backoff.")],
         grounding=["- claims it retries", "- claims backoff"],
     )
-    esc = Escalation(threshold=999)  # cognitive routing can never fire; only the verification route can promote
-    defs, doc_map = _run(llm, escalation=esc)
-
-    assert doc_map == {}, "a promoted routine must produce no local docstring"
-    assert len(esc.requests) == 1 and esc.requests[0].get("def") is not None
-    assert esc.requests[0]["qualname"] == "f" and "def f(x):" in esc.requests[0]["snippet"]
-
-    out = patch_docstrings_textually(SRC.split("\n"), defs, doc_map)
-    assert out == SRC.split("\n"), "the promoted routine must be left byte-for-byte untouched"
+    defs, doc_map = _run(llm)
+    assert doc_map[id(defs[0].node)] == "Add one, with exponential backoff.", \
+        "the last attempt must be written despite the failed challenge"
+    assert llm.grounding_calls == 2, "exactly one regeneration is allowed"
 
 
 def test_clean_pass_costs_one_challenge_turn():
@@ -156,11 +148,11 @@ def main():
     test_gate_tokeniser()
     test_verdict_parse()
     test_gate_nudge_corrects()
-    test_gate_failure_without_manifest_writes_with_warning()
+    test_gate_failure_writes_with_warning()
     test_challenge_regenerates_then_passes()
-    test_twice_failed_promotes_to_manifest_and_leaves_routine_untouched()
+    test_twice_failed_is_written_with_a_warning()
     test_clean_pass_costs_one_challenge_turn()
-    print("PASS: the grounding gate and grounding challenge verify def docs, with promote/warn failure routing")
+    print("PASS: the grounding gate and grounding challenge verify def docs, with warn-and-write failure routing")
     return 0
 
 

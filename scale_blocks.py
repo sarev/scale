@@ -130,8 +130,7 @@ SCORE_PROMPT = (
     "nothing else."
 )
 VALUE_FLAG = "{@X@}"        # magic marker tagging a low-value note: kept for context, skipped at output
-CHALLENGE_FLAG = "{@F@}"    # marker tagging a note that failed verification twice: kept for context, never written,
-                            # and (when a manifest is active) the signal to promote the routine to the stronger model
+CHALLENGE_FLAG = "{@F@}"    # marker tagging a note that failed verification twice: kept for context, never written
 COMMENT_VALUE_THRESHOLD = 2  # minimum 1-3 value score for a note to be written into the code (drop bare restatements)
 
 # A routine with at most this many chunks is "short": its docstring plus the visible code already walk a reader
@@ -237,9 +236,7 @@ class BlockTarget:
     - `indent_of`: Maps each boundary line to its exact leading-whitespace string.
     - `depth`: Nesting depth (0 = module level), used to order generation deepest-first.
     - `doc`: The routine's own docstring/header comment (or ""), used as brief context for the comment pass.
-    - `cognitive`: The routine's cognitive complexity, used by selective escalation to decide whether to defer this
-      routine's comments to a stronger model (0 when complexity is not being computed).
-    - `sig`: A structural signature of the routine (see `scale_python.node_sig`), used by selective escalation to
+    - `sig`: A structural signature of the routine (see `scale_python.node_sig`), used by the online manifest flow to
       re-bind a deferred routine across the emit/apply phases ("" when not computed).
     - `segments`: Optional precomputed `(start, end)` chunk ranges from a provider's deterministic segmenter; when
       present the block pass uses them instead of asking the model to segment (None falls back to the LLM segment pass).
@@ -255,7 +252,6 @@ class BlockTarget:
     indent_of: Dict[int, str] = field(default_factory=dict)
     depth: int = 0
     doc: str = ""
-    cognitive: int = 0
     sig: str = ""
     segments: Optional[List[Tuple[int, int]]] = None
 
@@ -859,8 +855,7 @@ def request_block_comment(
     - `verifier`: Optional `scale_verify.Verifier`. When supplied, an insertable summary additionally faces the
       deterministic grounding gate (backticked identifiers must exist in the run's source; one corrective nudge) and
       the clean-context obviousness challenge (one regeneration with the verdict as feedback). A summary that fails
-      either twice is tagged with `CHALLENGE_FLAG`: kept as context, never written, and - when a manifest is active -
-      the caller's signal to promote the routine to the stronger model.
+      either twice is tagged with `CHALLENGE_FLAG`: kept as context, never written.
     - `feedback`: Optional reviewer feedback appended to the summary turn (the story-challenge retry), steering the
       regenerated note towards intent rather than restatement.
 
@@ -943,9 +938,8 @@ def request_block_comment(
 
     # The obviousness challenge (clean context - just the pristine paragraph, the note, one YES/NO question) on a
     # note that would be written: a NO regenerates the note once with the verdict as feedback (re-scored, then
-    # re-challenged); a second NO tags it CHALLENGE_FLAG - dropped from the output, kept as context, and the
-    # promote-to-manifest signal when escalation is active. This kills restatement and purpose-clause score-gaming
-    # that the (same-context) score turn lets through.
+    # re-challenged); a second NO tags it CHALLENGE_FLAG - dropped from the output, kept as context. This kills
+    # restatement and purpose-clause score-gaming that the (same-context) score turn lets through.
     challenge_failed = False
     if kept and verifier is not None:
         pristine = "\n".join(source_lines[blob_start - 1:blob_end])
@@ -1135,6 +1129,55 @@ def apply_blocks(
 # ---------------------------- orchestration ----------------------------
 
 
+def defer_block_targets(
+    escalation,
+    source_lines: Chunk,
+    targets: List[BlockTarget],
+    note_short: Optional[str] = None,
+    note_long: Optional[str] = None,
+) -> int:
+    """
+    Record every routine's chunk recipe on the manifest (the online emit phase) - model-free, language-agnostic.
+
+    Segmentation is structural and has already been computed by the provider (`BlockTarget.segments`); only the
+    per-chunk comment *text* is deferred. The routine's code rides the manifest ONCE, as its verbatim span; each chunk
+    carries its boundary index (placement at apply) and its 1-based line range INTO that span (what the stronger
+    model reads). A target with no boundaries, no segments, or no re-binding signature is skipped (nothing could be
+    placed or re-bound at apply time).
+
+    Parameters:
+    - `escalation`: The `scale_escalate.Escalation` collector for this target file.
+    - `source_lines`: The source split into lines (never modified).
+    - `targets`: The routines from the language's block provider.
+    - `note_short`/`note_long`: Optional overrides for the short-/long-routine length notes (defaults
+      `COMMENT_NOTE_SHORT`/`COMMENT_NOTE_LONG`), recorded so the stronger model keeps the same strictness bias.
+
+    Returns:
+    - The number of routines recorded.
+    """
+
+    count = 0
+    for target in sorted(targets, key=lambda t: t.body_start):
+        if not target.boundary_lines or not target.segments or not target.sig:
+            continue
+        if len(target.segments) <= SHORT_FUNCTION_CHUNKS:
+            length_note = note_short or COMMENT_NOTE_SHORT
+        else:
+            length_note = note_long or COMMENT_NOTE_LONG
+        span = "\n".join(source_lines[target.header_start - 1:target.body_end])
+        chunks = [
+            {"bidx": target.boundary_lines.index(s),
+             "lines": [s - target.header_start + 1, e - target.header_start + 1]}
+            for s, e in target.segments
+        ]
+        escalation.record_block(
+            qualname=target.qualname, kind=target.kind, sig_hash=target.sig,
+            doc_summary=_doc_summary(target.doc), length_note=length_note, chunks=chunks, snippet=span,
+        )
+        count += 1
+    return count
+
+
 def annotate_blocks(
     llm: LocalChatModel,
     cfg: GenerationConfig,
@@ -1149,7 +1192,6 @@ def annotate_blocks(
     note_long: Optional[str] = None,
     score_prompt: Optional[str] = None,
     value_threshold: Optional[int] = None,
-    escalation=None,
     callee_annotations: Optional[Dict[str, Dict[int, str]]] = None,
     verifier=None,
 ) -> Chunk:
@@ -1179,9 +1221,6 @@ def annotate_blocks(
     - `value_threshold`: Minimum 1-3 value score for a comment to be written into the code (`--block-comments`); when
       None, `COMMENT_VALUE_THRESHOLD` is used. Higher is stricter; `1` keeps all. A value above 3 (e.g. `4`) can never
       be cleared, so the comment turns are skipped entirely - the pass only paragraphs the body, no model work.
-    - `escalation`: Optional `scale_escalate.Escalation`. When supplied, a routine whose complexity exceeds the cutoff
-      has its (still-local) segmentation recorded as a manifest request and its comment turns deferred to a stronger
-      model - it is left untouched here and annotated later by the apply phase.
     - `callee_annotations`: Optional `{qualname -> {line -> "callee: one-liner"}}` call-graph context. Each routine's
       map annotates its call lines (read-side only) in the comment turn, so a paragraph that calls a known routine is
       summarised knowing what that routine does. Absent (or for an unlisted routine), behaviour is unchanged.
@@ -1189,10 +1228,7 @@ def annotate_blocks(
       challenge (see `request_block_comment`); per routine - when the routine is long enough (more than
       `SHORT_FUNCTION_CHUNKS` chunks) and at least one note would be written - the **story challenge** judges the
       full note set in a clean context. A failed set is regenerated once with the verdict as per-paragraph feedback;
-      a second failure (or any note tagged `CHALLENGE_FLAG`) promotes the routine to the manifest when escalation is
-      active - the chunk recipe is recorded and the routine is left byte-for-byte untouched, so the apply phase
-      delivers spacing and comments together - else the routine's comments are dropped (the paragraphing blanks stay;
-      wrongness is worse than absence).
+      a second failure drops the routine's comments (the paragraphing blanks stay; wrongness is worse than absence).
 
     Returns:
     - The annotated source split into lines.
@@ -1221,30 +1257,6 @@ def annotate_blocks(
             length_note = note_short or COMMENT_NOTE_SHORT
         else:
             length_note = note_long or COMMENT_NOTE_LONG
-
-        def defer_to_manifest(reason: str) -> None:
-            """Record this routine's chunk recipe on the manifest (it is left byte-for-byte untouched here)."""
-            # The routine's code rides the manifest ONCE, as its verbatim span; each chunk carries its boundary index
-            # (placement at apply) and its 1-based line range INTO that span (what the stronger model reads).
-            span = "\n".join(source_lines[target.header_start - 1:target.body_end])
-            chunks = [
-                {"bidx": target.boundary_lines.index(s),
-                 "lines": [s - target.header_start + 1, e - target.header_start + 1]}
-                for s, e in segments
-            ]
-            escalation.record_block(
-                qualname=target.qualname, kind=target.kind, sig_hash=target.sig,
-                cognitive=target.cognitive, doc_summary=_doc_summary(target.doc),
-                length_note=length_note, chunks=chunks, snippet=span,
-            )
-            echo(f"[blocks] Escalated '{target.qualname}' ({reason}); {len(chunks)} chunk(s) deferred")
-
-        # Selective escalation: a complex routine's comment text is deferred to a stronger model. Segmentation has
-        # already run locally (it is structural), so we record the chunk recipe - each chunk's boundary index and its
-        # code - and skip the local comment turns, leaving this routine untouched for the apply phase.
-        if escalation is not None and escalation.should_escalate(target.qualname, target.cognitive):
-            defer_to_manifest(f"cognitive {target.cognitive}")
-            continue
 
         # One comment turn per chunk, in body order, feeding earlier comments forward as narrative context.
         line_notes = (callee_annotations or {}).get(target.qualname)
@@ -1286,15 +1298,8 @@ def annotate_blocks(
                                                          [_strip_note_flags(n) for n in notes])):
                     story_failed = True
 
-        # Shared failure routing: a twice-failed routine (story challenge, or any note that failed its own
-        # gate/obviousness challenge twice) is promoted whole to the manifest when one is active - the local attempt
-        # is discarded and the routine left byte-for-byte untouched, so the apply phase delivers spacing and comments
-        # together. Without a manifest, a story failure drops the routine's comments (the paragraphing blanks stay);
-        # individually-flagged notes are already excluded from the edits.
-        challenged = story_failed or any((n or "").rstrip().endswith(CHALLENGE_FLAG) for n in notes)
-        if challenged and escalation is not None:
-            defer_to_manifest("failed verification")
-            continue
+        # Failure routing: a twice-failed story drops the routine's comments (the paragraphing blanks stay -
+        # wrongness is worse than absence); individually-flagged notes are already excluded from the edits.
         if story_failed:
             echo(f"[verify] '{target.qualname}': story challenge failed twice; dropping its comments")
             edits = [(b, None, indent) for b, _comment, indent in edits]

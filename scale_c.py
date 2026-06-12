@@ -1047,123 +1047,14 @@ def iter_block_targets_c(
                 indent_of=indent_of,
                 depth=0,
                 doc=doc,
-                cognitive=cognitive_complexity_c(info.node),
-                # The escalation identity: a hash of the routine's verbatim span. Shift-proof (content, not line
-                # numbers), and the doc comment sits above the header so the def-pass apply does not disturb it.
+                # The manifest re-binding identity: a hash of the routine's verbatim span. Shift-proof (content, not
+                # line numbers), and the doc comment sits above the header so the def-pass apply does not disturb it.
                 sig=routine_text_hash(_get_text_for_lines(source_lines, info.header_start, info.end)),
                 segments=segments,
             )
         )
 
     return targets
-
-
-# ---------------- Cognitive complexity (the escalation routing signal)
-
-# Constructs that score +1 plus the nesting penalty and deepen nesting for their contents (SonarSource B1+B2 rules).
-# `if_statement` is handled separately so an `else if` chain folds into cheap continuations.
-_C_NESTING_TYPES = {"for_statement", "while_statement", "do_statement", "switch_statement"}
-
-# Logical operators: one increment per operator *sequence* (`a && b && c` scores once, mirroring Python's `BoolOp`).
-_C_LOGICAL_OPS = {"&&", "||"}
-
-
-def cognitive_complexity_c(node: Any) -> int:
-    """
-    Compute the SonarSource-style Cognitive Complexity of a single C function's own body.
-
-    This is the native C escalation routing signal, the tree-sitter mirror of `scale_python.cognitive_complexity`
-    (same rules, so one `--escalate-cognitive` cutoff is meaningful across languages; a `--codestats-json` report
-    still overrides per-qualname):
-
-      - +1 (and +1 per enclosing nesting level) for each `if` / `for` / `while` / `do` / `switch` and ternary
-        (`conditional_expression`);
-      - +1 (with no nesting penalty) for each `else if` / `else` continuation - the chain is folded iteratively so
-        an `else if` ladder reads as cheap continuations rather than ever-deeper nested `if`s;
-      - +1 for each `&&` / `||` operator sequence (a run of the same operator scores once, like Python's `BoolOp`).
-
-    Loop/switch headers (initialiser, condition, update) stay at the surrounding nesting level; only the construct's
-    body deepens. A node with no `body` field (e.g. a prototype `declaration` record) scores 0.
-
-    Parameters:
-    - `node`: A tree-sitter `function_definition` node whose body is scored.
-
-    Returns:
-    - The cognitive complexity as a non-negative integer.
-    """
-
-    body = node.child_by_field_name("body") if node is not None else None
-    if body is None:
-        return 0
-
-    score = 0
-
-    def visit_if(n, nesting: int) -> None:
-        """Score an `if_statement`, folding its `else if` chain into +1 continuations."""
-        nonlocal score
-        score += 1 + nesting
-        visit(n.child_by_field_name("condition"), nesting, None)
-        visit(n.child_by_field_name("consequence"), nesting + 1, None)
-        alt = n.child_by_field_name("alternative")
-        while alt is not None:
-            # Modern grammars wrap the branch in an `else_clause`; unwrap to the statement inside.
-            inner = alt
-            if alt.type == "else_clause":
-                kids = [alt.named_child(i) for i in range(alt.named_child_count)]
-                inner = kids[0] if kids else None
-            if inner is None:
-                return
-            if inner.type == "if_statement":  # `else if`: a continuation, not a fresh nested if
-                score += 1
-                visit(inner.child_by_field_name("condition"), nesting, None)
-                visit(inner.child_by_field_name("consequence"), nesting + 1, None)
-                alt = inner.child_by_field_name("alternative")
-            else:  # plain `else`
-                score += 1
-                visit(inner, nesting + 1, None)
-                alt = None
-
-    def visit(n, nesting: int, logical_op: Optional[str]) -> None:
-        """Walk `n` adding to `score`; `logical_op` is the operator of an enclosing logical run (for collapsing)."""
-        nonlocal score
-        if n is None:
-            return
-
-        if n.type == "if_statement":
-            visit_if(n, nesting)
-            return
-
-        if n.type in _C_NESTING_TYPES:
-            score += 1 + nesting
-            body_node = n.child_by_field_name("body")
-            for i in range(n.named_child_count):
-                c = n.named_child(i)
-                # The header parts (initialiser/condition/update) stay at this level; the body deepens.
-                visit(c, nesting + 1 if (body_node is None or c.id == body_node.id) else nesting, None)
-            return
-
-        if n.type == "conditional_expression":  # ternary `c ? a : b`
-            score += 1 + nesting
-            visit(n.child_by_field_name("condition"), nesting, None)
-            visit(n.child_by_field_name("consequence"), nesting + 1, None)
-            visit(n.child_by_field_name("alternative"), nesting + 1, None)
-            return
-
-        if n.type == "binary_expression":
-            op_node = n.child_by_field_name("operator")
-            op = op_node.text.decode("utf-8", "replace") if op_node is not None else ""
-            if op in _C_LOGICAL_OPS:
-                if op != logical_op:  # a run of the same operator scores once
-                    score += 1
-                for i in range(n.named_child_count):
-                    visit(n.named_child(i), nesting, op)
-                return
-
-        for i in range(n.named_child_count):
-            visit(n.named_child(i), nesting, None)
-
-    visit(body, 0, None)
-    return score
 
 
 # ---------------- Snippet assembly
@@ -1485,7 +1376,6 @@ def generate_comments_c(
     doc_plan: Optional[CFileDocPlan] = None,
     decls: Optional[List[DefInfoC]] = None,
     verifier=None,
-    escalation=None,
 ) -> Dict[Tuple[int, int], str]:
     """
     Generate doc comments for each documentable C record (function definitions and, when redirecting, prototypes).
@@ -1514,11 +1404,7 @@ def generate_comments_c(
       on the plan so the paired implementation's block pass can reuse it.
     - `verifier`: Optional `scale_verify.Verifier`. When supplied, each generated comment faces the deterministic
       backtick-grounding gate and the clean-context grounding challenge (one corrective regeneration each); a comment
-      that fails twice is promoted to the manifest when escalation is active, else written under a prominent warning.
-    - `escalation`: Optional `scale_escalate.Escalation`. When supplied, a doc-site redirected prototype is always
-      deferred to the stronger model, as is any record whose routing score (the native `cognitive_complexity_c`, or
-      its `--codestats-json` override) exceeds the cutoff or whose local comment fails verification twice; deferred
-      records are left untouched for the apply phase.
+      that fails twice is written under a prominent warning.
 
     Returns:
     - A dictionary mapping each record's header span to its corresponding documentation comment.
@@ -1543,21 +1429,6 @@ def generate_comments_c(
             snippet = doc_plan.impl_snippet(info.qualname)
         if not snippet:
             snippet = assemble_snippet_for_c(source_lines, info)
-        full_snippet = snippet
-        span_hash = routine_text_hash(_get_text_for_lines(source_lines, info.header_start, info.end))
-
-        # Selective escalation: with a manifest active, a doc-site redirected prototype is ALWAYS deferred to the
-        # stronger model (a public contract is the highest value per token), and so is any record whose routing score
-        # exceeds the cutoff (the native `cognitive_complexity_c` score, overridable per-qualname by
-        # `--codestats-json`). The record is left untouched here; the model-free apply phase patches the answer in by
-        # (qualname, span hash). A declaration record has no body, so its native score is 0 - the doc-site rule is
-        # what defers it.
-        score = cognitive_complexity_c(info.node) if escalation is not None else 0
-        if escalation is not None and (is_decl or escalation.should_escalate(info.qualname, score)):
-            escalation.record_def(qualname=info.qualname, kind=info.kind, sig_hash=span_hash,
-                                  cognitive=escalation.score_for(info.qualname, score), snippet=full_snippet)
-            echo(f"[C] Escalated '{info.qualname}' ({'doc-site prototype' if is_decl else 'complexity'}); deferred")
-            continue
 
         # Elide the body if this function is too large for the context window (the patch is unaffected).
         header_lines = max(1, info.header_end - info.header_start + 1)
@@ -1619,13 +1490,7 @@ def generate_comments_c(
 
             body, ok = verifier.verify_def(snippet, body, regenerate, label=info.qualname)
             if not ok:
-                # Shared failure routing: promote to the manifest (discarding the local attempt) when one is active;
-                # else write the doc under a prominent warning - a visible contract beats a silent gap.
-                if escalation is not None:
-                    escalation.record_def(qualname=info.qualname, kind=info.kind, sig_hash=span_hash,
-                                          cognitive=escalation.score_for(info.qualname, score), snippet=full_snippet)
-                    echo(f"[C] Promoted '{info.qualname}' to the stronger model (failed verification)")
-                    continue
+                # Failure routing: write the doc under a prominent warning - a visible contract beats a silent gap.
                 error(f"[verify] '{info.qualname}': comment failed verification twice; writing it anyway - "
                       f"review this comment")
         if not body:
@@ -1705,7 +1570,6 @@ def generate_language_comments(
     on_doc: Optional[Callable[[str, str], None]] = None,
     doc_plan: Optional[CFileDocPlan] = None,
     verifier=None,
-    escalation=None,
 ) -> Chunk:
     """
     Generate language comments for a given C source code.
@@ -1756,10 +1620,51 @@ def generate_language_comments(
     echo("Generating C comments...\n")
     doc_map = generate_comments_c(llm, cfg, messages, defs, source_blob, source_lines,
                                   doc_order=doc_order, callee_context=callee_context, on_doc=on_doc,
-                                  doc_plan=doc_plan, decls=decls, verifier=verifier, escalation=escalation)
+                                  doc_plan=doc_plan, decls=decls, verifier=verifier)
 
     echo("Applying C patches...\n")
     return patch_comments_textually_c(source_lines, defs + decls, doc_map, style=style)
+
+
+# ---------------- Manifest emit (model-free)
+
+
+def collect_def_requests_c(source_blob: str, source_lines: Chunk, escalation, doc_plan: Optional[CFileDocPlan] = None) -> int:
+    """
+    Record every documentable C record as a deferred doc-comment request (the online emit phase) - model-free.
+
+    Mirrors what `generate_comments_c` documents: the file's function definitions minus any the `--doc-site` plan
+    redirects to a header, plus the prototypes the plan names as documentation sites. A prototype's snippet is the
+    paired implementation body (the prose source), falling back to the prototype text when no implementation is in
+    the run; run-level slimming later collapses the duplicate impl text to a `snippet_ref`.
+
+    Parameters:
+    - `source_blob`: The complete source text (parsed with Tree-sitter C).
+    - `source_lines`: The same source split into individual lines.
+    - `escalation`: The `scale_escalate.Escalation` collector for this target file.
+    - `doc_plan`: Optional per-file `--doc-site` plan (skips redirected definitions, names header prototypes).
+
+    Returns:
+    - The number of records recorded.
+    """
+
+    tree, source_bytes = _parse_c(source_blob)
+    defs = iter_defs_with_info_c(tree, source_bytes)
+
+    skip = doc_plan.skip if doc_plan is not None else set()
+    records: List[DefInfoC] = [d for d in defs if d.qualname not in skip]
+    if doc_plan is not None and doc_plan.header_names:
+        records += [d for d in iter_decls_with_info_c(tree, source_bytes) if d.qualname in doc_plan.header_names]
+
+    for info in records:
+        snippet = None
+        if info.kind == "declaration" and doc_plan is not None:
+            snippet = doc_plan.impl_snippet(info.qualname)
+        if not snippet:
+            snippet = assemble_snippet_for_c(source_lines, info)
+        span_hash = routine_text_hash(_get_text_for_lines(source_lines, info.header_start, info.end))
+        escalation.record_def(qualname=info.qualname, kind=info.kind, sig_hash=span_hash, snippet=snippet)
+    return len(records)
 
 
 # ---------------- Manifest apply (model-free)
