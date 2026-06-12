@@ -3,9 +3,9 @@ Function `{qualname}` does: {doc}
 One-line notes on the earlier paragraphs of its body (your running context):
 {priors}
 
-Here is the NEXT paragraph of its body:
+Here is the NEXT paragraph of its body - the lines marked `>`. The unmarked lines are surrounding code, shown only so you can read the paragraph in context:
 
 {block}
 
-In ONE short line, capture this paragraph's POINT: why it is here, what it accomplishes for the function, or the reason / gotcha / subtlety / edge case behind it. Assume the reader can already read the code - do NOT narrate the statements or restate what the lines plainly say. If the paragraph really is just a mechanical step, say that plainly and briefly. Always give a real description (later paragraphs rely on it); never reply 'NONE' or leave it blank.
+In ONE short line, capture this paragraph's POINT: why it is here, what it accomplishes for the function, or the reason / gotcha / subtlety / edge case behind it. Describe ONLY the `>`-marked lines, never the unmarked context. Assume the reader can already read the code - do NOT narrate the statements or restate what the lines plainly say. If the paragraph really is just a mechanical step, say that plainly and briefly. Always give a real description (later paragraphs rely on it); never reply 'NONE' or leave it blank.
 Bare sentence. No #, no quotes, no list.

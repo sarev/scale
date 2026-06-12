@@ -10,7 +10,10 @@ missing file is never an error.
 - **Block pass**: the per-language priming templates `blocks.python.txt` / `blocks.c.txt` / `blocks.js.txt` plus the
   per-turn wording files `blocks.segment.txt`, `blocks.comment.txt` (turn-1 summary), `blocks.score.txt` (turn-2
   value score), `blocks.comment.nudge.txt`, `blocks.note.short.txt`, and `blocks.note.long.txt` (each overriding a
-  default constant in `scale_blocks.py`).
+  default constant in `scale_blocks.py`). Note: `{block}` is the paragraph *inside its raw context window*, the
+  paragraph's own lines gutter-marked `> ` — a custom `blocks.comment.txt` / `blocks.score.txt` /
+  `blocks.comment.nudge.txt` predating the window should be re-based on the shipped files, which tell the model to
+  describe only the marked lines.
 - **Whole-file summary** (which is also the `--file-doc` header description): `summary.txt` (the full
   file-description spec, `{language}`/`{seed}`) and `summary.short.txt` (the def-pass squash), overriding
   `SUMMARY_INSTRUCTION`/`SHORT_SUMMARY_INSTRUCTION` in `scale.py`.

@@ -1,6 +1,6 @@
 {length_note}
 
-Score the one-line note you just wrote: how much would it help a READER OF THE CODE, placed as a comment above that paragraph?
+Score the one-line note you just wrote: how much would it help a READER OF THE CODE, placed as a comment above that paragraph (the `>`-marked lines)?
   1 - it just restates what the code already says (no insight beyond reading the lines themselves)
   2 - it signposts the block - a heading that helps a reader navigate, even if it lightly echoes the code
   3 - it explains intent, a reason, a gotcha, or behaviour that is not obvious from the code

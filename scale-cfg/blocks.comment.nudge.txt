@@ -1,2 +1,2 @@
-Describe what that paragraph does in ONE short line - even if it is simple, say plainly what it accomplishes. Do not reply 'NONE' and do not leave it blank.
+Describe what that paragraph (the `>`-marked lines) does in ONE short line - even if it is simple, say plainly what it accomplishes. Do not reply 'NONE' and do not leave it blank.
 Bare sentence. No #, no quotes, no list.

@@ -48,6 +48,18 @@ MAX_CONTEXT_RUN = 6
 ELISION_BAND = "« {n} lines elided »"
 
 
+# The comment turn shows each paragraph inside a raw window of surrounding source - this many lines either side,
+# clamped to the routine - with the paragraph's own lines gutter-marked `> `. A bare paragraph used to be all the
+# model saw, which drove bland or hallucinated notes; the window lets it read the neighbouring code without being
+# asked to describe it.
+BLOCK_CONTEXT_LINES = 8
+
+# The window's lower edge is nudged further back to the paragraph's enclosing scope opener (the nearest line above
+# with strictly smaller indentation) so a paragraph deep in an `if`/loop is read knowing what guards it. The walk up
+# is bounded by this many lines; past it, the plain ±N window stands.
+BLOCK_SCOPE_NUDGE_CAP = 24
+
+
 # Reply-length caps (tokens) for the two block-pass turns. Both replies are tiny - a list of line ranges, or a one- to
 # three-line comment - so capping them keeps the prompt+reply within the context window (avoiding spurious budget
 # warnings) and discourages the model from rambling into a multi-line "what the code does" list.
@@ -68,8 +80,9 @@ SCORE_TEMPERATURE = 0.0
 # fallbacks; the CLI normally overrides them with the user-editable `scale-cfg/blocks.segment.txt`,
 # `blocks.comment.txt` and `blocks.score.txt`. Placeholders are filled by simple substitution (`_fill`), so a prompt
 # may use any of: `{kind}`, `{qualname}` (any turn); `{view}` (segment - the numbered body); `{doc}` (function
-# summary), `{priors}` (one-line notes on earlier paragraphs), `{block}` (comment - the paragraph's own lines);
-# `{length_note}` (score - the short/long strictness hint). Other braces in the text are left untouched.
+# summary), `{priors}` (one-line notes on earlier paragraphs), `{block}` (comment/score - the paragraph inside its
+# raw context window, the paragraph's own lines gutter-marked `> `); `{length_note}` (score - the short/long
+# strictness hint). Other braces in the text are left untouched.
 #
 # The segment prompt asks for line RANGES, not split points: framing the task as "group related lines into chunks"
 # stops the weak model hyper-focusing on breaking up individual lines (which over-segments). Each chunk's start is
@@ -89,12 +102,13 @@ SEGMENT_PROMPT = (
 COMMENT_PROMPT = (
     "Function `{qualname}` does: {doc}\n\n"
     "One-line notes on the earlier paragraphs of its body (your running context):\n{priors}\n\n"
-    "Here is the NEXT paragraph of its body:\n\n{block}\n\n"
+    "Here is the NEXT paragraph of its body - the lines marked `>`. The unmarked lines are surrounding code, shown "
+    "only so you can read the paragraph in context:\n\n{block}\n\n"
     "In ONE short line, capture this paragraph's POINT: why it is here, what it accomplishes for the function, or the "
-    "reason / gotcha / subtlety / edge case behind it. Assume the reader can already read the code - do NOT narrate "
-    "the statements or restate what the lines plainly say. If the paragraph really is just a mechanical step, say that "
-    "plainly and briefly. Always give a real description (later paragraphs rely on it); never reply 'NONE' or leave it "
-    "blank.\n"
+    "reason / gotcha / subtlety / edge case behind it. Describe ONLY the `>`-marked lines, never the unmarked context. "
+    "Assume the reader can already read the code - do NOT narrate the statements or restate what the lines plainly "
+    "say. If the paragraph really is just a mechanical step, say that plainly and briefly. Always give a real "
+    "description (later paragraphs rely on it); never reply 'NONE' or leave it blank.\n"
     "Bare sentence. No #, no quotes, no list."
 )
 # TURN 2 (the value score) judges whether that one-line note earns a place in the code, on a deliberately narrow 1-3
@@ -108,7 +122,7 @@ COMMENT_PROMPT = (
 SCORE_PROMPT = (
     "{length_note}\n\n"
     "Score the one-line note you just wrote: how much would it help a READER OF THE CODE, placed as a comment above "
-    "that paragraph?\n"
+    "that paragraph (the `>`-marked lines)?\n"
     "  1 - it just restates what the code already says (no insight beyond reading the lines themselves)\n"
     "  2 - it signposts the block - a heading that helps a reader navigate, even if it lightly echoes the code\n"
     "  3 - it explains intent, a reason, a gotcha, or behaviour that is not obvious from the code\n"
@@ -141,8 +155,8 @@ COMMENT_NOTE_LONG = (
     "lightly echoes the code - but still give 1 to a bare restatement, and 3 to genuine intent or a gotcha."
 )
 COMMENT_NUDGE = (
-    "Describe what that paragraph does in ONE short line - even if it is simple, say plainly what it accomplishes. "
-    "Do not reply 'NONE' and do not leave it blank.\n"
+    "Describe what that paragraph (the `>`-marked lines) does in ONE short line - even if it is simple, say plainly "
+    "what it accomplishes. Do not reply 'NONE' and do not leave it blank.\n"
     "Bare sentence. No #, no quotes, no list."
 )
 
@@ -748,6 +762,47 @@ def _strip_note_flags(comment: Optional[str]) -> str:
     return out.strip()
 
 
+def _context_window(source_lines: Chunk, target: BlockTarget, blob_start: int, blob_end: int) -> Tuple[int, int]:
+    """
+    Compute the raw source window `(lo, hi)` shown around a paragraph in the comment turn.
+
+    The base window is `BLOCK_CONTEXT_LINES` either side of the paragraph, clamped to the routine
+    (`header_start`..`body_end`) so the signature is the furthest back it can reach. The lower edge is then nudged
+    further back to the paragraph's enclosing scope opener - walking up at most `BLOCK_SCOPE_NUDGE_CAP` lines, the
+    first non-blank line with strictly smaller leading whitespace than the paragraph's first line - so a paragraph
+    deep inside an `if`/loop is read knowing what guards it. The nudge only ever extends the window backwards.
+
+    Parameters:
+    - `source_lines`: The full source split into lines.
+    - `target`: The routine the paragraph belongs to.
+    - `blob_start`: The first line of the paragraph (1-based).
+    - `blob_end`: The last line of the paragraph, inclusive.
+
+    Returns:
+    - The `(lo, hi)` window bounds, 1-based and inclusive.
+    """
+
+    lo = max(target.header_start, blob_start - BLOCK_CONTEXT_LINES)
+    hi = min(target.body_end, blob_end + BLOCK_CONTEXT_LINES)
+
+    # Scope nudge: find the paragraph's enclosing scope opener and pull the window back to include it.
+    first = source_lines[blob_start - 1] if 1 <= blob_start <= len(source_lines) else ""
+    para_indent = first[:len(first) - len(first.lstrip())]
+    floor = max(target.header_start, blob_start - BLOCK_SCOPE_NUDGE_CAP)
+    for ln in range(blob_start - 1, floor - 1, -1):
+        if not (1 <= ln <= len(source_lines)):
+            break
+        text = source_lines[ln - 1]
+        if not text.strip():
+            continue
+        indent = text[:len(text) - len(text.lstrip())]
+        if len(indent) < len(para_indent):
+            lo = min(lo, ln)        # never forward: the ±N window already reaches at least this far back
+            break
+
+    return lo, hi
+
+
 def request_block_comment(
     llm: LocalChatModel,
     cfg: GenerationConfig,
@@ -772,8 +827,9 @@ def request_block_comment(
 
     Two turns. **Turn 1** always asks for a one-line description of the paragraph - there is no opt-out, because the
     summary is the running record (`priors`) that later paragraphs depend on (a paragraph left undescribed used to
-    starve its successors of context and drive hallucinations). The paragraph is shown with only light context - the
-    routine's purpose and the notes on earlier paragraphs; the file overview is already primed. **Turn 2** asks for a
+    starve its successors of context and drive hallucinations). The paragraph is shown gutter-marked `> ` inside its
+    raw context window (`_context_window`) alongside the routine's purpose and the notes on earlier paragraphs; the
+    file overview is already primed. **Turn 2** asks for a
     1-3 value score for that summary as a code comment (1 = restates the code, 2 = signpost, 3 = intent/gotcha).
 
     The summary is always returned (for the caller to keep as context). When its score falls below
@@ -813,18 +869,23 @@ def request_block_comment(
       verification twice), or None if the model gave nothing usable.
     """
 
-    raw_lines = source_lines[blob_start - 1:blob_end]
-    if line_notes:
-        # Annotate call lines with their callee's one-liner, in the language's own trailing-comment form. This is the
-        # model's view only - the output is patched from the pristine source, so a misplaced note is harmless.
-        annotated: List[str] = []
-        for off, text in enumerate(raw_lines):
-            note = line_notes.get(blob_start + off)
+    # The model's view: the paragraph inside its raw context window, target lines gutter-marked `> ` and context
+    # lines indented to match. Call lines within the paragraph carry their callee's one-liner as a trailing comment.
+    # This is the model's view only - the output is patched from the pristine source, so a misplaced note is harmless.
+    lo, hi = _context_window(source_lines, target, blob_start, blob_end)
+    view_lines: List[str] = []
+    for ln in range(lo, hi + 1):
+        if not (1 <= ln <= len(source_lines)):
+            continue
+        text = source_lines[ln - 1]
+        if blob_start <= ln <= blob_end:
+            note = line_notes.get(ln) if line_notes else None
             if note and text.strip():
                 text = f"{text.rstrip()}  {style.line_prefix.rstrip()} {note}"
-            annotated.append(text)
-        raw_lines = annotated
-    block_text = "\n".join(raw_lines)
+            view_lines.append(f"> {text}")
+        else:
+            view_lines.append(f"  {text}")
+    block_text = "\n".join(view_lines)
     priors = "\n".join(f"- {c}" for c in (prior_comments or [])) or "(none yet)"
 
     prompt = _fill(

@@ -64,6 +64,13 @@ the file/function docs and the notes written for *earlier* paragraphs, so a sile
 its successors blind to what it did (a prime source of hallucination — e.g. a bare `return true` chunk with no
 preceding statement to describe).
 
+- The paragraph is shown inside a **raw context window** (`_context_window`): `BLOCK_CONTEXT_LINES` (8) lines either
+  side, clamped to the routine, with the lower edge **nudged back to the enclosing scope opener** — the nearest line
+  above with strictly smaller indentation, walked up at most `BLOCK_SCOPE_NUDGE_CAP` (24) lines — so a paragraph deep
+  in an `if`/loop is read knowing what guards it. The paragraph's own lines are gutter-marked `> `; the unmarked
+  context lines are explicitly not-to-be-described (a bare, contextless paragraph used to drive bland or hallucinated
+  notes). This marked view is the model's view only: the patcher and the obviousness challenge still work from the
+  pristine source lines.
 - **Turn 1 (summary)** therefore *always* asks for a one-line description — there is no `NONE` opt-out — and
   **every** summary is kept in the running `{priors}` context, even ones that won't be written.
 - **Turn 2 (score)** rates that summary on a deliberately narrow **1–3** scale — **1** restates the code, **2**
