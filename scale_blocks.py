@@ -1096,11 +1096,15 @@ def defer_block_targets(
     targets: List[BlockTarget],
     note_short: Optional[str] = None,
     note_long: Optional[str] = None,
+    style: Optional[CommentStyle] = None,
+    preserve_existing: bool = True,
 ) -> int:
     """
     Record every usable block target in the run manifest instead of annotating it locally.
 
     Each target's full span (header through body) is captured once as a self-contained snippet, with chunk line ranges rebased to 1-based positions within it. Each chunk also carries an `anchor` - the verbatim text of its boundary line - so the writer can locate the chunk by matching that line rather than counting through a body thick with comments and blanks (the off-by-N failure mode). Targets missing boundaries, segments, or a signature hash are skipped, as they cannot be re-bound at apply time.
+
+    When a `style` is supplied, any comment already attached to a chunk's boundary is surfaced as the chunk's `existing` text so the writer can choose not to clobber it. A *substantive* (multi-line) existing comment is protected by default: its answer is pre-filled `NONE` (which keeps the comment verbatim at apply time) and flagged `preserve`, so a run over already-commented code never silently degrades hand-written rationale. `preserve_existing=False` (the `--overwrite-comments` path) lifts that protection, leaving every slot unfilled for the writer to decide.
 
     Parameters:
     - `escalation`: The run-manifest collector that receives each block record.
@@ -1108,6 +1112,8 @@ def defer_block_targets(
     - `targets`: The block targets produced by the structural segmenter.
     - `note_short`: Optional override for the short-routine length note.
     - `note_long`: Optional override for the long-routine length note.
+    - `style`: The comment style used to recognise existing comments; when `None`, existing comments are neither surfaced nor protected.
+    - `preserve_existing`: When true (the default), pre-fill `NONE` for chunks whose boundary already carries a multi-line comment, protecting prior work.
 
     Returns:
     - The number of targets actually deferred.
@@ -1128,12 +1134,24 @@ def defer_block_targets(
 
         # Capture the whole span once and rebase chunk ranges to 1-based snippet lines, so each record is self-contained.
         span = "\n".join(source_lines[target.header_start - 1:target.body_end])
-        chunks = [
-            {"bidx": target.boundary_lines.index(s),
-             "lines": [s - target.header_start + 1, e - target.header_start + 1],
-             "anchor": source_lines[s - 1].strip()}
-            for s, e in target.segments
-        ]
+        chunks = []
+        for s, e in target.segments:
+            chunk = {"bidx": target.boundary_lines.index(s),
+                     "lines": [s - target.header_start + 1, e - target.header_start + 1],
+                     "anchor": source_lines[s - 1].strip()}
+
+            # Surface a comment already attached to this boundary, and protect a multi-line one by pre-answering NONE.
+            if style is not None:
+                indent = target.indent_of.get(s, "")
+                cs = _existing_comment_start(source_lines, s - 1, indent, style)
+                if cs < s - 1:
+                    existing = source_lines[cs:s - 1]
+                    chunk["existing"] = "\n".join(existing)
+                    if preserve_existing and len(existing) >= 2:
+                        chunk["answer"] = "NONE"
+                        chunk["preserve"] = True
+            chunks.append(chunk)
+
         escalation.record_block(
             qualname=target.qualname, kind=target.kind, sig_hash=target.sig,
             doc_summary=_doc_summary(target.doc), length_note=length_note, chunks=chunks, snippet=span,

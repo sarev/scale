@@ -164,16 +164,20 @@ class Escalation:
         - `snippet`: The routine's verbatim source; optional if already captured.
         """
 
-        # Chunks are reduced to boundary index, line range, the anchor line text and a null answer slot; any other provider extras are dropped.
+        # Chunks are reduced to boundary index, line range, the anchor line text and an answer slot; any other provider extras are dropped. A chunk may arrive pre-answered NONE to protect an existing comment, and may surface that comment's text.
         req = self._routine(qualname, kind, sig_hash, snippet)
         if snippet:
             req["snippet"] = snippet
-        req["blocks"] = {
-            "doc_summary": doc_summary,
-            "length_note": length_note,
-            "chunks": [{"bidx": c["bidx"], "lines": list(c.get("lines") or []),
-                        "anchor": c.get("anchor", ""), "answer": None} for c in chunks],
-        }
+        reduced = []
+        for c in chunks:
+            rc = {"bidx": c["bidx"], "lines": list(c.get("lines") or []), "anchor": c.get("anchor", "")}
+            if c.get("existing"):
+                rc["existing"] = c["existing"]
+            if c.get("preserve"):
+                rc["preserve"] = True
+            rc["answer"] = c.get("answer")
+            reduced.append(rc)
+        req["blocks"] = {"doc_summary": doc_summary, "length_note": length_note, "chunks": reduced}
 
     def to_manifest(self, source: str, language: str, line_ending: str) -> dict:
         """

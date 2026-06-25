@@ -1821,6 +1821,9 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--block-comments", "-bc", choices=("low", "medium", "high"), default=None,
                    help="Write within-function block comments at the chosen density (implies the block pass): 'high' "
                         "keeps all of them, 'medium' drops bare restatements, 'low' keeps only intent/gotcha notes.")
+    p.add_argument("--overwrite-comments", action="store_true",
+                   help="Online emit: offer existing multi-line block comments up for rewriting instead of "
+                        "preserving them by default (a substantive comment is otherwise kept untouched).")
     p.add_argument("--language", "-l", default=None, help="Source file language. SCALE currently supports: 'python', 'js', 'c'")
     p.add_argument("--project-doc", "-p", default="", metavar="PATH",
                    help="Project overview to distil into background context for every file (e.g. CLAUDE.md/README). "
@@ -2353,6 +2356,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     escalation, source_lines, provider(source_blob, source_lines),
                     note_short=_read_optional(scale_path / "blocks.note.short.txt"),
                     note_long=_read_optional(scale_path / "blocks.note.long.txt"),
+                    style=_block_style_for(language, args.block_comment_style),
+                    preserve_existing=not args.overwrite_comments,
                 )
                 echo(f"[emit] {target}: {n} block recipe(s)")
 

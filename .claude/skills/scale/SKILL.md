@@ -85,6 +85,10 @@ duplicate the text back). It has either or both of:
   anchor happens to repeat. Set each chunk's `answer` to ONE short, useful line (the paragraph's point, reason, or
   gotcha — never a restatement), or the string `"NONE"` for a chunk that is genuinely self-evident. Leave `bidx`,
   `lines`, `anchor`, `sig_hash` etc. untouched.
+  - **Do not clobber good prior work.** A chunk may carry `existing` — the comment already on that block. If it is
+    adequate, answer `"NONE"` to keep it untouched; only write when the block has no comment or a poor one. A chunk
+    that arrives already `"answer": "NONE"` with `"preserve": true` is a multi-line comment SCALE has protected for
+    you — leave it exactly as is.
 
 **Fill order.** For a request with both slots, fill the **block chunks first, in body order** (one line or `"NONE"`
 each — by the last chunk you have read the whole routine), **then** write the `def` answer from that understanding.
