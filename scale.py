@@ -1470,6 +1470,55 @@ def _read_optional(path: Path) -> Optional[str]:
     return path.read_text(encoding="utf-8") if path.is_file() else None
 
 
+class ConfigResolver:
+    """
+    Resolve a prompt/template file name across an ordered list of config directories.
+
+    Every prompt lookup in SCALE is written `config_dir / "name"`; making `config_dir` one of these lets a
+    project-local override directory shadow the built-in `scale-cfg` per file. `name` is resolved against each
+    directory in priority order (overrides first) and the first existing file wins; a name present in none resolves
+    to the lowest-priority (built-in) path, where `_read_optional` reads it as absent or `read_text` raises - exactly
+    the behaviour a bare `Path` gave before. Resolution is per file, so an override directory need only carry the
+    handful of templates it wants to change, inheriting the rest.
+    """
+
+    def __init__(self, dirs: List[Path]):
+        # Highest priority first; the last entry is the built-in default and the fallback for an unknown name.
+        self._dirs = [Path(d) for d in dirs]
+
+    def __truediv__(self, name: str) -> Path:
+        for d in self._dirs:
+            candidate = d / name
+            if candidate.is_file():
+                return candidate
+        return self._dirs[-1] / name
+
+
+def _discover_config_dir(start: Path, builtin: Path) -> Optional[Path]:
+    """
+    Find a project-local `scale-cfg`/`.scale-cfg` override directory at or above `start`.
+
+    Walks `start` and its parents, returning the first such directory that is not the built-in one (so SCALE's own
+    `scale-cfg`, found when the tool is run from its own root, is never mistaken for a project override).
+
+    Parameters:
+    - `start`: The directory to begin the upward search from (typically the working directory).
+    - `builtin`: The built-in `scale-cfg` directory, excluded from the results.
+
+    Returns:
+    - The discovered override directory, or `None` when none is found.
+    """
+
+    start = start.resolve()
+    builtin = builtin.resolve()
+    for d in [start, *start.parents]:
+        for name in ("scale-cfg", ".scale-cfg"):
+            candidate = d / name
+            if candidate.is_dir() and candidate.resolve() != builtin:
+                return candidate
+    return None
+
+
 def _block_pass(
     llm: LocalChatModel,
     cfg: GenerationConfig,
@@ -1833,6 +1882,9 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--line-length", type=int, default=0, metavar="N",
                    help="Wrap inserted block comments to fit N columns (indent + prefix included). 0 (default) "
                         "leaves them unwrapped. Online: a value at emit is stored in the manifest; apply can override.")
+    p.add_argument("--config-dir", default="", metavar="DIR",
+                   help="Directory of prompt-template overrides that shadow the built-in scale-cfg per file. When "
+                        "omitted, a scale-cfg/ or .scale-cfg/ found at or above the working directory is used.")
     p.add_argument("--language", "-l", default=None, help="Source file language. SCALE currently supports: 'python', 'js', 'c'")
     p.add_argument("--project-doc", "-p", default="", metavar="PATH",
                    help="Project overview to distil into background context for every file (e.g. CLAUDE.md/README). "
@@ -1964,7 +2016,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parse_args(argv)
     set_verbosity(args.verbose)
     root = Path(__file__).resolve().parent
-    scale_path = root / "scale-cfg"
+    builtin_cfg = root / "scale-cfg"
+
+    # An explicit --config-dir, else an auto-discovered project scale-cfg, overlays the built-in prompts per file.
+    if args.config_dir:
+        override_cfg = Path(args.config_dir)
+        if not override_cfg.is_dir():
+            error(f"--config-dir '{args.config_dir}' is not a directory.")
+            return 1
+    else:
+        override_cfg = _discover_config_dir(Path.cwd(), builtin_cfg)
+    if override_cfg is not None:
+        echo(f"Overlaying prompt overrides from {override_cfg}")
+    scale_path = ConfigResolver([override_cfg, builtin_cfg] if override_cfg is not None else [builtin_cfg])
     model = Path(args.model) if args.model else root / DEFAULT_MODEL
     dst_path = Path(args.output) if args.output else None
 
