@@ -195,7 +195,7 @@ class Escalation:
         return run_manifest([(source, language, line_ending, self)], self.doc_style)
 
 
-def run_manifest(parts: List[Tuple[str, str, str, "Escalation"]], doc_style: str) -> dict:
+def run_manifest(parts: List[Tuple[str, str, str, "Escalation"]], doc_style: str, line_length: int = 0) -> dict:
     """
     Build the run-level manifest dict from each processed file's collected escalation requests.
 
@@ -204,9 +204,10 @@ def run_manifest(parts: List[Tuple[str, str, str, "Escalation"]], doc_style: str
     Parameters:
     - `parts`: One tuple per file of (source path, language, line-ending string, its `Escalation` collector).
     - `doc_style`: The house-style text embedded verbatim for the answering model.
+    - `line_length`: The column budget the apply phase wraps inserted comments to (0 leaves them unwrapped); recorded so a single emit-time setting carries through to apply.
 
     Returns:
-    - The manifest dict (version, tool, files, doc_style and the merged request list), ready to serialise.
+    - The manifest dict (version, tool, files, doc_style, line_length and the merged request list), ready to serialise.
     """
 
     # Accumulators for the merged manifest; seen_snippets remembers which request first carried each snippet text.
@@ -244,6 +245,7 @@ def run_manifest(parts: List[Tuple[str, str, str, "Escalation"]], doc_style: str
         "tool": "scale",
         "files": files,
         "doc_style": doc_style,
+        "line_length": line_length,
         "requests": requests,
     }
 

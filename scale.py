@@ -1483,6 +1483,7 @@ def _block_pass(
     doc_override: Optional[Callable[[str], Optional[str]]] = None,
     callee_annotations: Optional[Dict[str, Dict[int, str]]] = None,
     verifier=None,
+    width: int = 0,
 ) -> List[str]:
     """
     Run the within-function block pass over one file.
@@ -1502,6 +1503,7 @@ def _block_pass(
     - `doc_override`: C only - callable returning replacement doc text for a routine, or `None`.
     - `callee_annotations`: Optional per-routine call-site notes shown to the model.
     - `verifier`: Optional verification hook applied to generated comments.
+    - `width`: Column budget for wrapping inserted comments, or 0 to leave them unwrapped.
 
     Returns:
     - The updated source lines with block spacing and comments applied.
@@ -1529,6 +1531,7 @@ def _block_pass(
         value_threshold=comment_value,
         callee_annotations=callee_annotations,
         verifier=verifier,
+        width=width,
     )
 
 
@@ -1689,6 +1692,7 @@ def generate_comments(
     do_file_doc: bool = False,
     block_comment_style: str = "line",
     comment_value: Optional[int] = None,
+    line_length: int = 0,
     project_context: str = "",
     doc_order: Optional[List[str]] = None,
     callee_context: Optional[Callable[[str], str]] = None,
@@ -1721,6 +1725,7 @@ def generate_comments(
     - `do_file_doc`: Run the top-of-file description pass.
     - `block_comment_style`: Comment delimiter for C/JS block comments: `line` or `block`.
     - `comment_value`: Optional score threshold; lower-valued block comments are dropped.
+    - `line_length`: Column budget for wrapping inserted block comments, or 0 to leave them unwrapped.
     - `project_context`: Optional project background primed before each pass.
     - `doc_order`: Optional routine ordering for the definition pass (e.g. leaf-first).
     - `callee_context`: Optional callable supplying callee contract notes for a routine.
@@ -1766,7 +1771,8 @@ def generate_comments(
         annotations = block_callee_notes(current_blob, new_lines) if block_callee_notes is not None else None
         new_lines = _block_pass(llm, cfg, scale_path, messages, current_blob, new_lines, language,
                                 comment_style=block_comment_style, comment_value=comment_value,
-                                doc_override=doc_override, callee_annotations=annotations, verifier=verifier)
+                                doc_override=doc_override, callee_annotations=annotations, verifier=verifier,
+                                width=line_length)
 
     # The file-doc pass runs last by design: the description draws on everything the earlier passes wrote.
     if do_file_doc:
@@ -1824,6 +1830,9 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--overwrite-comments", action="store_true",
                    help="Online emit: offer existing multi-line block comments up for rewriting instead of "
                         "preserving them by default (a substantive comment is otherwise kept untouched).")
+    p.add_argument("--line-length", type=int, default=0, metavar="N",
+                   help="Wrap inserted block comments to fit N columns (indent + prefix included). 0 (default) "
+                        "leaves them unwrapped. Online: a value at emit is stored in the manifest; apply can override.")
     p.add_argument("--language", "-l", default=None, help="Source file language. SCALE currently supports: 'python', 'js', 'c'")
     p.add_argument("--project-doc", "-p", default="", metavar="PATH",
                    help="Project overview to distil into background context for every file (e.g. CLAUDE.md/README). "
@@ -2033,6 +2042,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         # Sibling fragment files are found via the master's naming scheme; lingering checkout markers alone also count as fragmented.
         manifest = scale_escalate.read_manifest(Path(args.apply_manifest))
+
+        # A --line-length on the apply command overrides whatever budget the emit recorded (apply is where wrapping happens).
+        if args.line_length:
+            manifest["line_length"] = args.line_length
+
         master_path = Path(args.apply_manifest)
         stem, dot, suffix = master_path.name.rpartition(".")
         if not dot:
@@ -2369,7 +2383,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 echo(f"Emit copy written to {dst_path}")
 
         # Every file's requests merge into a single run-level manifest.
-        manifest = scale_escalate.run_manifest(emit_parts, emit_doc_style)
+        manifest = scale_escalate.run_manifest(emit_parts, emit_doc_style, line_length=args.line_length)
         scale_escalate.write_manifest(Path(args.emit_manifest), manifest)
         echo(f"Wrote {len(manifest['requests'])} request(s) to {args.emit_manifest}")
 
@@ -2503,6 +2517,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             do_file_doc=args.file_doc,
             block_comment_style=args.block_comment_style,
             comment_value=block_threshold,
+            line_length=args.line_length,
             project_context=project_context,
             doc_order=doc_order,
             callee_context=callee_context,

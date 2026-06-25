@@ -33,6 +33,11 @@ from scale_log import echo
 from scale_text import fit_snippet, MARKER_PYTHON
 from typing import Dict, List, Optional, Tuple
 import re
+import textwrap
+
+# Below this many columns of room (after indent + comment prefix) line-length wrapping is abandoned for a comment:
+# a deep indent can leave too little width to wrap to without shredding the text one or two words per line.
+_MIN_WRAP_WIDTH = 24
 
 
 # Numbered-view formatting. A contiguous run of more than this many non-boundary lines (continuation lines, or the
@@ -358,23 +363,42 @@ def _is_comment_line(line: str, style: CommentStyle) -> bool:
     return False
 
 
-def render_comment_lines(text: str, indent: str, style: CommentStyle) -> List[str]:
+def render_comment_lines(text: str, indent: str, style: CommentStyle, width: int = 0) -> List[str]:
     """
     Render comment text as indented source lines in the given style.
 
     Single-line text (or any style without a block form) is rendered as line comments; multi-line text is wrapped in the block delimiters, using the line prefix for continuation lines when the style defines no continuation marker. Every line is right-stripped so blank comment lines carry no trailing whitespace.
 
+    When `width` is positive, each logical line is re-wrapped so the final rendered line (indent + comment prefix + text) fits within `width` columns - the writer cannot anticipate the indentation a comment lands at, so the patcher enforces the budget here. Identifiers and hyphenated tokens are never split, so a single over-long token may still exceed the budget rather than be broken mid-word. A degenerately small budget (deep indent leaving too little room) disables wrapping for that comment.
+
     Parameters:
     - `text`: The comment text, with embedded newlines for multiple lines.
     - `indent`: Indentation prepended to every emitted line.
     - `style`: Comment delimiters for the file's language.
+    - `width`: Column budget the rendered lines must fit, or 0 to leave the text unwrapped.
 
     Returns:
     - The rendered comment as a list of source lines.
     """
 
-    # Single-line text stays in compact line-comment form; only genuinely multi-line text earns the block delimiters.
     lines = text.split("\n")
+
+    # Re-wrap to the column budget before choosing a rendering form, accounting for the prefix that form will use.
+    if width and width > 0:
+        will_block = style.block_open is not None and len(lines) > 1
+        prefix = (style.block_cont if (will_block and style.block_cont is not None) else style.line_prefix)
+        avail = width - len(indent) - len(prefix)
+        if avail >= _MIN_WRAP_WIDTH:
+            wrapped: List[str] = []
+            for ln in lines:
+                if ln.strip():
+                    wrapped.extend(textwrap.wrap(ln, width=avail, break_long_words=False,
+                                                 break_on_hyphens=False) or [ln])
+                else:
+                    wrapped.append(ln)
+            lines = wrapped
+
+    # Single-line text stays in compact line-comment form; only genuinely multi-line text earns the block delimiters.
     if style.block_open is None or len(lines) == 1:
         return [(f"{indent}{style.line_prefix}{ln}").rstrip() for ln in lines]
     out = [f"{indent}{style.block_open}"]
@@ -1009,6 +1033,7 @@ def _apply_edits(
     source_lines: Chunk,
     edits: List[Tuple[int, Optional[str], str]],
     style: CommentStyle,
+    width: int = 0,
 ) -> Chunk:
     """
     Splice block comments and paragraph spacing into a copy of the source lines.
@@ -1019,6 +1044,7 @@ def _apply_edits(
     - `source_lines`: The pristine source lines; never mutated.
     - `edits`: `(boundary, comment, indent)` triples, where `boundary` is the 1-based line number of the statement starting a blob.
     - `style`: The comment style used to render and recognise comment lines.
+    - `width`: Column budget for wrapping inserted comments, or 0 to leave them unwrapped.
 
     Returns:
     - A new line list with all edits applied.
@@ -1036,7 +1062,7 @@ def _apply_edits(
 
         # A fresh comment replaces any run already attached to the statement; with none supplied, an existing run is kept verbatim.
         if comment:
-            body = render_comment_lines(comment, indent, style)
+            body = render_comment_lines(comment, indent, style, width)
             start = cs
         elif has_existing:
             body = out[cs:stmt_idx]
@@ -1059,6 +1085,7 @@ def apply_blocks(
     target: BlockTarget,
     blocks: List[Tuple[int, Optional[str]]],
     style: CommentStyle,
+    width: int = 0,
 ) -> Chunk:
     """
     Apply a routine's ready-made block comments to the source, guarded against code changes.
@@ -1070,6 +1097,7 @@ def apply_blocks(
     - `target`: The block target the comments belong to; supplies per-boundary indentation and the name used in diagnostics.
     - `blocks`: `(boundary, comment)` pairs; a `None` comment inserts paragraph spacing only.
     - `style`: The comment style used to render comment lines.
+    - `width`: Column budget for wrapping inserted comments, or 0 to leave them unwrapped.
 
     Returns:
     - The patched line list, or an untouched copy of the original if the edit would alter code.
@@ -1077,7 +1105,7 @@ def apply_blocks(
 
     # Pair each boundary with its recorded indentation and trial-apply the ready-made comments.
     edits = [(b, comment, target.indent_of.get(b, "")) for b, comment in blocks]
-    candidate = _apply_edits(source_lines, edits, style)
+    candidate = _apply_edits(source_lines, edits, style, width)
 
     # Preservation guard: any patch that changes the comment-stripped code is rejected outright.
     if not code_preserved(source_lines, candidate, style):
@@ -1177,6 +1205,7 @@ def annotate_blocks(
     value_threshold: Optional[int] = None,
     callee_annotations: Optional[Dict[str, Dict[int, str]]] = None,
     verifier=None,
+    width: int = 0,
 ) -> Chunk:
     """
     Run the block pass: generate, verify, and splice paragraph comments into every target.
@@ -1199,6 +1228,7 @@ def annotate_blocks(
     - `value_threshold`: Minimum 1-3 score a comment must reach to be kept; above 3 switches commenting off.
     - `callee_annotations`: Optional per-routine map of line numbers to call-site notes fed into the comment turns.
     - `verifier`: Optional verifier supplying the story-challenge turns.
+    - `width`: Column budget for wrapping inserted comments, or 0 to leave them unwrapped.
 
     Returns:
     - A new line list with all surviving comments and paragraph spacing applied.
@@ -1292,7 +1322,7 @@ def annotate_blocks(
             echo(f"[verify] '{target.qualname}': story challenge failed twice; dropping its comments")
             edits = [(b, None, indent) for b, _comment, indent in edits]
 
-        trial = _apply_edits(source_lines, edits, style)
+        trial = _apply_edits(source_lines, edits, style, width)
 
         # Per-routine guard: a bad patch costs only this routine's comments, never the whole file's.
         if code_preserved(source_lines, trial, style):
@@ -1301,4 +1331,4 @@ def annotate_blocks(
             echo(f"[blocks] Skipped '{target.qualname}': edit would alter code; keeping original")
 
     # All surviving edits are spliced into the pristine source in one final pass.
-    return _apply_edits(source_lines, all_edits, style)
+    return _apply_edits(source_lines, all_edits, style, width)

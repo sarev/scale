@@ -1918,6 +1918,7 @@ def apply_manifest_js(source_lines: Chunk, manifest: dict) -> Chunk:
 
     # Split the manifest into def and block requests; the two phases patch the same running line list in turn.
     from scale_blocks import SLASH_LINE_STYLE, _apply_edits, code_preserved, _parse_comment_reply
+    width = int(manifest.get("line_length") or 0)   # comment wrap budget set at emit (0 = unwrapped)
     requests = manifest.get("requests", [])
     def_reqs = [r for r in requests if r.get("def") is not None]
     block_reqs = [r for r in requests if r.get("blocks") is not None]
@@ -1990,7 +1991,7 @@ def apply_manifest_js(source_lines: Chunk, manifest: dict) -> Chunk:
                 edits.append((boundary, comment, target.indent_of.get(boundary, "")))
 
             # Trial-apply this routine's edits in isolation so the guard can vet them.
-            trial = _apply_edits(out_lines, edits, SLASH_LINE_STYLE)
+            trial = _apply_edits(out_lines, edits, SLASH_LINE_STYLE, width)
 
             # Keep the edits only if the guard proves the code byte-identical; otherwise the whole routine's edits are dropped.
             if code_preserved(out_lines, trial, SLASH_LINE_STYLE):
@@ -1999,6 +2000,6 @@ def apply_manifest_js(source_lines: Chunk, manifest: dict) -> Chunk:
                 echo(f"[apply] Skipped '{req['qualname']}': block edit would alter code; keeping original")
 
         # Apply every vetted edit in one batch so boundary line numbers stay valid.
-        out_lines = _apply_edits(out_lines, all_edits, SLASH_LINE_STYLE)
+        out_lines = _apply_edits(out_lines, all_edits, SLASH_LINE_STYLE, width)
 
     return out_lines

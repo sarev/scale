@@ -1823,6 +1823,7 @@ def apply_manifest(source_lines: Chunk, manifest: dict) -> Chunk:
 
     # The local import avoids a circular dependency with scale_blocks; requests are split so docstrings land before block comments.
     from scale_blocks import PYTHON_STYLE, _apply_edits, code_preserved, _parse_comment_reply
+    width = int(manifest.get("line_length") or 0)   # comment wrap budget set at emit (0 = unwrapped)
     requests = manifest.get("requests", [])
     def_reqs = [r for r in requests if r.get("def") is not None]
     block_reqs = [r for r in requests if r.get("blocks") is not None]
@@ -1889,7 +1890,7 @@ def apply_manifest(source_lines: Chunk, manifest: dict) -> Chunk:
                 edits.append((boundary, comment, target.indent_of.get(boundary, "")))
 
             # Trial-apply this routine's edits in isolation so one bad routine cannot taint the others.
-            trial = _apply_edits(out_lines, edits, PYTHON_STYLE)
+            trial = _apply_edits(out_lines, edits, PYTHON_STYLE, width)
 
             # The preservation guard is the real safety net: any code drift rejects the whole routine's edits.
             if code_preserved(out_lines, trial, PYTHON_STYLE):
@@ -1898,6 +1899,6 @@ def apply_manifest(source_lines: Chunk, manifest: dict) -> Chunk:
                 echo(f"[apply] Skipped '{req['qualname']}': block edit would alter code; keeping original")
 
         # Apply all surviving edits in a single pass so boundary line numbers stay valid.
-        out_lines = _apply_edits(out_lines, all_edits, PYTHON_STYLE)
+        out_lines = _apply_edits(out_lines, all_edits, PYTHON_STYLE, width)
 
     return out_lines
