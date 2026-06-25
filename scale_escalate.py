@@ -164,14 +164,15 @@ class Escalation:
         - `snippet`: The routine's verbatim source; optional if already captured.
         """
 
-        # Chunks are reduced to boundary index, line range and a null answer slot; any provider extras are dropped.
+        # Chunks are reduced to boundary index, line range, the anchor line text and a null answer slot; any other provider extras are dropped.
         req = self._routine(qualname, kind, sig_hash, snippet)
         if snippet:
             req["snippet"] = snippet
         req["blocks"] = {
             "doc_summary": doc_summary,
             "length_note": length_note,
-            "chunks": [{"bidx": c["bidx"], "lines": list(c.get("lines") or []), "answer": None} for c in chunks],
+            "chunks": [{"bidx": c["bidx"], "lines": list(c.get("lines") or []),
+                        "anchor": c.get("anchor", ""), "answer": None} for c in chunks],
         }
 
     def to_manifest(self, source: str, language: str, line_ending: str) -> dict:

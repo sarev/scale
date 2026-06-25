@@ -1100,7 +1100,7 @@ def defer_block_targets(
     """
     Record every usable block target in the run manifest instead of annotating it locally.
 
-    Each target's full span (header through body) is captured once as a self-contained snippet, with chunk line ranges rebased to 1-based positions within it. Targets missing boundaries, segments, or a signature hash are skipped, as they cannot be re-bound at apply time.
+    Each target's full span (header through body) is captured once as a self-contained snippet, with chunk line ranges rebased to 1-based positions within it. Each chunk also carries an `anchor` - the verbatim text of its boundary line - so the writer can locate the chunk by matching that line rather than counting through a body thick with comments and blanks (the off-by-N failure mode). Targets missing boundaries, segments, or a signature hash are skipped, as they cannot be re-bound at apply time.
 
     Parameters:
     - `escalation`: The run-manifest collector that receives each block record.
@@ -1130,7 +1130,8 @@ def defer_block_targets(
         span = "\n".join(source_lines[target.header_start - 1:target.body_end])
         chunks = [
             {"bidx": target.boundary_lines.index(s),
-             "lines": [s - target.header_start + 1, e - target.header_start + 1]}
+             "lines": [s - target.header_start + 1, e - target.header_start + 1],
+             "anchor": source_lines[s - 1].strip()}
             for s, e in target.segments
         ]
         escalation.record_block(
