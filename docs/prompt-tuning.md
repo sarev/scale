@@ -4,6 +4,12 @@ Prompt behaviour lives in `scale-cfg/`. Tuning these examples/wording to match t
 lever for output quality — prefer this over changing code. Each file overrides a built-in default constant, so a
 missing file is never an error.
 
+**Per-project overrides.** To tune behaviour for one codebase without editing the shared install, point
+`--config-dir DIR` at a directory of override files (or drop a `scale-cfg/`/`.scale-cfg/` at or above the working
+directory — it is discovered automatically). It overlays the built-in `scale-cfg/` *per file*: an override directory
+need only carry the templates it changes, inheriting the rest. The names below are identical; only the directory
+differs.
+
 - **Definition pass**: `comment.txt` is the system prompt and `guidelines.md` the house-style rules (definition pass
   only); `comment.python.txt` / `comment.js.txt` / `comment.c.txt` are per-language definition-pass templates (with
   examples).

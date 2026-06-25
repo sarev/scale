@@ -49,27 +49,43 @@ the file descriptions are Step 4's manifest round, after your docstrings are in.
 
 If the manifest has **zero** requests, skip to Step 4.
 
-## Step 2 — Fill the function manifest (fragments, PARALLEL fresh contexts, counter loop)
+## Step 2 — Fill the function manifest (round-based: a wave at a time, banked between rounds)
 
 You are the driver. **Never read the target source files yourself** — every fragment is self-contained, and SCALE
-does the slot bookkeeping (no agent ever touches the master or another agent's file). Loop:
+does the slot bookkeeping (no agent ever touches the master or another agent's file).
 
-1. Check out the work as fragments — call repeatedly until it exits nonzero ("no fragment available" /
-   "manifest complete"), collecting each printed fragment path:
+**Work in rounds — do not check out the whole manifest up front.** For a large run (hundreds of routines) that would
+mean dozens of simultaneous agents: wasteful and hard to oversee. Instead each round checks out a *wave*, fills it,
+then applies to bank the finished work and learn what is left. The source is only ever patched once the master is
+fully filled, so applying between rounds is safe and purely additive. Repeat the loop until the apply patches the
+source:
+
+1. **Check out one wave** — call `--next-fragment` up to **~15–20 times**, collecting each printed fragment path;
+   stop at the wave cap even if more remain (the next round gets them). Stop early if it exits nonzero ("no fragment
+   available" / "manifest complete").
    `env/Scripts/python.exe scale.py --next-fragment "<MANIFEST>" --fragment-size 8`
-   Each call writes a small valid mini-manifest next to the master (e.g. `scale-manifest.frag-001.json`) holding
-   the next ~8 unfilled requests, and marks them checked out in the master, so every fragment is disjoint.
-2. Spawn one **fresh subagent** (Agent tool, `general-purpose`) per fragment, **all in parallel** (one message,
-   multiple Agent calls) — fragments share nothing, and each clean context keeps quality flat as the run grows.
-   Tell each subagent:
+   Each call writes a small valid mini-manifest next to the master (e.g. `scale-manifest.frag-001.json`), marks those
+   requests checked out in the master so fragments never overlap. **`--fragment-size` counts ROUTINES, not
+   comments** — a routine averages ~2.4 block chunks plus maybe a def slot, so size 8 is roughly 20–25 answers; size
+   a wave by answers with that ratio in mind.
+2. **Spawn one fresh subagent per fragment, all in parallel** (Agent tool, `general-purpose`; one message, multiple
+   Agent calls) — fragments share nothing, and each clean context keeps quality flat as the run grows. Tell each
+   subagent:
    - its fragment path; it should Read the file directly (fragments are small) and fill EVERY `answer` field in it;
    - to follow the fragment's top-level `doc_style` for every def answer;
-   - the request shape and fill order (below);
+   - the request shape, fill order, and recommended fill method (below);
    - to self-check before finishing: `--check-manifest <FRAGMENT>` must exit 0.
-3. When all agents have returned, run the apply (Step 3). It merges every sibling fragment into the master
-   (first write wins), deletes the spent fragment files, and — if any slot is still unfilled — errors, lists the
-   slots, and returns them to the pile: go back to 1 and hand them out again. Never mark the step done on trust —
-   only on the apply/checker exit code.
+3. **Apply to bank the round** (Step 3). It merges this wave's fragments into the master (first write wins), deletes
+   the spent fragment files, and — while any slot is still unfilled — errors, lists what is missing, and returns the
+   released requests to the pile. That is the signal to run the next round: back to 1. When the master is finally
+   complete the same command patches the source and the loop ends. Never mark the step done on trust — only on the
+   apply/checker exit code.
+
+**Recommended fill method (for each subagent).** Hand-editing the `null`s is fragile — `"answer": null` is not
+unique, so a blind find/replace is unsafe. Instead assign answers programmatically: load the fragment JSON, walk
+`requests[]` in order and within each its block `chunks[]` in array order (then its `def` slot), set each `answer`,
+assert no `answer` remains null, and dump the file back. The `--check-manifest` gate then confirms completeness. (A
+chunk already carrying `"answer": "NONE"` with `"preserve": true` is pre-filled — skip it, do not overwrite.)
 
 **Request shape (manifest version 2).** Each request is one routine: `qualname`, `kind`, `sig_hash`, `file`, and
 `snippet` — the routine's verbatim source (if `snippet` is null, follow `snippet_ref` to the request in the same
@@ -151,3 +167,16 @@ results were written. Note that all code was preserved byte-for-byte (SCALE's gu
 - A dry run = stop after Step 1 and show the manifest.
 - The emit/check/fragment/apply phases never load a model, so they are all fast; only the offline fallback needs
   the GGUF.
+- **House style:** to pin a project's own comment templates without touching SCALE's global defaults, point
+  `--config-dir <DIR>` at a folder of override prompts (or drop a `scale-cfg/`/`.scale-cfg/` beside the targets — it
+  is discovered automatically). It overlays the built-ins per file, so it need only carry the templates it changes.
+- **Line length:** pass `--line-length N` to wrap inserted block comments to N columns; online, set it on the emit
+  (it is stored in the manifest) and/or the apply. Left off, comments are inserted unwrapped.
+
+## Driver notes (operator pitfalls, not tool bugs)
+
+- **Do not pre-plan the whole fan-out.** Work in rounds (Step 2): check out a wave, fill, apply, and let the apply
+  tell you what is left rather than cutting every fragment up front.
+- **Force UTF-8 when verifying.** Reading `git show HEAD:<file>` (or any source) without an explicit UTF-8 decode
+  renders em dashes, ellipses and bullets as the platform default and fakes a "corruption" diff — SCALE preserves
+  non-ASCII correctly. Always compare with an explicit UTF-8 decode.

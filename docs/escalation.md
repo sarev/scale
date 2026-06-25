@@ -20,8 +20,12 @@ so it can only ever change comments/docstrings. **Python, C, and JS** targets ar
   the block collector record into the *same* request keyed `(qualname, sig_hash)` — while the target itself is left
   **byte-for-byte untouched**. The request carries the routine's identity, ONE `snippet` (its verbatim source span),
   an optional `def` answer slot, and an optional `blocks` recipe (segmentation is structural and runs at emit; each
-  chunk holds its boundary index `bidx` plus `lines`, its 1-based line range INTO the snippet — chunk text is never
-  duplicated). The collectors are `scale_python.collect_def_requests`, `scale_c.collect_def_requests_c` (doc-site
+  chunk holds its boundary index `bidx`, `lines` (its 1-based line range INTO the snippet), and `anchor` (the
+  verbatim text of its boundary line, so the writer locates the chunk by matching rather than counting) — chunk text
+  is otherwise never duplicated). A chunk whose boundary already carries a comment also surfaces that comment as
+  `existing`; a *multi-line* one is protected by default — pre-answered `NONE` (which keeps it verbatim at apply) and
+  flagged `preserve`, so a run over already-commented code never degrades hand-written rationale (`--overwrite-comments`
+  lifts this). The collectors are `scale_python.collect_def_requests`, `scale_c.collect_def_requests_c` (doc-site
   aware: a redirected definition is skipped and its header prototype requested instead, with the impl body as the
   prose source), `scale_javascript.collect_def_requests_js`, and the language-agnostic
   `scale_blocks.defer_block_targets`. `run_manifest` merges the per-target collectors, stamps each request with its
@@ -36,7 +40,8 @@ so it can only ever change comments/docstrings. **Python, C, and JS** targets ar
   `scale_javascript.apply_manifest_js`).
 
 The manifest carries a top-level **`doc_style`** (guidelines + the def-pass templates of the run's target languages)
-so the stronger model writes deferred docs to house style.
+so the stronger model writes deferred docs to house style, and a **`line_length`** (the column budget, from a
+`--line-length` at emit) that the apply phase wraps inserted block comments to.
 
 ## Completeness is a counter, not trust
 

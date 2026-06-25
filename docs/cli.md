@@ -17,6 +17,16 @@ python scale.py -c file.py -o out.py -v --n-ctx 12288 --n-batch 256
 # --block-comment-style {line,block} picks // (default) or /* */ for C/JS block-pass comments (ignored for Python).
 python scale.py -c --block-comments medium file.py -o out.py -v
 
+# --line-length N wraps each inserted block comment to fit N columns (indent + comment prefix included), continuing
+# on fresh comment lines; identifiers are never split. Default 0 = unwrapped. Online: a value passed to the emit is
+# stored in the manifest and honoured at apply; a --line-length on the apply command overrides it.
+python scale.py -c --block-comments medium --line-length 99 file.py -o out.py -v
+
+# --overwrite-comments (online emit only): by default a substantive (multi-line) hand-written block comment is
+# preserved - its chunk is pre-answered NONE so the stronger model leaves it untouched. Pass this to offer those
+# comments up for rewriting instead. Existing single-line comments are always surfaced for the model to judge.
+python scale.py --block-comments medium -l python --online --emit-manifest m.json --overwrite-comments "src/*.py"
+
 # --file-doc adds/updates the top-of-file header description (Python module docstring, or C/JS header comment),
 # preserving shebang/copyright/license byte-for-byte; combinable with -c and the block flags, and runs LAST.
 python scale.py --file-doc -l c -m /path/model.gguf file.c -o out.c -v
@@ -65,6 +75,11 @@ python scale.py -l python --apply-filedoc fd.json "src/*.py"
 # --check-manifest counts all three manifest kinds (scale / scale-filedoc / scale-reword).
 python scale.py --file-doc -l c -m /path/model.gguf --emit-reword r.json "src/*.c"
 python scale.py -l c --apply-reword r.json "src/*.c"
+
+# --config-dir DIR overlays a project's own prompt-template overrides on top of the built-in scale-cfg, per file (so
+# a repo pins its house style without editing the shared install; an override dir need only carry the templates it
+# changes). When omitted, a scale-cfg/ or .scale-cfg/ found at or above the working directory is used automatically.
+python scale.py -c --block-comments medium --config-dir ./my-scale-cfg file.py -o out.py -v
 
 # Without -o, output is printed to stdout. --help lists all flags.
 ```
