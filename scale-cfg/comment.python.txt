@@ -1,65 +1,48 @@
-This is a Python example of the comment format for a function called `pt_primitive_dyadic_int_op()`:
+This is the Python doc-comment format: a PEP 257 docstring. For Python it supersedes the generic
+"Function doc-comments" shape above. Match it exactly.
 
-    """
-    Call one of the primitive integer dyadic operations on two polytuples and return the integer result.
+Example, a function `cohort_verdict()`:
 
-    This call wraps the `AND`, `OR`, `EOR`, `<<`, `>>`, `>>>`, `DIV` and `MOD` dyadic operators during primitive
-    expression evaluation. The following conditions are observed:
+    """Judge a failed job's cohort, returning the verdict and the axes it was read across.
 
-    - If either operand is `str`, then error.
-    - Coerce both operands to `int`.
-    - Perform integer operation and return `int`.
+    The judgement is worst-first: an intermittent split (identical setup, opposite outcome) is reported
+    before a clean suspect split, so the most actionable signal wins. It is pure: it computes over the rows
+    it is given and adds no opinion the data does not support.
 
     Parameters:
-    - `wsp`: The workspace for this instance.
-    - `ioexpr`: The first (and result) polytuple operand.
-    - `other`: The second polytuple operand.
-    - `op`: Type of dyadic operation to perform.
+    - rows: The comparable jobs, newest first.
+    - sku: The product the cohort is defined for.
 
     Returns:
-    - `NO_ERROR` if the operation was successful, or an error number.
+    - A `(verdict, axes)` pair; `verdict` is one of `intermittent`, `suspect` or `inconclusive`.
+
+    Raises:
+    - ValueError: When `rows` is empty.
     """
 
-This is another Python example for Flask route function called `editor_move_button()` illustrating the preferred format:
+A trivial helper needs only the summary line:
 
-    """
-    Move a button in the editor view.
-
-    This call updates the position of a button in the editor view. The request body must contain the lock token,
-    remote UID, and new anchor coordinates.
-
-    Parameters:
-    - `button_uid`: The UID string for the button to be moved.
-
-    Request Body:
-    - `lock_token`: The gallery lock token string.
-    - `remote_uid`: The UID string for the remote associated with the button.
-    - `anchor`: The new position of the button as a dictionary with `x` and `y` integer coordinates.
-
-    Returns:
-    - A JSON string containing the result of the operation, or an error envelope if the operation failed.
-
-    Notes:
-    This can raise if there is any issue with updating the button position.
-    """
-
-Finally, this is an example of a more trivial Python function called `toggle_debug()` comment:
-
-    """
-    Enable or disable program debugging.
-
-    Parameters:
-    - state: Set debugging state to enabled (`True`) or disabled (`False`).
-    """
+    """Return the held credential, or an empty string when none is set."""
 
 **Rules:**
 
-1. Always generate exactly one comment per turn.
-2. Never output anything more than the comment - no code, no further commentary.
-3. All input parameters and any returned value(s) must be documented.
-4. Reformat existing comments if they do not adhere to the format outlined above.
-5. The comment must be expressed as a Python docstring.
-6. The comment text should use Markdown formatting.
-7. If there are no input parameters, the "Parameters:" section may be omitted.
-8. If there are no returned values, the "Returns:" section may be omitted.
-9. You will use British English spellings where possible.
+1. Output exactly one docstring per turn, and nothing else: no code, no fences, no commentary. When asked for
+   the body only, omit the `"""` delimiters.
+2. The first line is a one-line imperative summary ending with a full stop. Then a blank line, then any
+   elaboration (the reasoning, contracts, ordering constraints, edge cases), then the sections.
+3. Document the parameters, the return value and the raised exceptions as bulleted lists under `Parameters:`,
+   `Returns:` and `Raises:` headings, in that order. Omit any heading that would say nothing: no `Parameters:`
+   for a method taking only `self`, no `Returns:` for a function returning `None`, no `Raises:` when nothing
+   is raised.
+4. Never restate the type. The signature already carries it; the prose carries the meaning, units and edge
+   cases. Write `- count: How many checks to run.`, never `- count (int): ...`.
+5. The prose must give insight, not paraphrase the signature. A docstring that only restates the signature in
+   words is not worth writing; cut it to the summary line.
+6. Plain prose with single backticks for inline code and identifiers (`None`, `path`, `/api/state`). No other
+   Markdown: no bold, no headings, and no ad-hoc sections beyond the three named above.
+7. Self-contained: cite nothing outside the source. No decision or issue identifiers, no document, plan or
+   spec names, no commit hashes, and no change history ("was formerly", "now does", dates). State the reason
+   itself. A reference to other source (a sibling method, a class) is fine.
+8. British English spellings (`colour`, `behaviour`, `serialise`).
+9. Wrap at about 120 columns.
+10. Reformat an existing docstring that does not already follow this format.
