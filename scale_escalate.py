@@ -148,11 +148,12 @@ class Escalation:
         length_note: str,
         chunks: List[dict],
         snippet: str = "",
+        stmt_lines: Optional[List[int]] = None,
     ) -> None:
         """
         Register the block-comment requests for a routine.
 
-        Attaches a `blocks` section to the routine's request record, reducing each provider chunk to its boundary index, line range and a null answer slot for the stronger model to fill. A non-empty snippet replaces any text already stored.
+        Attaches a `blocks` section to the routine's request record, reducing each provider chunk to its boundary index, line range and a null answer slot for the stronger model to fill. A non-empty snippet replaces any text already stored. When `stmt_lines` is supplied, an empty `insertions` slot is opened: the stronger model may map any of those snippet-local statement-start lines to a finer break or comment (see `apply`).
 
         Parameters:
         - `qualname`: The routine's qualified name.
@@ -162,6 +163,7 @@ class Escalation:
         - `length_note`: Scoring guidance matched to the routine's length.
         - `chunks`: The provider's chunk records carrying `bidx` and line ranges.
         - `snippet`: The routine's verbatim source; optional if already captured.
+        - `stmt_lines`: Snippet-local line numbers of every statement start, offered as insertion points; omit (or empty) to leave the insertions slot off entirely.
         """
 
         # Chunks are reduced to boundary index, line range, the anchor line text and an answer slot; any other provider extras are dropped. A chunk may arrive pre-answered NONE to protect an existing comment, and may surface that comment's text.
@@ -177,7 +179,13 @@ class Escalation:
                 rc["preserve"] = True
             rc["answer"] = c.get("answer")
             reduced.append(rc)
-        req["blocks"] = {"doc_summary": doc_summary, "length_note": length_note, "chunks": reduced}
+        blocks = {"doc_summary": doc_summary, "length_note": length_note, "chunks": reduced}
+
+        # Open the optional insertions slot only when the provider supplied statement starts (Python today).
+        if stmt_lines:
+            blocks["stmt_lines"] = list(stmt_lines)
+            blocks["insertions"] = {}
+        req["blocks"] = blocks
 
     def to_manifest(self, source: str, language: str, line_ending: str) -> dict:
         """

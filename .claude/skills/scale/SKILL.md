@@ -94,7 +94,7 @@ duplicate the text back). It has either or both of:
 - `"def": {"answer": null}` — write the **doc body only** (no `"""`/`/* */` delimiters, no fences) describing
   purpose, parameters, return value, per `doc_style`. For `kind: "declaration"` (a C header prototype) write the
   **caller-facing contract** — the snippet is the implementation body, but the doc sits above the prototype.
-- `"blocks": {"doc_summary", "length_note", "chunks": [{"bidx", "lines", "anchor", "answer"}]}` — each chunk is one
+- `"blocks": {"doc_summary", "length_note", "chunks": [...], "stmt_lines"?, "insertions"?}` — each chunk is one
   paragraph inside the routine. `anchor` is the **verbatim text of the line the comment attaches to**: find that
   line in the snippet to see exactly which block the chunk covers — do not count lines (bodies thick with comments
   and blanks make counting drift). `lines` is the 1-based inclusive range into the snippet and disambiguates if an
@@ -105,6 +105,15 @@ duplicate the text back). It has either or both of:
     adequate, answer `"NONE"` to keep it untouched; only write when the block has no comment or a poor one. A chunk
     that arrives already `"answer": "NONE"` with `"preserve": true` is a multi-line comment SCALE has protected for
     you — leave it exactly as is.
+  - **Subdivide where the segmenter was too coarse (`insertions`, optional).** The deterministic segmenter is
+    conservative: a flat run of statements can collapse into one paragraph, leaving a genuinely comment-worthy line
+    (a cryptic regex, a subtle one-liner) buried with no slot of its own. When a `blocks` request carries
+    `stmt_lines` (the snippet-local line numbers of every statement start) and an empty `insertions`, you MAY add
+    finer breaks/comments: set `insertions["<line>"]` to `""` for a blank-line break before that statement, or to a
+    one-line comment to explain it. Pick `<line>` from `stmt_lines` (index the snippet programmatically — never count
+    by eye), targeting the start of a sub-step or a non-obvious line. This is for genuine improvement only; leave
+    `insertions` empty (`{}`) when the baseline paragraphs already read well. It is purely additive and optional —
+    the completeness counter ignores it.
 
 **Fill order.** For a request with both slots, fill the **block chunks first, in body order** (one line or `"NONE"`
 each — by the last chunk you have read the whole routine), **then** write the `def` answer from that understanding.

@@ -213,7 +213,7 @@ class BlockTarget:
     """
     One routine body targeted by the block pass.
 
-    All line numbers are 1-based positions in the file. `boundary_lines` holds the only lines where a comment may be inserted, `indent_of` gives the indentation to use at each of them, and `segments`, when present, carries pre-computed paragraph ranges that bypass the structural segmenter.
+    All line numbers are 1-based positions in the file. `boundary_lines` holds the only lines where the deterministic pass may insert a comment, `indent_of` gives the indentation to use at each of them, and `segments`, when present, carries pre-computed paragraph ranges that bypass the structural segmenter. `stmt_lines` maps every statement-start line in the body (a superset of `boundary_lines` - it also includes first-in-suite statements) to its indentation; the online mode offers these as the lines a strong model may insert a finer break or comment before.
     """
 
     # Line numbers are 1-based file positions; boundary_lines lists the only legal comment insertion points.
@@ -229,6 +229,7 @@ class BlockTarget:
     doc: str = ""
     sig: str = ""
     segments: Optional[List[Tuple[int, int]]] = None
+    stmt_lines: Dict[int, str] = field(default_factory=dict)
 
 
 # ---------------------------- structural segmentation (deterministic paragraph rules) ----------------------------
@@ -1080,6 +1081,55 @@ def _apply_edits(
     return out
 
 
+def resolve_insertions(
+    blocks_req: dict,
+    target: BlockTarget,
+    style: CommentStyle,
+    skip_lines: Optional[set] = None,
+) -> List[Tuple[int, Optional[str], str]]:
+    """
+    Turn a strong model's `insertions` into ready-to-apply block edits, re-bound across the emit-to-apply shift.
+
+    Each insertion keys a snippet-local statement-start line (as offered in the request's `stmt_lines`) to its text: an empty string means a paragraph break only, anything else a comment. The line is re-bound by its *position* in the statement list, never by raw line number - the i-th statement at emit is the i-th statement at apply (code is preserved and a freshly inserted docstring is skipped by the enumerator), so the binding survives the line shifts exactly as a chunk's `bidx` does. An insertion whose line is not a known statement start, whose index has no counterpart, or that collides with `skip_lines` (e.g. a baseline chunk boundary) is dropped.
+
+    Parameters:
+    - `blocks_req`: The request's `blocks` section, carrying `stmt_lines` (emit-time, snippet-local) and `insertions`.
+    - `target`: The freshly re-parsed block target, whose `stmt_lines` give the current file lines and indents.
+    - `style`: The comment style used to parse the model's text.
+    - `skip_lines`: Lines already claimed by other edits, to avoid a double insertion at one statement.
+
+    Returns:
+    - A list of `(line, comment, indent)` edits, where a `None` comment inserts a break only.
+    """
+
+    emit_stmt = blocks_req.get("stmt_lines") or []
+    insertions = blocks_req.get("insertions") or {}
+    reparsed = sorted(target.stmt_lines)
+    skip = set(skip_lines or ())
+    used: set = set()
+    edits: List[Tuple[int, Optional[str], str]] = []
+
+    # Each insertion is re-bound by statement index, so the line shifts between emit and apply never misplace it.
+    for key, text in insertions.items():
+        try:
+            local_line = int(key)
+        except (TypeError, ValueError):
+            continue
+        if local_line not in emit_stmt:
+            continue
+        idx = emit_stmt.index(local_line)
+        if not (0 <= idx < len(reparsed)):
+            continue
+        line = reparsed[idx]
+        if line in skip or line in used:
+            continue
+        used.add(line)
+        comment = None if not str(text).strip() else _parse_comment_reply(str(text), style)
+        edits.append((line, comment, target.stmt_lines.get(line, "")))
+
+    return edits
+
+
 def apply_blocks(
     source_lines: Chunk,
     target: BlockTarget,
@@ -1126,6 +1176,7 @@ def defer_block_targets(
     note_long: Optional[str] = None,
     style: Optional[CommentStyle] = None,
     preserve_existing: bool = True,
+    offer_insertions: bool = True,
 ) -> int:
     """
     Record every usable block target in the run manifest instead of annotating it locally.
@@ -1142,6 +1193,7 @@ def defer_block_targets(
     - `note_long`: Optional override for the long-routine length note.
     - `style`: The comment style used to recognise existing comments; when `None`, existing comments are neither surfaced nor protected.
     - `preserve_existing`: When true (the default), pre-fill `NONE` for chunks whose boundary already carries a multi-line comment, protecting prior work.
+    - `offer_insertions`: When true (the default), open an `insertions` slot offering the routine's statement-start lines for finer model-chosen breaks/comments; `False` keeps strictly to the deterministic boundaries.
 
     Returns:
     - The number of targets actually deferred.
@@ -1180,9 +1232,15 @@ def defer_block_targets(
                         chunk["preserve"] = True
             chunks.append(chunk)
 
+        # The statement-start lines, rebased into the snippet, are the points a strong model may insert a finer
+        # break or comment before (empty for languages without a statement enumerator, or when opted out).
+        stmt_lines = sorted(ln - target.header_start + 1 for ln in target.stmt_lines
+                            if target.header_start <= ln <= target.body_end) if offer_insertions else []
+
         escalation.record_block(
             qualname=target.qualname, kind=target.kind, sig_hash=target.sig,
             doc_summary=_doc_summary(target.doc), length_note=length_note, chunks=chunks, snippet=span,
+            stmt_lines=stmt_lines,
         )
         count += 1
 

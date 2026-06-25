@@ -1678,6 +1678,10 @@ def iter_block_targets(source_blob: str, source_lines: Chunk) -> List[BlockTarge
                 indent_of[anchor] = text[: len(text) - len(text.lstrip())]
                 boundary_lines.append(anchor)
 
+        # Every statement start (suite leaders included) is an insertion point a strong model may break/comment before.
+        stmt_lines = {start: source_lines[start - 1][: indent] if 1 <= start <= len(source_lines) else ""
+                      for start, indent, *_ in _seg_records(info.node, source_lines)}
+
         # Bundle everything the block pass needs - ranges, insertion points, doc, signature and precomputed segments - into one self-contained target.
         boundary_lines = sorted(boundary_lines)
         targets.append(
@@ -1694,6 +1698,7 @@ def iter_block_targets(source_blob: str, source_lines: Chunk) -> List[BlockTarge
                 doc=ast.get_docstring(info.node) or "",
                 sig=node_sig(info.node),
                 segments=structural_segments(info.node, source_lines, boundary_lines, info.end),
+                stmt_lines=stmt_lines,
             )
         )
 
@@ -1822,7 +1827,7 @@ def apply_manifest(source_lines: Chunk, manifest: dict) -> Chunk:
     """
 
     # The local import avoids a circular dependency with scale_blocks; requests are split so docstrings land before block comments.
-    from scale_blocks import PYTHON_STYLE, _apply_edits, code_preserved, _parse_comment_reply
+    from scale_blocks import PYTHON_STYLE, _apply_edits, code_preserved, _parse_comment_reply, resolve_insertions
     width = int(manifest.get("line_length") or 0)   # comment wrap budget set at emit (0 = unwrapped)
     requests = manifest.get("requests", [])
     def_reqs = [r for r in requests if r.get("def") is not None]
@@ -1873,8 +1878,8 @@ def apply_manifest(source_lines: Chunk, manifest: dict) -> Chunk:
                 echo(f"[apply] No match for block request '{req['id']}'; skipping")
                 continue
 
-            # All-null answers mean the routine was never filled; distinguish that from chunks deliberately answered NONE.
-            if all(c.get("answer") is None for c in chunks):
+            # All-null chunk answers with no insertions mean the routine was never filled; an insertions-only fill still counts.
+            if all(c.get("answer") is None for c in chunks) and not req["blocks"].get("insertions"):
                 echo(f"[apply] Block request '{req['id']}' has no answers; leaving routine untouched")
                 continue
 
@@ -1888,6 +1893,10 @@ def apply_manifest(source_lines: Chunk, manifest: dict) -> Chunk:
                 boundary = target.boundary_lines[bidx]
                 comment = _parse_comment_reply(chunk.get("answer") or "", PYTHON_STYLE)
                 edits.append((boundary, comment, target.indent_of.get(boundary, "")))
+
+            # The strong model's finer breaks/comments, re-bound by statement index and kept off the chunk boundaries.
+            edits.extend(resolve_insertions(req["blocks"], target, PYTHON_STYLE,
+                                            skip_lines={b for b, _c, _i in edits}))
 
             # Trial-apply this routine's edits in isolation so one bad routine cannot taint the others.
             trial = _apply_edits(out_lines, edits, PYTHON_STYLE, width)

@@ -1882,6 +1882,9 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--line-length", type=int, default=0, metavar="N",
                    help="Wrap inserted block comments to fit N columns (indent + prefix included). 0 (default) "
                         "leaves them unwrapped. Online: a value at emit is stored in the manifest; apply can override.")
+    p.add_argument("--no-subdivide", action="store_true",
+                   help="Online emit: do not offer the stronger model the option to add finer block breaks/comments "
+                        "(insertions); keep strictly to the deterministic segmenter's paragraph boundaries.")
     p.add_argument("--config-dir", default="", metavar="DIR",
                    help="Directory of prompt-template overrides that shadow the built-in scale-cfg per file. When "
                         "omitted, a scale-cfg/ or .scale-cfg/ found at or above the working directory is used.")
@@ -2436,6 +2439,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     note_long=_read_optional(scale_path / "blocks.note.long.txt"),
                     style=_block_style_for(language, args.block_comment_style),
                     preserve_existing=not args.overwrite_comments,
+                    offer_insertions=not args.no_subdivide,
                 )
                 echo(f"[emit] {target}: {n} block recipe(s)")
 

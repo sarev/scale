@@ -25,7 +25,12 @@ so it can only ever change comments/docstrings. **Python, C, and JS** targets ar
   is otherwise never duplicated). A chunk whose boundary already carries a comment also surfaces that comment as
   `existing`; a *multi-line* one is protected by default — pre-answered `NONE` (which keeps it verbatim at apply) and
   flagged `preserve`, so a run over already-commented code never degrades hand-written rationale (`--overwrite-comments`
-  lifts this). The collectors are `scale_python.collect_def_requests`, `scale_c.collect_def_requests_c` (doc-site
+  lifts this). The deterministic segmenter is conservative, so a `blocks` recipe also offers `stmt_lines` (every
+  statement-start line, suite leaders included, snippet-local) and an empty `insertions` map: the stronger model
+  **may** add finer breaks/comments by mapping any of those lines to `""` (a paragraph break) or a comment, letting it
+  subdivide a coarse paragraph and comment a line the structural pass never made addressable (Python only today;
+  `--no-subdivide` opts out, and the completeness counter ignores `insertions` as optional). The collectors are
+  `scale_python.collect_def_requests`, `scale_c.collect_def_requests_c` (doc-site
   aware: a redirected definition is skipped and its header prototype requested instead, with the impl body as the
   prose source), `scale_javascript.collect_def_requests_js`, and the language-agnostic
   `scale_blocks.defer_block_targets`. `run_manifest` merges the per-target collectors, stamps each request with its
@@ -37,7 +42,11 @@ so it can only ever change comments/docstrings. **Python, C, and JS** targets ar
   JS: `_js_span_hash`, a comment/blank-stripped code-line hash, because applying a nested function's JSDoc inserts
   comment lines *inside* the parent's span — all shift-proof), then docstrings are patched and the text re-parsed
   before block answers are placed by boundary index (`scale_python.apply_manifest` / `scale_c.apply_manifest_c` /
-  `scale_javascript.apply_manifest_js`).
+  `scale_javascript.apply_manifest_js`). Any `insertions` are folded into the same edit pass, re-bound by statement
+  *index* (the i-th statement at emit is the i-th at apply — the code is preserved and the freshly inserted docstring
+  is skipped by the enumerator, so the binding survives the line shift exactly as a chunk's `bidx` does) through the
+  same insertion-only patcher and `code_preserved` guard; one that collides with a chunk boundary or names a
+  non-statement line is dropped.
 
 The manifest carries a top-level **`doc_style`** (guidelines + the def-pass templates of the run's target languages)
 so the stronger model writes deferred docs to house style, and a **`line_length`** (the column budget, from a

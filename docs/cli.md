@@ -27,6 +27,12 @@ python scale.py -c --block-comments medium --line-length 99 file.py -o out.py -v
 # comments up for rewriting instead. Existing single-line comments are always surfaced for the model to judge.
 python scale.py --block-comments medium -l python --online --emit-manifest m.json --overwrite-comments "src/*.py"
 
+# --no-subdivide (online emit only): by default the manifest offers the stronger model every statement-start line as
+# a point it MAY add a finer break/comment before (insertions), so it can subdivide a too-coarse deterministic
+# paragraph (e.g. give a buried, cryptic line its own comment). Pass this to keep strictly to the segmenter's
+# boundaries. Insertions are optional and Python-only today; the completeness counter ignores them.
+python scale.py --block-comments medium -l python --online --emit-manifest m.json --no-subdivide "src/*.py"
+
 # --file-doc adds/updates the top-of-file header description (Python module docstring, or C/JS header comment),
 # preserving shebang/copyright/license byte-for-byte; combinable with -c and the block flags, and runs LAST.
 python scale.py --file-doc -l c -m /path/model.gguf file.c -o out.c -v
